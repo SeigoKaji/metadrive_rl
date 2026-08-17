@@ -1,4 +1,4 @@
-"""MetaDrive公式SB3ミニ例のPPO学習をCLIから実行する。"""
+"""選択したMetaDrive profileのPPO学習をCLIから実行する。"""
 
 from __future__ import annotations
 
@@ -22,12 +22,11 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from env_factory import make_training_env
+from experiment_profiles import PROFILE_NAMES, get_experiment_profile
 from phase0_config import (
     LOG_DIR,
     MODEL_DIR,
     MONITOR_LOG_DIR,
-    OFFICIAL_ENV_CONFIG,
-    OFFICIAL_TRAINING_CONFIG,
     OUTPUT_DIR,
     TENSORBOARD_LOG_DIR,
 )
@@ -144,34 +143,50 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse training options; defaults exactly match the official full run."""
+    """Parse training options using the selected profile as CLI defaults."""
+
+    profile_parser = argparse.ArgumentParser(add_help=False)
+    profile_parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        default="official",
+    )
+    selected, _unknown = profile_parser.parse_known_args(argv)
+    profile = get_experiment_profile(selected.profile)
+    training_config = profile.training_config
 
     parser = argparse.ArgumentParser(
-        description="MetaDrive公式SB3ミニ例のPPO学習",
+        description="MetaDrive SB3 PPO学習",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        default=selected.profile,
+        help="環境・学習設定profile（既定: official）",
     )
     parser.add_argument(
         "--timesteps",
         type=_positive_int,
-        default=int(OFFICIAL_TRAINING_CONFIG["total_timesteps"]),
+        default=int(training_config["total_timesteps"]),
         help="model.learn()へ渡す最小timestep数",
     )
     parser.add_argument(
         "--num-envs",
         type=_positive_int,
-        default=int(OFFICIAL_TRAINING_CONFIG["num_envs"]),
+        default=int(training_config["num_envs"]),
         help="SubprocVecEnvで並列実行する環境数",
     )
     parser.add_argument(
         "--n-steps",
         type=_positive_int,
-        default=int(OFFICIAL_TRAINING_CONFIG["n_steps"]),
+        default=int(training_config["n_steps"]),
         help="1環境あたりのPPO rollout長",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=int(OFFICIAL_TRAINING_CONFIG["seed"]),
-        help="RL/PPOの乱数seed（scenario seedは環境設定の5で固定）",
+        default=int(training_config["seed"]),
+        help="RL/PPOの乱数seed（scenario seed範囲とは別）",
     )
     parser.add_argument(
         "--device",
@@ -181,13 +196,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         type=_model_stem,
-        default="phase0_official",
+        default=profile.default_model_name,
         help="models/とoutputs/で使うベース名",
     )
     parser.add_argument(
         "--log-interval",
         type=_positive_int,
-        default=int(OFFICIAL_TRAINING_CONFIG["log_interval"]),
+        default=int(training_config["log_interval"]),
         help="model.learn()のログ間隔",
     )
     parser.add_argument(
@@ -201,6 +216,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     """Train, save, validate, and reload one PPO model."""
+
+    profile = get_experiment_profile(args.profile)
+    environment_config = profile.train_env_config
+    training_config = profile.training_config
+    scenario_start = int(environment_config["start_seed"])
+    scenario_count = int(environment_config["num_scenarios"])
 
     for directory in (
         MODEL_DIR,
@@ -219,6 +240,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             rank=rank,
             seed=args.seed,
             monitor_dir=MONITOR_LOG_DIR,
+            env_config=environment_config,
         )
         for rank in range(args.num_envs)
     ]
@@ -230,7 +252,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         # Each picklable partial creates exactly one MetaDrive instance in its worker.
         train_env = SubprocVecEnv(env_factories)
         model = PPO(
-            str(OFFICIAL_TRAINING_CONFIG["policy"]),
+            str(training_config["policy"]),
             train_env,
             n_steps=args.n_steps,
             verbose=1,
@@ -241,10 +263,15 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         print(
             "training_start",
             {
+                "profile": args.profile,
                 "timesteps": args.timesteps,
                 "num_envs": args.num_envs,
                 "n_steps": args.n_steps,
                 "seed": args.seed,
+                "scenario_seed_range": [
+                    scenario_start,
+                    scenario_start + scenario_count,
+                ],
                 "requested_device": args.device,
                 "actual_device": actual_device,
             },
@@ -277,9 +304,11 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             "platform": platform.platform(),
             "python_executable": sys.executable,
             "versions": _runtime_versions(),
-            "official_environment_config": dict(OFFICIAL_ENV_CONFIG),
+            "profile": args.profile,
+            "environment_config": dict(environment_config),
+            "profile_training_config": dict(training_config),
             "training": {
-                "policy": str(OFFICIAL_TRAINING_CONFIG["policy"]),
+                "policy": str(training_config["policy"]),
                 "requested_total_timesteps": args.timesteps,
                 "actual_total_timesteps": int(model.num_timesteps),
                 "num_envs": args.num_envs,
@@ -287,7 +316,10 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "rollout_batch_size": args.num_envs * args.n_steps,
                 "log_interval": args.log_interval,
                 "rl_seed": args.seed,
-                "scenario_seed": int(OFFICIAL_ENV_CONFIG["start_seed"]),
+                "scenario_seed_range": {
+                    "start": scenario_start,
+                    "stop_exclusive": scenario_start + scenario_count,
+                },
                 "requested_device": args.device,
                 "actual_device": actual_device,
                 "ppo_seed_argument": None,
@@ -296,6 +328,11 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                     "argument is intentionally omitted because SB3 would forward it to "
                     "env.reset(seed=...), which MetaDrive 0.4.3 interprets as a scenario index"
                 ),
+                "scenario_sampling_note": (
+                    "reset() without a seed lets MetaDrive sample inside the configured "
+                    "scenario range; this sampling is separate from the RL seed"
+                ),
+                "scenario_sampling_reproducible_from_rl_seed": scenario_count == 1,
                 "ppo_unspecified_parameters": "stable-baselines3 defaults",
             },
             "artifacts": {
@@ -311,6 +348,10 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "device": reload_device,
             },
         }
+        if args.profile == "official":
+            # Keep the Phase 0 metadata field for existing consumers.
+            metadata["official_environment_config"] = dict(environment_config)
+            metadata["training"]["scenario_seed"] = scenario_start
         _write_json(metadata_path, metadata)
         print(f"model_saved={model_path} size_bytes={model_size} sha256={model_sha256}")
         print(f"model_reload_verified=True metadata={metadata_path}")

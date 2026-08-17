@@ -1,4 +1,4 @@
-"""保存済みPPOを固定シナリオで評価し、結果と任意のGIFを保存する。"""
+"""保存済みPPOを選択profileのシナリオで評価し、結果を保存する。"""
 
 from __future__ import annotations
 
@@ -21,14 +21,12 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.utils import check_for_correct_spaces
 
 from env_factory import make_evaluation_env
+from experiment_profiles import PROFILE_NAMES, get_experiment_profile
 from phase0_config import (
     LOG_DIR,
     MODEL_DIR,
-    OFFICIAL_ENV_CONFIG,
     OUTPUT_DIR,
     PROJECT_ROOT,
-    RL_SEED,
-    SCENARIO_SEED,
 )
 
 
@@ -96,7 +94,7 @@ def _default_evaluation_log(output_prefix: str) -> Path:
 
 
 def _resolve_log_path(path: Path | None, output_prefix: str) -> Path:
-    """Resolve an optional log path relative to the Phase 0 project."""
+    """Resolve an optional log path relative to this project."""
 
     if path is None:
         return _default_evaluation_log(output_prefix)
@@ -192,21 +190,36 @@ def _write_gif_trace(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse deterministic evaluation options."""
+    """Parse deterministic evaluation options for the selected profile."""
+
+    profile_parser = argparse.ArgumentParser(add_help=False)
+    profile_parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        default="official",
+    )
+    selected, _unknown = profile_parser.parse_known_args(argv)
+    profile = get_experiment_profile(selected.profile)
 
     parser = argparse.ArgumentParser(
-        description="MetaDrive Phase 0の保存済みPPOを評価",
+        description="MetaDriveの保存済みPPOを評価",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        default=selected.profile,
+        help="評価環境profile（既定: official）",
     )
     parser.add_argument(
         "--model",
         type=Path,
-        default=MODEL_DIR / "phase0_official.zip",
-        help="PPO .zipモデル（相対パスはPhase 0直下基準）",
+        default=MODEL_DIR / f"{profile.default_model_name}.zip",
+        help="PPO .zipモデル（相対パスはproject直下基準）",
     )
     parser.add_argument(
         "--episodes",
         type=_positive_int,
-        default=1,
+        default=profile.evaluation_episodes,
         help="評価episode数",
     )
     parser.add_argument(
@@ -217,14 +230,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-prefix",
         type=_output_prefix,
-        default="phase0_official",
+        default=profile.default_model_name,
         help="outputs/とlogs/で使うベース名",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=int(RL_SEED),
-        help="評価過程のRL乱数seed（scenario seedは5のまま）",
+        default=int(profile.training_config["seed"]),
+        help="評価過程のRL乱数seed（scenario seed範囲とは別）",
     )
     parser.add_argument(
         "--device",
@@ -242,6 +255,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     """Run deterministic Gymnasium evaluation and optionally record one GIF."""
+
+    profile = get_experiment_profile(args.profile)
+    environment_config = profile.evaluation_env_config
+    scenario_start = int(environment_config["start_seed"])
+    scenario_count = int(environment_config["num_scenarios"])
+    if scenario_count > 1 and args.episodes > scenario_count:
+        raise ValueError(
+            "評価episode数はprofileのscenario数以下にしてください: "
+            f"episodes={args.episodes}, num_scenarios={scenario_count}"
+        )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -291,13 +314,29 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     evaluation_started_at = datetime.now(timezone.utc)
     evaluation_start_time = time.perf_counter()
     try:
-        env = make_evaluation_env(seed=args.seed, record_gif=args.record_gif)
+        env = make_evaluation_env(
+            seed=args.seed,
+            record_gif=args.record_gif,
+            env_config=environment_config,
+        )
         check_for_correct_spaces(env, model.observation_space, model.action_space)
 
         for episode_number in range(1, args.episodes + 1):
             episode_start_time = time.perf_counter()
-            # MetaDrive reset(seed=...) selects a scenario. Omitting it preserves start_seed=5.
-            obs, reset_info = env.reset()
+            # MetaDriveのseedはRL乱数ではなくscenario indexである。複数scenario
+            # profileでは先頭から一度ずつ走査し、ランダム抽選による重複を避ける。
+            scenario_seed = (
+                scenario_start
+                if scenario_count == 1
+                else scenario_start + episode_number - 1
+            )
+            obs, reset_info = env.reset(seed=scenario_seed)
+            actual_scenario_seed = int(env.current_seed)
+            if actual_scenario_seed != scenario_seed:
+                raise RuntimeError(
+                    "要求したscenarioと実際のscenarioが一致しません: "
+                    f"requested={scenario_seed}, actual={actual_scenario_seed}"
+                )
             total_reward = 0.0
             episode_length = 0
             terminated_flag = False
@@ -346,6 +385,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             }
             episode_result = {
                 "episode": episode_number,
+                "scenario_seed": actual_scenario_seed,
                 "total_reward": total_reward,
                 "episode_length": episode_length,
                 "terminated": terminated_flag,
@@ -362,7 +402,8 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             }
             episodes.append(episode_result)
             print(
-                f"episode={episode_number} reward={total_reward:.6f} "
+                f"episode={episode_number} scenario_seed={actual_scenario_seed} "
+                f"reward={total_reward:.6f} "
                 f"length={episode_length} terminated={terminated_flag} "
                 f"truncated={truncated_flag} "
                 f"reason={episode_result['termination_reason']}"
@@ -421,6 +462,12 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
 
     rewards = [float(episode["total_reward"]) for episode in episodes]
     lengths = [int(episode["episode_length"]) for episode in episodes]
+    success_count = sum(
+        episode["termination_reason"] == "success" for episode in episodes
+    )
+    out_of_road_count = sum(
+        episode["termination_reason"] == "out_of_road" for episode in episodes
+    )
     evaluation_finished_at = datetime.now(timezone.utc)
     result = {
         "evaluation_status": "success",
@@ -435,8 +482,12 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             "requested_device": args.device,
             "actual_device": actual_device,
         },
-        "environment_config": dict(OFFICIAL_ENV_CONFIG),
-        "scenario_seed": int(SCENARIO_SEED),
+        "profile": args.profile,
+        "environment_config": dict(environment_config),
+        "scenario_seed_range": {
+            "start": scenario_start,
+            "stop_exclusive": scenario_start + scenario_count,
+        },
         "rl_seed": args.seed,
         "deterministic": True,
         "episode_count": args.episodes,
@@ -446,14 +497,18 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             "min_reward": min(rewards),
             "max_reward": max(rewards),
             "mean_episode_length": statistics.fmean(lengths),
-            "success_count": sum(
-                episode["termination_reason"] == "success" for episode in episodes
-            ),
+            "success_count": success_count,
+            "success_rate": success_count / len(episodes),
+            "out_of_road_count": out_of_road_count,
+            "out_of_road_rate": out_of_road_count / len(episodes),
         },
         # GIF failure is deliberately independent of successful policy evaluation.
         "gif": gif_result,
         "console_log_path": str(log_path.resolve()),
     }
+    if scenario_count == 1:
+        # Keep the Phase 0 scalar field for existing result consumers.
+        result["scenario_seed"] = scenario_start
     _write_json(result_path, result)
     print(f"evaluation_saved={result_path.resolve()}")
     return result_path

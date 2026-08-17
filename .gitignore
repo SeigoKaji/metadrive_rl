@@ -8,14 +8,10 @@ htmlcov/
 build/
 dist/
 
-# Local virtual environments and upstream source checkout
+# Local Python environment and runtime cache
 .venv/
 .venv-*/
-.tools/
-.uv-cache/
-.uv-python/
 .runtime/
-.external/
 
 # Training artefacts (keep directory placeholders only)
 models/*
@@ -28,11 +24,9 @@ logs/monitor/*
 logs/tensorboard/*
 !logs/tensorboard/.gitkeep
 
-# Runtime inspection/evaluation artefacts. JSON reports remain trackable.
-outputs/*.log
-outputs/*.gif
-outputs/*.mp4
-outputs/*.png
+# Generated inspection/evaluation artefacts (keep the directory placeholder only)
+outputs/*
+!outputs/.gitkeep
 
 # Panda3D / editor noise
 panda3d-log.txt

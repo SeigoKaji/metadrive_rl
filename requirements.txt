@@ -1,10 +1,8 @@
-# MetaDrive official release tag MetaDrive-0.4.3
-# Resolved commit: 5bf8ea8909c4643a4099a250e6f5fb89c695d8b4
-# Source: https://github.com/metadriverse/metadrive.git
-# The README clones and verifies this checkout before the editable install.
--e ./.external/metadrive-src
+# MetaDrive is cloned separately as ../metadrive and installed from source.
+# Update that checkout before installing when the latest main branch is wanted.
+-e ../metadrive
 
-# Keep these on the normal stable release channel. Exact installed versions are
-# recorded later in requirements.lock.txt after a successful installation.
+# Exact versions resolved in the verified Python 3.12 environment are recorded
+# in requirements.lock.txt. Keep this file limited to direct dependencies.
 stable-baselines3[extra]
 pytest
