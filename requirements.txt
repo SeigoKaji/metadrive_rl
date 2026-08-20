@@ -5,4 +5,7 @@
 # Exact versions resolved in the verified Python 3.12 environment are recorded
 # in requirements.lock.txt. Keep this file limited to direct dependencies.
 stable-baselines3[extra]
+Pillow
+opencv-python
+openpyxl
 pytest

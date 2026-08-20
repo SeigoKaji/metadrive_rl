@@ -3,17 +3,20 @@
 import pytest
 
 from env_factory import make_env
-from evaluate import parse_args as parse_evaluation_args
-from experiment_profiles import PROFILE_NAMES, get_experiment_profile
-from generalization_config import (
+from evaluate import (
+    _evaluation_output_directory,
+    parse_args as parse_evaluation_args,
+)
+from configs.experiment_profiles import PROFILE_NAMES, get_experiment_profile
+from configs.generalization_config import (
     COMMON_GENERALIZATION_ENV_CONFIG,
     GENERALIZATION_EVALUATION_ENV_CONFIG,
     GENERALIZATION_EVALUATION_EPISODES,
     GENERALIZATION_TRAIN_ENV_CONFIG,
     GENERALIZATION_TRAINING_CONFIG,
 )
-from phase0_config import OFFICIAL_ENV_CONFIG, OFFICIAL_TRAINING_CONFIG
-from train import parse_args as parse_training_args
+from configs.phase0_config import OFFICIAL_ENV_CONFIG, OFFICIAL_TRAINING_CONFIG, OUTPUT_DIR
+from train import _training_output_directory, parse_args as parse_training_args
 
 
 EXPECTED_COMMON_CONFIG = {
@@ -144,6 +147,25 @@ def test_generalization_profile_is_connected_to_both_clis() -> None:
     assert evaluation_args.episodes == 200
     assert evaluation_args.model.name == "generalization.zip"
     assert evaluation_args.output_prefix == "generalization"
+
+
+def test_artifact_directories_are_separated_by_profile_and_stage() -> None:
+    """同じrun名でもprofileと学習・評価の組み合わせで衝突しない。"""
+
+    paths = {
+        _training_output_directory("official", "shared"),
+        _training_output_directory("generalization", "shared"),
+        _evaluation_output_directory("official", "shared"),
+        _evaluation_output_directory("generalization", "shared"),
+    }
+
+    assert len(paths) == 4
+    assert _training_output_directory("official", "shared") == (
+        OUTPUT_DIR / "official" / "training" / "shared"
+    )
+    assert _evaluation_output_directory("generalization", "shared") == (
+        OUTPUT_DIR / "generalization" / "evaluation" / "shared"
+    )
 
 
 def test_generalization_environment_can_reset_and_step() -> None:

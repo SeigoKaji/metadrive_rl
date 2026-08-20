@@ -15,10 +15,10 @@
 ## 2. 全体の処理経路
 
 ```text
-phase0_config.py ──────────┐
-  公式設定・保存先          │
-                           ├─> experiment_profiles.py
-generalization_config.py ──┘     official / generalization選択
+configs/phase0_config.py ──────────┐
+  公式設定・保存先                  │
+                                   ├─> configs/experiment_profiles.py
+configs/generalization_config.py ──┘     official / generalization選択
   複数scenario学習・未見評価            │
                                        v
                                 env_factory.py
@@ -30,7 +30,8 @@ generalization_config.py ──┘     official / generalization選択
                       SubprocVecEnv/PPO   PPO.load/predict
                               │                 │
                               v                 v
-                       model + metadata   evaluation JSON/GIF
+                       model + metadata   evaluation_results.py
+                                        JSON/JSONL/GIF/MP4/PNG
 
 inspect_env.py ── raw環境の仕様、Action変換、raw/adapted check_env、random走行を検査
 tests/         ── 公式契約、汎化設定、Gymnasium戻り値、profile接続を検査
@@ -44,11 +45,11 @@ tests/         ── 公式契約、汎化設定、Gymnasium戻り値、profile
 
 | ファイル・行 | 処理 | 入力 | 出力 | 担当すること | 担当しないこと |
 | --- | --- | --- | --- | --- | --- |
-| `phase0_config.py:7-23` | 公式環境設定 | 公式例で指定された値 | `OFFICIAL_ENV_CONFIG` | MetaDriveへ渡す11項目を一か所に固定 | MetaDrive defaultの再定義、環境生成 |
-| `phase0_config.py:25-33` | 公式PPO設定 | 公式例で指定された値 | `OFFICIAL_TRAINING_CONFIG` | seed、環境数、rollout長、総step、Policy等を一元管理 | PPO instance生成、学習 |
-| `phase0_config.py:35-55` | seedと出力先 | 上記公式設定、project位置 | `Path`と派生定数 | scenario seedとRL seedの区別、保存先の共通化 | directory作成、ファイル書込み |
-| `generalization_config.py:8-48` | 汎化設定 | MetaDrive generalization例、実用的な学習予算 | train/evaluation/training設定 | 学習seed `[1000, 2000)` と未見評価seed `[0, 200)`、道路・車線・車種の多様化 | 独自Reward、事故生成、連続Action |
-| `experiment_profiles.py:22-66` | profile選択 | `official` / `generalization` | `ExperimentProfile` | train/evaluation環境、学習設定、既定出力名を一括選択 | 設定値の暗黙merge、未知名へのfallback |
+| `configs/phase0_config.py:7-23` | 公式環境設定 | 公式例で指定された値 | `OFFICIAL_ENV_CONFIG` | MetaDriveへ渡す11項目を一か所に固定 | MetaDrive defaultの再定義、環境生成 |
+| `configs/phase0_config.py:25-33` | 公式PPO設定 | 公式例で指定された値 | `OFFICIAL_TRAINING_CONFIG` | seed、環境数、rollout長、総step、Policy等を一元管理 | PPO instance生成、学習 |
+| `configs/phase0_config.py:35-55` | seedと出力先 | 上記公式設定、project位置 | `Path`と派生定数 | scenario seedとRL seedの区別、保存先の共通化 | directory作成、ファイル書込み |
+| `configs/generalization_config.py:8-48` | 汎化設定 | MetaDrive generalization例、実用的な学習予算 | train/evaluation/training設定 | 学習seed `[1000, 2000)` と未見評価seed `[0, 200)`、道路・車線・車種の多様化 | 独自Reward、事故生成、連続Action |
+| `configs/experiment_profiles.py:22-66` | profile選択 | `official` / `generalization` | `ExperimentProfile` | train/evaluation環境、学習設定、既定出力名を一括選択 | 設定値の暗黙merge、未知名へのfallback |
 | `env_factory.py:18-31` | raw環境生成 | 選択した環境設定、または省略 | `MetaDriveEnv` | 設定のcopyを渡してsimulatorを生成。省略時は公式設定 | PPO学習、Reward計算、描画 |
 | `env_factory.py:34-73` | 学習環境生成 | rank、RL seed、Monitor保存先、環境設定 | `Monitor[MetaDriveEnv]` | workerごとのspace seedと衝突しないCSV名を設定 | scenarioをRL seedへ変更、タスク変換 |
 | `env_factory.py:76-98` | 評価環境生成 | RL seed、GIF記録意図、環境設定 | raw `MetaDriveEnv` | 単一評価環境のspaceをseed | GIF frame生成、モデル推論 |
@@ -84,17 +85,17 @@ tests/         ── 公式契約、汎化設定、Gymnasium戻り値、profile
 
 | ファイル・行 | 処理 | 入力 | 出力 | 担当すること | 担当しないこと |
 | --- | --- | --- | --- | --- | --- |
-| `evaluate.py:192-253` | CLI解析 | command-line引数、profile | `argparse.Namespace` | profileごとのmodel・episode数・出力名を選択 | モデル評価 |
-| `evaluate.py:256-322` | モデル・環境準備 | profile、`.zip` path、device | 読込済みPPO、単一raw環境 | model hash、profile環境、space互換性を確認 | モデル更新、学習用並列化 |
-| `evaluate.py:324-345` | episode初期化 | raw環境、scenario範囲 | 初期Observation、reset info | scenarioを範囲先頭から重複なしで明示選択し実値を確認 | RL seedのscenario流用、ランダム重複抽選 |
-| `evaluate.py:347-348` | `model.predict()` | 現在のObservation | 離散Action ID | `deterministic=True`で保存Policyから推論 | 探索、loss計算、重み更新 |
-| `evaluate.py:349-354` | `env.step()` | Action ID | 次Observation、Reward、2種の終了値、info | MetaDrive simulationを1 step進め結果を集計 | PPO更新 |
-| `evaluate.py:356-369` | top-down frame記録 | 評価中のenv | renderer内frame | MetaDrive 0.4.3の実APIでheadless frameを記録 | 学習taskやObservationの画像化 |
-| `evaluate.py:374-410` | episode終了・分類 | `terminated`、`truncated`、info | episode result | scenario seed、終了理由と全flagを保存 | 欠落info keyの無条件参照 |
-| `evaluate.py:412-457` | GIF生成 | 記録frame | `.gif`またはerror trace | rendererの実signatureでGIFを生成・検証 | GIF失敗をPolicy評価失敗に改変 |
-| `evaluate.py:458-461` | 評価環境解放 | raw環境 | なし | 成否にかかわらずclose | singleton環境を残すこと |
-| `evaluate.py:463-514` | 評価JSON保存 | episode群、model/config情報 | evaluation JSON | reward、長さ、success/out-of-road率、scenario範囲を保存 | 実行していないepisodeの補完 |
-| `evaluate.py:517-538` | 評価CLI entry point | CLI | exit status、console log | stdout/stderrとtracebackの保存、main guard | 学習開始 |
+| `evaluate.py:143-208` | CLI解析 | command-line引数、profile | `argparse.Namespace` | profileごとのmodel・episode数・出力名を選択 | モデル評価 |
+| `evaluate.py:211-286` | モデル・環境準備 | profile、`.zip` path、device | 読込済みPPO、単一raw環境 | model hash、profile環境、space互換性を確認 | モデル更新、学習用並列化 |
+| `evaluate.py:297-331` | episode初期化 | raw環境、scenario範囲 | 初期Observation、reset info | scenarioを範囲先頭から重複なしで明示選択し実値を確認 | RL seedのscenario流用、ランダム重複抽選 |
+| `evaluate.py:334` | `model.predict()` | 現在のObservation | 離散Action ID | `deterministic=True`で保存Policyから推論 | 探索、loss計算、重み更新 |
+| `evaluate.py:336-342` | `env.step()` | Action ID | 次Observation、Reward、2種の終了値、info | MetaDrive simulationを1 step進め結果を集計 | PPO更新 |
+| `evaluation_results.py:301-545` | top-down frame記録 | 評価中のenv、step telemetry | renderer内frame、PNG/MP4 stream | MetaDrive 0.4.3の実APIでheadless frameを記録 | 学習taskやObservationの画像化 |
+| `evaluate.py:380-426` | episode終了・分類 | `terminated`、`truncated`、info | episode result | scenario seed、終了理由と全flagを保存 | 欠落info keyの無条件参照 |
+| `evaluation_results.py:547-809` | artifact確定 | 記録frame | GIF/MP4/PNGまたはerror情報 | 生成物を個別に検証し、失敗を評価結果から分離 | GIF等の失敗をPolicy評価失敗に改変 |
+| `evaluate.py:446-464` | 評価環境解放 | raw環境、active recorder | なし | 成否にかかわらずclose・一時file cleanup | singleton環境を残すこと |
+| `evaluate.py:466-536`, `evaluation_results.py:39-120` | 評価結果保存 | episode群、model/config情報 | evaluation JSON、step JSONL | 集計schemaと厳密JSON形式を維持してatomicに保存 | 実行していないepisodeの補完 |
+| `evaluate.py:539-560` | 評価CLI entry point | CLI | exit status、console log | stdout/stderrとtracebackの保存、main guard | 学習開始 |
 
 ### 3.4 Contract test
 
@@ -153,7 +154,7 @@ tests/         ── 公式契約、汎化設定、Gymnasium戻り値、profile
 
 ### 4.2 評価時の1 step
 
-評価では `evaluate.py:348` が `model.predict(obs, deterministic=True)` を呼び、`evaluate.py:349` がActionを `env.step()` へ渡す。戻ったRewardは集計にだけ使い、rollout bufferへ保存せず、loss、backpropagation、optimizer stepも実行しない。`terminated or truncated` が真になった時点でloopを終了するため、task終了とtime-limitの両方を正しく扱う。
+評価では `evaluate.py:334` が `model.predict(obs, deterministic=True)` を呼び、`evaluate.py:336` がActionを `env.step()` へ渡す。戻ったRewardは集計にだけ使い、rollout bufferへ保存せず、loss、backpropagation、optimizer stepも実行しない。`terminated or truncated` が真になった時点でloopを終了するため、task終了とtime-limitの両方を正しく扱う。
 
 ## 5. ActorとCritic
 
@@ -179,7 +180,7 @@ SB3のPPO lossにはActorのclipped policy lossだけでなく、Criticのvalue 
 
 | 項目 | 学習 | 評価 |
 | --- | --- | --- |
-| Entry point | `train.py:365-387` | `evaluate.py:517-538` |
+| Entry point | `train.py:365-387` | `evaluate.py:539-560` |
 | モデル | `PPO(...)` で生成 | `PPO.load(...)` で読込 |
 | Action選択 | Policy分布からsampleし探索を含む | `deterministic=True` |
 | Reward利用 | advantage、return、lossを通して重み更新に使用 | episode統計への集計のみ |
@@ -291,7 +292,7 @@ seed-only adapterは検査専用であり、`env_factory.py`、`train.py`、`eva
 
 - `env_factory.py:62-68` と `:91-95` はAction/Observation spaceだけをRL seedでseedし、`env.reset(seed=RL_SEED)` を呼ばない。
 - `train.py:236-246` は `set_random_seed()` とworker別space seedを使う。`PPO(seed=...)` はSB3がVecEnvへRL seedをscenario indexとして転送するため指定していない。
-- `evaluate.py:324-339` はprofileの有効なscenario indexを明示的に渡す。`official`は5、`generalization`は未見集合0から199を一度ずつ使い、RL seedをscenario indexへ流用しない。
+- `evaluate.py:297-312` はprofileの有効なscenario indexを明示的に渡す。`official`は5、`generalization`は未見集合0から199を一度ずつ使い、RL seedをscenario indexへ流用しない。
 
 `official` profileの `start_seed` を0へ変更せず、Observation、Action、Reward、終了条件も変更していない。`generalization` profileはadapterとは独立して有効な学習・評価scenario範囲を設定する。adapterはSB3 checkerとMetaDrive reset APIの意味だけを検査時に調停するため、どちらの学習・評価経路にも入らない。
 

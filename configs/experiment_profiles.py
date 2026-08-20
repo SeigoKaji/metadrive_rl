@@ -6,14 +6,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final, Literal, TypeAlias
 
-from generalization_config import (
+from .generalization_config import (
     GENERALIZATION_DEFAULT_MODEL_NAME,
     GENERALIZATION_EVALUATION_ENV_CONFIG,
     GENERALIZATION_EVALUATION_EPISODES,
     GENERALIZATION_TRAIN_ENV_CONFIG,
     GENERALIZATION_TRAINING_CONFIG,
 )
-from phase0_config import OFFICIAL_ENV_CONFIG, OFFICIAL_TRAINING_CONFIG
+from .phase0_config import OFFICIAL_ENV_CONFIG, OFFICIAL_TRAINING_CONFIG
 
 
 ProfileName: TypeAlias = Literal["official", "generalization"]

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import gymnasium as gym
 from stable_baselines3.common.monitor import Monitor
 
-from phase0_config import MONITOR_LOG_DIR, OFFICIAL_ENV_CONFIG, RL_SEED
+from configs.phase0_config import MONITOR_LOG_DIR, OFFICIAL_ENV_CONFIG, RL_SEED
 
 if TYPE_CHECKING:
     from metadrive.envs import MetaDriveEnv

@@ -22,8 +22,8 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from env_factory import make_training_env
-from experiment_profiles import PROFILE_NAMES, get_experiment_profile
-from phase0_config import (
+from configs.experiment_profiles import PROFILE_NAMES, get_experiment_profile
+from configs.phase0_config import (
     LOG_DIR,
     MODEL_DIR,
     MONITOR_LOG_DIR,
@@ -94,6 +94,12 @@ def _resolve_log_path(path: Path | None, model_name: str) -> Path:
     if path.is_absolute():
         return path
     return LOG_DIR.parent / path
+
+
+def _training_output_directory(profile_name: str, model_name: str) -> Path:
+    """Return the profile- and run-specific directory for training metadata."""
+
+    return OUTPUT_DIR / profile_name / "training" / model_name
 
 
 def _distribution_version(*names: str) -> str | None:
@@ -197,7 +203,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--model-name",
         type=_model_stem,
         default=profile.default_model_name,
-        help="models/とoutputs/で使うベース名",
+        help="models/とoutputs/<profile>/training/で使うrun名",
     )
     parser.add_argument(
         "--log-interval",
@@ -222,12 +228,16 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     training_config = profile.training_config
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
+    training_output_dir = _training_output_directory(
+        args.profile,
+        args.model_name,
+    )
 
     for directory in (
         MODEL_DIR,
         MONITOR_LOG_DIR,
         TENSORBOARD_LOG_DIR,
-        OUTPUT_DIR,
+        training_output_dir,
         LOG_DIR,
         log_path.parent,
     ):
@@ -294,7 +304,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         del reloaded_model
 
         finished_at = datetime.now(timezone.utc)
-        metadata_path = OUTPUT_DIR / f"{args.model_name}_training_metadata.json"
+        metadata_path = training_output_dir / "training_metadata.json"
         metadata = {
             "status": "success",
             "started_at_utc": started_at.isoformat(),
@@ -336,6 +346,8 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "ppo_unspecified_parameters": "stable-baselines3 defaults",
             },
             "artifacts": {
+                "output_directory": str(training_output_dir.resolve()),
+                "metadata_path": str(metadata_path.resolve()),
                 "model_path": str(model_path.resolve()),
                 "model_size_bytes": model_size,
                 "model_sha256": model_sha256,

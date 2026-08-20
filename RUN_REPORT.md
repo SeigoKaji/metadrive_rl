@@ -1,6 +1,6 @@
 # MetaDrive RL 現行環境レポート
 
-最終確認日: 2026-08-18（Asia/Tokyo）
+最終確認日: 2026-08-21（Asia/Tokyo）
 
 ## 構成
 
@@ -44,7 +44,7 @@ python3.12 -m venv .venv
 
 | ファイル | 用途 |
 | --- | --- |
-| `requirements.txt` | MetaDrive、Stable-Baselines3、pytestの直接依存 |
+| `requirements.txt` | MetaDrive、Stable-Baselines3、評価可視化・Excel生成、pytestの直接依存 |
 | `requirements.lock.txt` | 検証済みPython 3.12環境の完全なversion固定 |
 
 完全に固定された依存versionを使う場合は、次のようにinstallする。
@@ -95,7 +95,7 @@ cd metadrive-workspace/metadrive-rl
 | --- | --- |
 | `.venv/bin/python -m pip check` | exit 0、依存関係の破損なし |
 | `.venv/bin/python -m metadrive.pull_asset` | exit 0、assets 0.4.3を取得 |
-| `.venv/bin/python -m pytest -q` | exit 0、10 passed in 4.07s |
+| `.venv/bin/python -m pytest -q` | exit 0、30 passed in 5.84s（2026-08-21再確認） |
 | generalization専用test | exit 0、7 passed in 3.59s |
 | generalization E2E Smoke | 4 workerで256 timestep学習、保存・再読込、未見scenario 0〜4の評価とJSON生成が完了 |
 | `.venv/bin/python inspect_env.py` | exit 0、検査adapterと走行検査が完了 |

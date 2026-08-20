@@ -248,20 +248,25 @@ metadrive-workspace/
 │   ├── .venv/                        # Python 3.12の単一local venv（git管理外）
 │   ├── requirements.txt              # MetaDrive sibling pathと直接依存
 │   ├── requirements.lock.txt         # 検証済みvenvのversion snapshot
-│   ├── phase0_config.py              # 公式設定値と出力先の一元管理
-│   ├── generalization_config.py       # 複数scenario学習と未見評価の設定
-│   ├── experiment_profiles.py         # official/generalizationの選択
+│   ├── configs/                       # 実験設定をまとめたpackage
+│   │   ├── phase0_config.py           # 公式設定値と出力先の一元管理
+│   │   ├── generalization_config.py   # 複数scenario学習と未見評価の設定
+│   │   └── experiment_profiles.py     # official/generalizationの選択
 │   ├── env_factory.py                 # MetaDrive生成と記録専用Monitor
 │   ├── inspect_env.py                 # version・空間・Action変換・check_env・random走行検査
 │   ├── train.py                       # SubprocVecEnvとPPO学習・モデル保存
-│   ├── evaluate.py                    # 保存モデルの決定論的評価と任意のGIF記録
+│   ├── evaluate.py                    # 保存モデルの読込と決定論的推論を統括
+│   ├── evaluation_results.py          # 評価JSON/JSONLとGIF/MP4/PNGの保持・保存
+│   ├── evaluation_visualization.py    # step telemetry収集と右パネル合成
+│   ├── generate_evaluation_telemetry_guide.py # 編集可能なExcelガイドの生成
+│   ├── EVALUATION_TELEMETRY_GUIDE.xlsx # 右パネルの編集可能な日本語ガイド
 │   ├── README.md                      # タスク、設計、実行手順（本書）
 │   ├── CODE_WALKTHROUGH.md            # 自作・library内部処理の行番号付き解説
 │   ├── RUN_REPORT.md                  # 現在の環境と検証結果
 │   ├── tests/                         # 環境contractと汎化設定test
 │   ├── models/                        # 学習済みmodel
 │   ├── logs/                          # Monitor / TensorBoard / console log
-│   └── outputs/                       # 検査log、metadata、評価JSON、GIF
+│   └── outputs/                       # 検査log、metadata、評価JSON、GIF/MP4/PNG
 └── metadrive/                         # 公式mainの独立checkout（RL project外）
 ```
 
@@ -318,6 +323,9 @@ python3.12 -m venv .venv
 ```text
 -e ../metadrive
 stable-baselines3[extra]
+Pillow
+opencv-python
+openpyxl
 pytest
 ```
 
@@ -383,7 +391,7 @@ PPO初期化、rollout、勾配更新、保存、再読込までを短時間で�
   --output-prefix phase0_smoke
 ```
 
-同じmodel名やoutput prefixで再実行すると対応する成果物を上書きします。結果を残す場合は別名を指定してください。
+評価では全episodeのtop-down GIF、MP4、フレーム別PNGを既定で `outputs/official/evaluation/phase0_smoke/episodes/` 以下へepisode別に保存します。記録が不要な場合は `--no-record-gif` を指定します。同じprofileとoutput prefixで再実行すると、古い `episodes/` を評価開始時に削除して対応する成果物を置き換えます。`--no-record-gif` での再実行時も古い可視化は削除されるため、結果を残す場合は別のoutput prefixを指定してください。
 
 ### 13.6 公式設定の学習
 
@@ -397,13 +405,24 @@ PPO初期化、rollout、勾配更新、保存、再読込までを短時間で�
   --model-name phase0_official
 ```
 
-### 13.7 モデル評価とGIF
+### 13.7 モデル評価（既定でGIF/MP4/PNGを保存）
 
 ```bash
 .venv/bin/python evaluate.py \
   --model models/phase0_official.zip \
   --episodes 1 \
-  --record-gif \
+  --output-prefix phase0_official
+```
+
+`evaluate.py` は既定で全評価episodeを、合成済みtelemetry panel付きのtop-down GIF、MP4、フレーム別PNGとしてepisode別に保存します。`--record-gif` は後方互換の記録スイッチ名で、`--record-gif` / `--no-record-gif` により全episodeの3種類すべてを切り替えます。GIF・MP4・PNGが不要な場合は、実行時に `--no-record-gif` を指定します。
+
+評価のCLI、モデル読込、`model.predict(..., deterministic=True)` と `env.step()` の順序は `evaluate.py` が担当し、JSON/JSONLの直列化とepisode別artifactの保持・保存は `evaluation_results.py` が担当します。この分割は評価経路と出力形式を変えず、ファイルI/Oの責務だけを推論loopから分離しています。
+
+```bash
+.venv/bin/python evaluate.py \
+  --model models/phase0_official.zip \
+  --episodes 1 \
+  --no-record-gif \
   --output-prefix phase0_official
 ```
 
@@ -422,9 +441,11 @@ PPO初期化、rollout、勾配更新、保存、再読込までを短時間で�
 .venv/bin/python -m tensorboard.main --logdir logs/tensorboard
 ```
 
-## 14. 評価とGIF API
+## 14. 評価とGIF/MP4 API
 
-評価は単一環境で、保存済みPPOを `deterministic=True` で呼び出します。各エピソードは `terminated or truncated` で終了し、total reward、length、元の終了flag、`route_completion`、model SHA-256、実行時間をJSONへ保存します。`info` のoptional項目は `info.get(...)` で取得し、存在しないキーを成功・失敗どちらにも推測しません。
+評価は単一環境で、保存済みPPOを `deterministic=True` で呼び出します。各エピソードは `terminated or truncated` で終了し、total reward、length、速度要約、Action切替回数・頻度、元の終了flag、`route_completion`、model SHA-256、実行時間を `outputs/<profile>/evaluation/<output-prefix>/evaluation.json` へ保存します。さらに全episodeの全stepを同じrunディレクトリの `evaluation_steps.jsonl` へ1行ずつ保存し、評価JSONの `step_telemetry` からpath・schema・row数を参照できます。各行はAction適用後の状態で、速度、Action、simulation時刻、現在区間のruntime道路値、Reward、終了flagを含みます。
+
+全評価episodeは既定でGIF、MP4、フレーム別PNGへ記録され、`episodes/episode_<番号>_scenario_<seed>/` ごとに分離されます。`--no-record-gif` 指定時だけ全episodeの記録を行いません。3種類の出力は同じpost-stepの合成済みpanel frameを使います。GIFは元の600×600地図を隠さず、右側へ320pxのtelemetry panelを追加します。panelには、実行時configから導出した物理更新Hz・制御Hz、適用済みAction、速度、累積切替回数と `switches/s`、直近2秒のAction履歴、Reward・route進捗・終了状態を表示します。`switches/s` の分母は再生時間やwall-clockではなく、episode開始から現在frameまでのsimulation経過秒です。道路値は固定設定ではなく、そのframeで車両がいる区間から取得し、`CURRENT SEGMENT (runtime)` と明記します。取得できない道路値は評価を止めず `N/A` とします。`info` のoptional項目は `info.get(...)` で取得し、存在しないキーを成功・失敗どちらにも推測しません。
 
 このcommitで確認できるtop-down記録APIは次の形です。
 
@@ -435,14 +456,33 @@ env.render(
     screen_record=True,
 )
 env.top_down_renderer.generate_gif(
-    gif_name="outputs/phase0_official_evaluation.gif",
-    duration=30,
+    gif_name=(
+        "outputs/official/evaluation/phase0_official/episodes/"
+        "episode_0001_scenario_000005/evaluation.gif"
+    ),
+    duration=100,  # runtime action_dt=0.10 s, in milliseconds
 )
+# MP4 is written from the same panel frames with OpenCV VideoWriter
+# (fps=control_hz, codec=mp4v).
 ```
 
-`window=False` はoff-screen描画、`screen_record=True` は各render frameの保存を意味します。`TopDownRenderer.generate_gif` の実際のsignatureは `(gif_name="demo.gif", duration=30)` で、`duration` の単位はmsです。ソース中の説明には第2引数を `fps` と呼ぶ古い表記もありますが、実signatureを優先します。rendererは最初のtop-down render後に利用します。互換処理はこのAPI差分だけを扱い、シミュレーション設定は変えません。
+`window=False` はoff-screen描画、`screen_record=True` は各render frameの保存を意味します。`TopDownRenderer.generate_gif` のsignatureは `(gif_name="demo.gif", duration=30)` で、`duration` の単位はmsです（実行時action dtに合わせて評価側から指定します）。Pillow/GIFのduration単位は10 msなので、評価側はruntimeのaction dtが正確に表現できる場合だけ記録します。現在のruntime既定値（物理step 0.02秒、`decision_repeat=5`）ではpost-step frameの1枚を100 msで表示し、MP4は `control_hz=10` fpsで書き出します。したがってN枚の再生時間はどちらも `N × 0.10` 秒で、frame kのpanel時刻 `t=k×0.10s` と一致します。初期reset時刻`t=0`のframeは追加せず、各frameはAction適用区間の終了状態です。MP4はOpenCV `VideoWriter` の `mp4v` codecを使い、temporary fileから最終ファイルへ確定します。
+
+MetaDrive 0.4.3の公開 `screen_frames` propertyはdeep copyを返すため、右panel付きframeへの置換は `evaluation_visualization.py` の単一補助関数だけでrenderer内部listへ触れます。upstreamの `metadrive/` source自体は変更しません。
+
+### 14.1 評価テレメトリExcelガイド
+
+`EVALUATION_TELEMETRY_GUIDE.xlsx` は、現行パネル画像、`項目説明`、`STATUS・色`、メディア時間の説明を上から順にまとめた1シート（`テレメトリ説明`）の編集可能な資料です。現行コードで右パネルを再合成した画像を埋め込み、説明・例示値・凡例は通常セルとして直接編集できます。再生成するときは次を実行します。
+
+```bash
+.venv/bin/python generate_evaluation_telemetry_guide.py
+```
+
+入力元や出力先を変える場合は `--frame`、`--steps`、`--evaluation`、`--output` を指定できます。Excelファイルにはマクロ、外部ブック参照、外部リンクを含めません。
 
 ## 15. 主な成果物
+
+`outputs/` は設定を選ぶprofileごとに分離します。`official` は `configs/phase0_config.py`、`generalization` は `configs/generalization_config.py` に対応し、その下を学習runと評価runに分けます。既存のroot直下の成果物は自動移動せず、新しい実行から次の構成を使います。
 
 | 種類 | 保存先 |
 | --- | --- |
@@ -450,15 +490,19 @@ env.top_down_renderer.generate_gif(
 | rank別Monitor | `logs/monitor/env_0.monitor.csv` ～ `env_3.monitor.csv` |
 | TensorBoard | `logs/tensorboard/` |
 | 学習・評価log | `logs/` |
-| training metadata | `outputs/<model-name>_training_metadata.json` |
-| 評価JSON | `outputs/<output-prefix>_evaluation.json` |
-| top-down GIF | `outputs/<output-prefix>_evaluation.gif` |
+| training metadata | `outputs/<profile>/training/<model-name>/training_metadata.json` |
+| 評価JSON | `outputs/<profile>/evaluation/<output-prefix>/evaluation.json` |
+| 全step telemetry（JSONL） | `outputs/<profile>/evaluation/<output-prefix>/evaluation_steps.jsonl` |
+| episode別top-down GIF（既定で全episodeを生成） | `outputs/<profile>/evaluation/<output-prefix>/episodes/episode_<番号>_scenario_<seed>/evaluation.gif` |
+| episode別top-down MP4（既定で全episodeを生成） | `outputs/<profile>/evaluation/<output-prefix>/episodes/episode_<番号>_scenario_<seed>/evaluation.mp4` |
+| episode別の合成済みtop-down PNG連番 | `outputs/<profile>/evaluation/<output-prefix>/episodes/episode_<番号>_scenario_<seed>/frames/frame_*.png` |
+| 評価テレメトリ表示ガイド（編集可能Excel） | `EVALUATION_TELEMETRY_GUIDE.xlsx` |
 | 環境検査log | `outputs/inspect_env.log` |
 | 直接依存 / dependency lock | `requirements.txt` / `requirements.lock.txt` |
 
 ## 16. 既知の制約
 
-公式11設定のraw `MetaDriveEnv`へSB3 2.9.0の`check_env`を直接適用すると、最新`main`でもfatalになります。SB3が送る`reset(seed=0)`をMetaDriveがscenario indexとして解釈し、固定scenario範囲`[5, 6)`から外れるためです。検査専用seed adapter、50step random走行、pytest 10件はpassしていますが、adapter成功をraw直接検査成功とは扱いません。公式config、upstream source、SB3 checkerは改変していません。
+公式11設定のraw `MetaDriveEnv`へSB3 2.9.0の`check_env`を直接適用すると、最新`main`でもfatalになります。SB3が送る`reset(seed=0)`をMetaDriveがscenario indexとして解釈し、固定scenario範囲`[5, 6)`から外れるためです。検査専用seed adapter、50step random走行、対象pytest 30件はpassしていますが、adapter成功をraw直接検査成功とは扱いません。公式config、upstream source、SB3 checkerは改変していません。
 
 upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計まで出力した後、終了コード139になりました。確認したscriptは生成したenvを明示closeしません。同じruntimeでenvを `finally` からcloseする1,000-step走行、本projectのtest、`inspect_env.py` は終了コード0なので、install不能とは判定しませんが、upstream profileのプロセス全体もpassとは判定しません。
 
@@ -466,7 +510,7 @@ upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計
 
 ## 17. 複数scenarioへ一般化するprofile
 
-`generalization_config.py` は、固定されたCurve 1本ではなく、scenario seedごとに生成される3-block道路を学習対象にします。MetaDrive同梱のgeneralization例に合わせて学習用と評価用のseed集合を分離し、評価時はランダム抽選せず先頭から一度ずつ走査します。
+`configs/generalization_config.py` は、固定されたCurve 1本ではなく、scenario seedごとに生成される3-block道路を学習対象にします。MetaDrive同梱のgeneralization例に合わせて学習用と評価用のseed集合を分離し、評価時はランダム抽選せず先頭から一度ずつ走査します。
 
 | 項目 | 学習 | 未見評価 |
 | --- | --- | --- |
@@ -501,7 +545,7 @@ upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計
 .venv/bin/python train.py --profile generalization
 ```
 
-これにより、`models/generalization.zip`、`outputs/generalization_training_metadata.json`、Monitor、TensorBoard、console logを保存します。MetaDrive 0.4.3では `reset(seed=...)` がRL乱数seedではなくscenario番号なので、PPOのseed引数へscenario seedを流用していません。学習時のscenario順序はMetaDriveが設定範囲内から選び、RL seedとは別に管理されるため、RL seedだけでは同じscenario順序を再現できません。この制約はtraining metadataにも明記します。一方、評価時は下記のとおりscenario番号を明示して比較可能にします。
+これにより、`models/generalization.zip`、`outputs/generalization/training/generalization/training_metadata.json`、Monitor、TensorBoard、console logを保存します。MetaDrive 0.4.3では `reset(seed=...)` がRL乱数seedではなくscenario番号なので、PPOのseed引数へscenario seedを流用していません。学習時のscenario順序はMetaDriveが設定範囲内から選び、RL seedとは別に管理されるため、RL seedだけでは同じscenario順序を再現できません。この制約はtraining metadataにも明記します。一方、評価時は下記のとおりscenario番号を明示して比較可能にします。
 
 未見200 scenarioの決定論的評価は次で実行します。
 
@@ -509,4 +553,4 @@ upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計
 .venv/bin/python evaluate.py --profile generalization
 ```
 
-既定ではscenario 0から199を各1回評価し、各episodeの `scenario_seed`、reward、終了理由と、全体のsuccess rate / out-of-road rateをJSONへ保存します。短く確認するときは `--episodes 5` のように指定すると、scenario 0から4だけを重複なしで評価します。既存のコマンドは `--profile official` が既定なので、Phase 0公式設定の動作は変わりません。
+既定ではscenario 0から199を各1回評価し、各episodeの `scenario_seed`、reward、終了理由と、全体のsuccess rate / out-of-road rateをJSONへ保存するとともに、200 episodeすべてをepisode別のGIF/MP4/PNGへ記録します。短く確認するときは `--episodes 5` のように指定すると、scenario 0から4だけを重複なしで評価します。全件可視化はディスク使用量と実行時間が大きくなるため、数値評価だけが必要な場合は `--no-record-gif` を併用してください。既存のコマンドは `--profile official` が既定なので、Phase 0公式設定のtask自体は変わりません。

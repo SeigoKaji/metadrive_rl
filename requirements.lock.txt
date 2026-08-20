@@ -1,4 +1,4 @@
-# Python 3.12.3 / pip 26.2.1 environment resolved on 2026-08-18.
+# Python 3.12.3 / pip 26.2.1 environment resolved on 2026-08-20.
 # MetaDrive source: ../metadrive
 # MetaDrive main commit: 85e5dadc6c7436d324348f6e3d8f8e680c06b4db
 -e ../metadrive
@@ -13,6 +13,7 @@ cuda-bindings==13.3.1
 cuda-pathfinder==1.6.0
 cuda-toolkit==13.0.3.0
 cycler==0.12.1
+et_xmlfile==2.0.0
 executing==2.2.1
 Farama-Notifications==0.0.6
 filelock==3.32.3
@@ -54,6 +55,7 @@ nvidia-nvjitlink==13.3.33
 nvidia-nvshmem-cu13==3.4.5
 nvidia-nvtx==13.0.85
 opencv-python==5.0.0.93
+openpyxl==3.1.5
 packaging==26.3
 Panda3D==1.10.16
 panda3d-gltf==0.15.0

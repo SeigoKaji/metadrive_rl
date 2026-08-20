@@ -9,7 +9,7 @@ from stable_baselines3.common.env_checker import check_env
 
 from env_factory import make_env
 from inspect_env import _CheckEnvFixedScenarioAdapter
-from phase0_config import OFFICIAL_ENV_CONFIG, SCENARIO_SEED
+from configs.phase0_config import OFFICIAL_ENV_CONFIG, SCENARIO_SEED
 
 
 # 公式dictを別ファイルへ複製せず、canonical JSONのdigestでkey/valueを厳密固定する。

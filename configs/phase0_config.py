@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Final
 
 
-PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent
+PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 
 # 公式ドキュメントのcreate_env()にある設定だけを保持する。
 # 描画や検査の都合でタスク設定をここへ追加してはならない。
@@ -46,11 +46,16 @@ LOG_DIR: Final[Path] = PROJECT_ROOT / "logs"
 MONITOR_LOG_DIR: Final[Path] = LOG_DIR / "monitor"
 TENSORBOARD_LOG_DIR: Final[Path] = LOG_DIR / "tensorboard"
 OUTPUT_DIR: Final[Path] = PROJECT_ROOT / "outputs"
-EVALUATION_RESULTS_DIR: Final[Path] = OUTPUT_DIR
 
 DEFAULT_MODEL_NAME: Final[str] = "phase0_official"
 MODEL_SAVE_PATH: Final[Path] = MODEL_DIR / DEFAULT_MODEL_NAME
-EVALUATION_RESULTS_PATH: Final[Path] = (
-    EVALUATION_RESULTS_DIR / f"{DEFAULT_MODEL_NAME}_evaluation.json"
+OFFICIAL_TRAINING_OUTPUT_DIR: Final[Path] = (
+    OUTPUT_DIR / "official" / "training" / DEFAULT_MODEL_NAME
 )
-
+OFFICIAL_EVALUATION_OUTPUT_DIR: Final[Path] = (
+    OUTPUT_DIR / "official" / "evaluation" / DEFAULT_MODEL_NAME
+)
+EVALUATION_RESULTS_DIR: Final[Path] = OFFICIAL_EVALUATION_OUTPUT_DIR
+EVALUATION_RESULTS_PATH: Final[Path] = (
+    EVALUATION_RESULTS_DIR / "evaluation.json"
+)

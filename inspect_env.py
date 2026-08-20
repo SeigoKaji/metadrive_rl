@@ -17,7 +17,7 @@ import numpy as np
 from stable_baselines3.common.env_checker import check_env
 
 from env_factory import make_env
-from phase0_config import OFFICIAL_ENV_CONFIG, OUTPUT_DIR, SCENARIO_SEED
+from configs.phase0_config import OFFICIAL_ENV_CONFIG, OUTPUT_DIR, SCENARIO_SEED
 
 if TYPE_CHECKING:
     from metadrive.envs import MetaDriveEnv
