@@ -13,6 +13,7 @@ from PIL import Image
 
 import evaluate as evaluate_module
 from env_factory import make_evaluation_env
+from evaluation_results import _termination_reason
 from evaluation_visualization import (
     STEP_TELEMETRY_FIELDS,
     ActionSwitchTracker,
@@ -71,6 +72,45 @@ def test_runtime_timing_is_derived_from_effective_config(tmp_path: Path) -> None
 def test_gif_duration_must_be_exactly_representable() -> None:
     with pytest.raises(ValueError, match="cannot be represented exactly"):
         derive_timing({"physics_world_step_size": 0.003, "decision_repeat": 1})
+
+
+def test_termination_reason_classifies_aggregate_crash_without_changing_priority(
+) -> None:
+    assert _termination_reason(
+        terminated=True,
+        truncated=False,
+        flags={"crash": True},
+    ) == "crash"
+    assert _termination_reason(
+        terminated=True,
+        truncated=False,
+        flags={"crash": True, "crash_vehicle": True},
+    ) == "crash_vehicle"
+    assert _termination_reason(
+        terminated=True,
+        truncated=False,
+        flags={"crash": True, "crash_object": True},
+    ) == "crash_object"
+    assert _termination_reason(
+        terminated=True,
+        truncated=False,
+        flags={"arrive_dest": True, "crash": True},
+    ) == "success"
+    assert _termination_reason(
+        terminated=True,
+        truncated=False,
+        flags={"crash": True, "out_of_road": True},
+    ) == "out_of_road"
+    assert _termination_reason(
+        terminated=True,
+        truncated=False,
+        flags={},
+    ) == "other_termination"
+    assert _termination_reason(
+        terminated=False,
+        truncated=True,
+        flags={},
+    ) == "max_step_truncation"
 
 
 def test_disabled_episode_recorder_creates_no_visualization_artifacts(

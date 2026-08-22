@@ -1,6 +1,6 @@
 # `model.learn()` 学習内容・環境仕様・ソース追跡調査
 
-最終確認日: 2026-08-20（Asia/Tokyo）
+最終確認日: 2026-08-21（Asia/Tokyo）
 
 ## 1. この文書の目的
 
@@ -1058,102 +1058,145 @@ steeringの符号は、vehicle進行方向を向いた運転者の視点で次�
 
 また、同レポートにあるPPO 64-stepやpytest結果も、今回再実行したのではなくreportedとして扱う。
 
-## 23. ソースを追う推奨順序
+## 23. ソースと本文の対応表・読む順序
 
-次の順に読むと、「設定した値がどこで生成され、変換され、消費されるか」を追いやすい。
+この章は、本文の説明を実ソース上で再確認するための案内図である。最初は23.2～23.4を番号順に一周し、その後で疑問に応じて23.5の枝へ進むと、「設定がどこで作られ、どのdataへ変換され、どのlossに消費されるか」を途切れずに追える。
 
-### Step 1: profileを確定する
+### 23.1 対応表の使い方
 
-1. [configs/phase0_config.py](configs/phase0_config.py)
-2. [configs/generalization_config.py](configs/generalization_config.py)
-3. [configs/experiment_profiles.py](configs/experiment_profiles.py)
+1. 表のリンクからファイルを開く。
+2. VS Codeのファイル内検索で、括弧内のclass名または関数名を検索する。
+3. 「入力 → 出力」欄と実際の引数・returnを照合する。
+4. 「確認点」を確認できたら、次の番号へ進む。
 
-ここで次を記録する。
+行番号はsource更新で変化するため、対応表ではsymbol名を主な検索キーにする。「開くソース」欄とcall図では、`→` は同一process内の呼び出し元から呼び出し先、`⇒` はprocess間通信やbufferを介したdata受け渡し、`＋` は直接callではない独立した照合先を表す。「入力 → 出力」欄だけは、関数callではなくdataの変換前後を表す。
 
-~~~text
-環境config
-PPOに明示するconfig
-train/evaluation scenario範囲
-Observation shapeを変える設定
-~~~
-
-### Step 2: 自作entry pointを追う
-
-4. [train.py](train.py) `main() → _run_training()`
-5. [env_factory.py](env_factory.py) `make_training_env()`
-6. [evaluate.py](evaluate.py) `main() → evaluation loop`
-
-ここで、自作コードはPPO内部lossやMetaDrive taskを再実装していないことを確認する。
-
-### Step 3: `model.learn()` の中へ入る
-
-7. [SB3 on_policy_algorithm.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/on_policy_algorithm.py)
-   - `learn()`
-   - `collect_rollouts()`
-8. [SB3 buffers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/buffers.py)
-   - `RolloutBuffer.add()`
-   - `compute_returns_and_advantage()`
-9. [SB3 ppo.py](.venv/lib/python3.12/site-packages/stable_baselines3/ppo/ppo.py)
-   - `PPO.__init__()`
-   - `PPO.train()`
-10. [SB3 policies.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py)
-    - `ActorCriticPolicy`
-11. [SB3 distributions.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/distributions.py)
-    - `CategoricalDistribution`
-
-この順で、次のdata boundaryを見る。
+学習時には、PPOとRolloutBufferは親process、各MetaDrive環境はSubprocVecEnvのworker processで動く。最短の一本線は次である。
 
 ~~~text
-生成: policy(obs) → action/value/log_prob
-変換: env.step(action) → reward/next_obs/done/info
-保存: RolloutBuffer
-後処理: GAE/return
-消費: PPO loss
-更新: backward/optimizer.step
+親process:
+  train.main
+    ├→ parse_args
+    └→ _run_training
+        ├→ SubprocVecEnv.__init__
+        ├→ PPO.__init__
+        └→ PPO.learn
+            → OnPolicyAlgorithm.learn
+                ├→ collect_rollouts
+                │   ├→ ActorCriticPolicy.forward
+                │   └→ VecEnv.step（SubprocVecEnvが継承）
+                │       ├→ SubprocVecEnv.step_async
+                │       │   ⇒ SubprocVecEnv._worker
+                │       └→ SubprocVecEnv.step_wait
+
+worker process:
+  SubprocVecEnv._worker
+    → Monitor.step
+    → BaseEnv.step
+      ├→ BaseEnv._step_simulator
+      │   ├→ BaseEngine.before_step
+      │   │   → BaseAgentManager.before_step
+      │   │   → BaseAgentManager.try_actuate_agent
+      │   │   ├→ EnvInputPolicy.act
+      │   │   └→ BaseVehicle.before_step
+      │   ├→ BaseEngine.step
+      │   └→ BaseEngine.after_step
+      └→ BaseEnv._get_step_return
+          ├→ MetaDriveEnv.reward_function
+          ├→ MetaDriveEnv.done_function
+          ├→ MetaDriveEnv.cost_function
+          └→ LidarStateObservation.observe
+    ⇒ SubprocVecEnv.step_wait
+
+親processのOnPolicyAlgorithm.learnへ戻る:
+  collect_rollouts
+    ├→ RolloutBuffer.add（各step）
+    └→ RolloutBuffer.compute_returns_and_advantage（rollout末尾）
+  OnPolicyAlgorithm.learn
+    └→ PPO.train
+        ├→ RolloutBuffer.get
+        ├→ ActorCriticPolicy.evaluate_actions
+        ├→ loss.backward
+        └→ optimizer.step
 ~~~
 
-### Step 4: MetaDriveの1 stepを追う
+### 23.2 設定からPPO生成まで
 
-12. [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)
-    - `step()`
-    - `_step_simulator()`
-    - `_get_step_return()`
-13. [MetaDrive metadrive_env.py](../metadrive/metadrive/envs/metadrive_env.py)
-    - `reward_function()`
-    - `cost_function()`
-    - `done_function()`
+| 順 | 本文との対応 | 開くソースと検索symbol | 入力 → 出力 | ここで確認すること |
+| ---: | --- | --- | --- | --- |
+| 1 | §4、§8、§12 | [train.py](train.py)（`main`、`parse_args`） | CLI引数 → `args` | `--profile` を先に解釈し、選択profileの値を `timesteps`、`num_envs`、`n_steps` 等のCLI既定値にしている。CLI指定があれば既定値を上書きする。 |
+| 2 | §8、§12 | [configs/experiment_profiles.py](configs/experiment_profiles.py)（`ExperimentProfile`、`get_experiment_profile`） | `"official"` / `"generalization"` → 設定bundle | 学習環境、評価環境、PPO設定、model名、評価episode数が同じprofileから選ばれる。 |
+| 3 | §8、§12、§14、§18 | [configs/phase0_config.py](configs/phase0_config.py)（`OFFICIAL_ENV_CONFIG`、`OFFICIAL_TRAINING_CONFIG`）または [configs/generalization_config.py](configs/generalization_config.py)（`GENERALIZATION_TRAIN_ENV_CONFIG`、`GENERALIZATION_TRAINING_CONFIG`） | profile → 環境configと学習config | map、scenario範囲、`random_agent_model`、`Discrete(9)` 関連設定、4環境、`n_steps=4096`、要求timestep、`MlpPolicy` を記録する。これらはCLIで上書き可能な値と固定環境値に分けて読む。 |
+| 4 | §4、§12.3 | [train.py](train.py)（`_run_training`、`env_factories`） | `args` + profile → worker factoryの配列 | `set_random_seed(args.seed)`、rankごとの `partial(make_training_env, ...)`、`SubprocVecEnv` の生成を確認する。PPO constructorへは `seed` を渡していない。 |
+| 5 | §3、§4、§13 | [env_factory.py](env_factory.py)（`make_env`、`make_training_env`） | profileの環境config → `Monitor[MetaDriveEnv]` | `MetaDriveEnv(dict(selected_config))` を生成し、Action/Observation spaceだけを `seed + rank` でseedし、記録用 `Monitor` で包む。RewardやObservationを加工するwrapperではない。 |
+| 6 | §9～§20 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`BaseEnv.__init__` → `self.default_config()`）→ [MetaDrive metadrive_env.py](../metadrive/metadrive/envs/metadrive_env.py)（`MetaDriveEnv.default_config`） | MetaDrive default + project config → runtime `self.config` | `BaseEnv.__init__()` から動的に `MetaDriveEnv.default_config()` を呼び、task既定値を得てproject設定をmergeする。Reward係数、sensor値など、profileが指定しない値はここから来る。 |
+| 7 | §4 | [SB3 subproc_vec_env.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/vec_env/subproc_vec_env.py)（`SubprocVecEnv.__init__`、`_worker`） | env factory配列 → 4 workerとVecEnv | factoryはworker内で実行される。親processのPPOからActionが送信され、workerからObservation、Reward、done、infoが返るprocess境界を確認する。 |
+| 8 | §5、§8 | [SB3 ppo.py](.venv/lib/python3.12/site-packages/stable_baselines3/ppo/ppo.py)（`policy_aliases`、`PPO.__init__` → `PPO._setup_model`）→ [SB3 on_policy_algorithm.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/on_policy_algorithm.py)（`OnPolicyAlgorithm._setup_model`） | `MlpPolicy` + VecEnv + `n_steps` → PolicyとRolloutBuffer | `MlpPolicy` が `ActorCriticPolicy` に解決される。VecEnvのObservation/Action spaceを基にPolicyを作り、`n_steps × n_envs` のRolloutBufferを作る。PPOの未指定hyperparameterは `PPO.__init__` の既定値を使う。 |
+| 9 | §5.3 | [SB3 policies.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py)（`ActorCriticPolicy.__init__` → `_build` → `_build_mlp_extractor`）→ [SB3 torch_layers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/torch_layers.py)（`MlpExtractor`） | Observation/Action space → Actor/Critic networkとoptimizer | Actor/Critic各 `[64, 64]`、Tanh、9-logitの `action_net`、1値の `value_net`、全parameterを持つAdam optimizerの生成箇所を確認する。 |
 
-`reward` と `info["cost"]` が別経路で作られ、PPO側にはRewardだけが入ることを確認する。
+この時点で、「このprojectが明示した値」と「SB3のdefaultから継承した値」を分離できる。次に、作られたPolicyとBufferがどう使われるかを追う。
 
-### Step 5: Observationを追う
+### 23.3 `model.learn()`、rollout、GAE、PPO更新
 
-14. [MetaDrive state_obs.py](../metadrive/metadrive/obs/state_obs.py)
-15. [MetaDrive node_network_navigation.py](../metadrive/metadrive/component/navigation_module/node_network_navigation.py)
-16. [MetaDrive distance_detector.py](../metadrive/metadrive/component/sensors/distance_detector.py)
-17. [MetaDrive lidar.py](../metadrive/metadrive/component/sensors/lidar.py)
-18. [MetaDrive base_vehicle.py](../metadrive/metadrive/component/vehicle/base_vehicle.py)
+| 順 | 本文との対応 | 開くソースと検索symbol | 入力 → 出力 | ここで確認すること |
+| ---: | --- | --- | --- | --- |
+| 10 | §4、§6 | [train.py](train.py)（`model.learn`）→ [SB3 ppo.py](.venv/lib/python3.12/site-packages/stable_baselines3/ppo/ppo.py)（`PPO.learn`）→ [SB3 on_policy_algorithm.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/on_policy_algorithm.py)（`OnPolicyAlgorithm.learn`） | 要求 `total_timesteps` → rollout/update loop | `PPO.learn()` は親classへ委譲し、`collect_rollouts()` と `self.train()` を要求timestep以上になるまで交互に呼ぶ。 |
+| 11 | §6 | [SB3 base_class.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/base_class.py)（`_setup_learn`） | VecEnv → 最初の `_last_obs` | 学習開始時の `env.reset()`、最初のObservation、`_last_episode_starts` の初期化を確認する。 |
+| 12 | §4.2、§5、§6 | [SB3 on_policy_algorithm.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/on_policy_algorithm.py)（`collect_rollouts`） | `_last_obs` → `actions, values, log_probs` | `obs_as_tensor` の後に `self.policy(obs_tensor)` を呼び、ActorのActionとlog probability、Criticのvalueを同時に得る。 |
+| 13 | §5、§20 | [SB3 policies.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py)（`ActorCriticPolicy.forward` → `_get_action_dist_from_latent`）→ [SB3 distributions.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/distributions.py)（`CategoricalDistribution.proba_distribution`）。分布classの初期選択は同ファイルの `make_proba_distribution` | 259/261次元Observation → 9 logits → Action ID | Discrete(9)なのでCategorical分布になる。学習時の `deterministic=False` では `sample()`、評価時は `mode()` を使う。 |
+| 14 | §4.2、§9～§20 | [SB3 on_policy_algorithm.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/on_policy_algorithm.py)（`env.step(clipped_actions)`）⇒ [SB3 subproc_vec_env.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/vec_env/subproc_vec_env.py)（`step_async`、`_worker`、`step_wait`） | Action ID → worker → `new_obs, rewards, dones, infos` | ここが親processからMetaDrive workerへの境界である。worker側の詳細は23.4で追う。 |
+| 15 | §6、§10、§11 | [SB3 on_policy_algorithm.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/on_policy_algorithm.py)（timeout処理、`rollout_buffer.add`）→ [SB3 buffers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/buffers.py)（`RolloutBuffer.add`） | obs、Action、Reward、episode start、value、log probability → buffer | 保存fieldを引数から確認する。`infos` と `info["cost"]` は `add()` へ渡されず、cost専用fieldもない。純粋なtime limitではterminal valueをRewardへbootstrapする。 |
+| 16 | §6.1 | [SB3 buffers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/buffers.py)（`compute_returns_and_advantage`） | Reward、value、done、`gamma`、`gae_lambda` → advantageとreturn | 後ろ向きloopの `delta`、`last_gae_lam`、`self.returns = self.advantages + self.values` を本文のGAE式と一行ずつ対応させる。 |
+| 17 | §7、§8 | [SB3 ppo.py](.venv/lib/python3.12/site-packages/stable_baselines3/ppo/ppo.py)（`PPO.train`）→ [SB3 buffers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/buffers.py)（`RolloutBuffer.get`） | full buffer → shuffleされた64件minibatch → loss | profile既定値のままなら16,384 transitionをflatten・shuffleし、64件minibatchで10 epoch反復する。`num_envs` または `n_steps` をCLIで変えるとrollout件数も変わる。 |
+| 18 | §5、§7 | [SB3 ppo.py](.venv/lib/python3.12/site-packages/stable_baselines3/ppo/ppo.py)（`PPO.train`）→ [SB3 policies.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py)（`evaluate_actions`） | minibatch → current value/log probability/entropy → gradient | `evaluate_actions()` から戻った後、`PPO.train()` がadvantage正規化、確率比、clip、value MSE、entropy、total lossを計算し、`zero_grad()`、`backward()`、gradient clipping、`optimizer.step()` でActor/Criticを更新する。これが「学習している」直接箇所である。 |
 
-shapeの算術だけで終わらず、`observe()` のappend順を追ってindex順を確定する。
+順12～18を追えば、ObservationがActionへ変わり、環境Rewardがbufferへ入り、GAEとlossを経てnetwork parameterが更新される一周を確認できる。
 
-### Step 6: Actionを追う
+### 23.4 MetaDrive worker内の1 decision
 
-19. [MetaDrive env_input_policy.py](../metadrive/metadrive/policy/env_input_policy.py)
-20. [MetaDrive base_vehicle.py](../metadrive/metadrive/component/vehicle/base_vehicle.py)
-21. [MetaDrive manual_controller.py](../metadrive/metadrive/engine/core/manual_controller.py)
-22. [MetaDrive steering test](../metadrive/metadrive/tests/test_component/test_set_get_vehicle_attribute.py)
+| 順 | 本文との対応 | 開くソースと検索symbol | 入力 → 出力 | ここで確認すること |
+| ---: | --- | --- | --- | --- |
+| 19 | §4.2 | [SB3 subproc_vec_env.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/vec_env/subproc_vec_env.py)（`_worker`）→ [SB3 monitor.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/monitor.py)（`Monitor.step`） | 親processから届いたAction ID → raw env | `_worker` が `env.step(data)` を呼び、Monitorが同じActionをMetaDriveへ渡す。Monitorはepisode統計をinfoへ足すがReward自体を作り直さない。 |
+| 20 | §4.2 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`BaseEnv.step`、`_preprocess_actions`） | 単一Action ID → agent IDをkeyにしたdict | single-agent Actionをagent dictへ包み、`_step_simulator()`、`_get_step_return()` の順に進む。 |
+| 21 | §20 | [MetaDrive base_engine.py](../metadrive/metadrive/engine/base_engine.py)（`before_step`）→ [MetaDrive base_manager.py](../metadrive/metadrive/manager/base_manager.py)（`BaseAgentManager.before_step` → `try_actuate_agent`）→ [MetaDrive env_input_policy.py](../metadrive/metadrive/policy/env_input_policy.py)（`act` → `convert_to_continuous_action`） | Action ID 0～8 → `[steering, throttle/brake]` | `action % 3 - 1` と `action // 3 - 1` の変換を確認する。ここで9個の離散Actionが2個の車両制御値へ変わる。 |
+| 22 | §20 | [MetaDrive base_vehicle.py](../metadrive/metadrive/component/vehicle/base_vehicle.py)（`before_step`、`_set_action`、`_apply_throttle_brake`） | `[steering, throttle/brake]` → Bullet vehicle制御 | steeringを前輪へ設定し、正の第2要素はengine force、負は既定ではbrakeへ変換する。左右符号はmanual controllerとsteering testでも照合する。 |
+| 23 | §4.2 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`_step_simulator`）→ [MetaDrive base_engine.py](../metadrive/metadrive/engine/base_engine.py)（`BaseEngine.step`） | 車両制御値 → 5 physics substep後の状態 | `engine.before_step(actions)`、`engine.step(decision_repeat)`、`engine.after_step()` の順を確認する。0.02秒 × 5回なので1 decisionはsimulation上0.1秒である。 |
+| 24 | §9～§16 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`_step_simulator`）→ [MetaDrive base_engine.py](../metadrive/metadrive/engine/base_engine.py)（`after_step`）→ [MetaDrive base_manager.py](../metadrive/metadrive/manager/base_manager.py)（agent managerの `after_step`）→ [MetaDrive base_vehicle.py](../metadrive/metadrive/component/vehicle/base_vehicle.py)（`after_step`）。各callからreturn後、`BaseEnv.step` → `BaseEnv._get_step_return` | physics後のvehicle state → Reward、終了値、cost、next Observation | vehicle/navigation/collision/lane状態のafter-step処理を終えてから、`_get_step_return()` が `reward_function()`、`done_function()`、`cost_function()`、`observation.observe()` を各agentについて呼ぶ。 |
+| 25 | §9 | [MetaDrive metadrive_env.py](../metadrive/metadrive/envs/metadrive_env.py)（`reward_function`） | last/current state → scalar Reward + reward info | 通常時の前進距離項と速度項、terminal時の置換順を確認する。このscalar RewardだけがSB3のReward列へ進む。 |
+| 26 | §10 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`_get_step_return`）→ [MetaDrive metadrive_env.py](../metadrive/metadrive/envs/metadrive_env.py)（`cost_function`） | crash/road flag → scalar cost → `info["cost"]` | `cost_function()` の第1戻り値は `_` で捨てられ、辞書側だけがinfoへmergeされる。順15の `RolloutBuffer.add()` には届かない。 |
+| 27 | §11 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`_get_step_return`）→ [MetaDrive metadrive_env.py](../metadrive/metadrive/envs/metadrive_env.py)（`done_function`） | task flagとhorizon → `terminated` / `truncated` | 現行profileでは到着やcrash等をterminated、`MAX_STEP`をtruncatedへ分ける。`truncate_as_terminate=True` に変更した場合はhorizon到達時にterminatedもtrueになり得る。 |
+| 28 | §6、§11 | [SB3 subproc_vec_env.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/vec_env/subproc_vec_env.py)（`_worker`） | raw 5戻り値 → VecEnvの4戻り値 | `terminated or truncated` を `done` へまとめ、`TimeLimit.truncated` と `terminal_observation` をinfoへ保存する。終了時はworkerでresetし、結果を親processの順15へ返す。 |
 
-`Action ID → steering/throttle → BulletVehicle` を追い、左右はmanual inputと物理testで照合する。
+### 23.5 疑問別の分岐対応表
 
-### Step 7: artifactとcontractを確認する
+主経路を一周した後は、知りたい内容だけを次の入口から追う。
 
-23. [tests](tests)
-24. [CODE_WALKTHROUGH.md](CODE_WALKTHROUGH.md)
-25. [RUN_REPORT.md](RUN_REPORT.md)
-26. `models/*.zip` のSB3 `data`
-27. `outputs/**/training_metadata.json`
-28. `outputs/**/evaluation.json`
+| 知りたい内容 | 本文 | ソースを開く順序 | 最終的に確認するもの |
+| --- | --- | --- | --- |
+| scenario seedとmap生成 | §12.2～§12.3 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`reset` → `_reset_global_seed`、および `reset` → `engine.reset`）→ [MetaDrive pg_map_manager.py](../metadrive/metadrive/manager/pg_map_manager.py)（`PGMapManager.reset`） | `reset(seed=...)` がscenario indexであり、engine managerのreset時に現在seedがmap生成・再利用へ渡ること。 |
+| Observation classの選択 | §13 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`get_single_observation`）→ [MetaDrive state_obs.py](../metadrive/metadrive/obs/state_obs.py)（`LidarStateObservation`） | `image_observation=False` なのでLidar付きstate vectorが選ばれること。 |
+| 259/261次元のshape | §14、§18 | [MetaDrive state_obs.py](../metadrive/metadrive/obs/state_obs.py)（`LidarStateObservation.observation_space` → 内部の `StateObservation.observation_space`） | `official = 9 + 10 + 240`、`random_agent_model=True` では車長・車幅が先頭に加わり `11 + 10 + 240` になること。 |
+| Ego・道路状態の全index | §14.2 | [MetaDrive state_obs.py](../metadrive/metadrive/obs/state_obs.py)（`vehicle_state`） | docstringでなく、`info.append(...)` と `info += ...` の実際の順からindex 0～8、または0～10を確定すること。 |
+| Navigation 10次元 | §15 | 生成時: [MetaDrive node_network_navigation.py](../metadrive/metadrive/component/navigation_module/node_network_navigation.py)（`update_localization` → `_get_info_for_checkpoint`）。読出し時: [MetaDrive state_obs.py](../metadrive/metadrive/obs/state_obs.py)（`StateObservation.observe`）→ [MetaDrive base_navigation.py](../metadrive/metadrive/component/navigation_module/base_navigation.py)（`get_navi_info`） | current/next checkpointそれぞれ5値の生成式、50 m crop、曲率・方向・角度encodingが `_navi_info` へ保存され、Observation生成時に読み出されること。 |
+| LiDAR 240次元と最大距離 | §16～§17 | [MetaDrive state_obs.py](../metadrive/metadrive/obs/state_obs.py)（`lidar_observe`）→ [MetaDrive lidar.py](../metadrive/metadrive/component/sensors/lidar.py)（`perceive`）→ [MetaDrive distance_detector.py](../metadrive/metadrive/component/sensors/distance_detector.py)（`perceive`） | 240 ray、50 m、Bullet hit fraction、未hit時1.0、noise/dropout 0。意味として `d/50` 相当だが、実装値はrayのhit fractionであること。 |
+| Action spaceが9個になる理由 | §20 | 生成時: [MetaDrive base_manager.py](../metadrive/metadrive/manager/base_manager.py)（`BaseAgentManager.__init__` → `_get_action_space`）→ [MetaDrive env_input_policy.py](../metadrive/metadrive/policy/env_input_policy.py)（`get_input_space`）。参照時: [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`action_space`）→ `BaseAgentManager.get_action_spaces` | Action spaceが生成時にcacheされ、参照時に返される経路と、`Discrete(discrete_steering_dim × discrete_throttle_dim) = Discrete(9)`。 |
+| steeringの左右 | §20 | [MetaDrive env_input_policy.py](../metadrive/metadrive/policy/env_input_policy.py)（`convert_to_continuous_action`）＋ [MetaDrive manual_controller.py](../metadrive/metadrive/engine/core/manual_controller.py) ＋ [MetaDrive steering test](../metadrive/metadrive/tests/test_component/test_set_get_vehicle_attribute.py) | `+1 = 左`、`-1 = 右` を変換式、manual input、物理testの3か所で独立に照合すること。 |
+| Reward係数の出所 | §9 | [MetaDrive metadrive_env.py](../metadrive/metadrive/envs/metadrive_env.py)（`METADRIVE_DEFAULT_CONFIG` と `reward_function`）| profileは係数を上書きしていないため、両profileが同じdefault Rewardを使うこと。 |
+| costが学習されない理由 | §10 | [MetaDrive base_env.py](../metadrive/metadrive/envs/base_env.py)（`_get_step_return`）→ [MetaDrive metadrive_env.py](../metadrive/metadrive/envs/metadrive_env.py)（`cost_function`）。完成したinfo ⇒ [SB3 on_policy_algorithm.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/on_policy_algorithm.py)（`collect_rollouts`）→ [SB3 buffers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/buffers.py)（`RolloutBuffer.add`） | costはinfoまでは来るが、`collect_rollouts()` が `add()` へinfoを渡さないため、bufferのfieldにもPPO lossの入力にもならないこと。 |
+| Actor/Criticのnetwork構造 | §5 | [SB3 policies.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py)（`ActorCriticPolicy.__init__` → `_build` → `_build_mlp_extractor` → `MlpExtractor`、および `_build` 内のAction/value出力層）＋ [SB3 torch_layers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/torch_layers.py)（`MlpExtractor`）＋ [SB3 distributions.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/distributions.py)（`CategoricalDistribution`） | ActorとCriticは別の64×64 branchを持ち、Actorが9 logits、Criticが1 valueを返すこと。 |
+| PPOのlossと更新 | §6～§8 | [SB3 buffers.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/buffers.py)（`compute_returns_and_advantage`）⇒ [SB3 ppo.py](.venv/lib/python3.12/site-packages/stable_baselines3/ppo/ppo.py)（`train` → `RolloutBuffer.get`、`train` → `ActorCriticPolicy.evaluate_actions`）＋ [SB3 policies.py](.venv/lib/python3.12/site-packages/stable_baselines3/common/policies.py)（`evaluate_actions`） | GAE/return、確率比、clip、value MSE、entropy係数、backpropagationを本文の各数式と対応させること。 |
 
-設定値、test、reported run、現物artifactを混同しない。
+### 23.6 評価、保存、artifactの対応表
+
+| 順 | 本文との対応 | 開くソースと検索symbol | ここで確認すること |
+| ---: | --- | --- | --- |
+| 29 | §22 | [train.py](train.py)（`model.save`、`PPO.load`、`training_metadata.json`） | 学習終了後にmodelを保存し、size/hashを取り、同じVecEnvでreloadしてspace互換性を確認してからmetadataを書く。 |
+| 30 | §21～§22 | [evaluate.py](evaluate.py)（`PPO.load`、`model.predict`、evaluation loop） | parameter更新はせず、`deterministic=True` でActionを選び、指定scenarioを1 episodeずつ走らせる。 |
+| 31 | §21～§22 | [evaluate.py](evaluate.py)（`episode_result`、`aggregate`、`evaluation.json`） | episode Reward、success、終了理由等が評価artifactへ集計される一方、現行実装ではcostを集計していない。 |
+| 32 | §22、§25 | [tests/test_phase0_contract.py](tests/test_phase0_contract.py)、[tests/test_generalization_config.py](tests/test_generalization_config.py) | testは設定・space・最小step等のcontractを確認するもので、full学習の完走や性能の証拠ではない。 |
+| 33 | §22 | [RUN_REPORT.md](RUN_REPORT.md)、`models/*.zip`、`outputs/**/training_metadata.json`、`outputs/**/evaluation.json` | reported記録、設定予定、現存artifactを分離する。実行済みの主張はmodel metadata、hash、evaluation JSON等の現物で確認する。 |
+
+まず順1～28を一周すれば、「どのObservationからActionを選び、どのRewardをbufferへ保存し、どのlossでActor/Criticを更新するか」をprogramの実行順で理解できる。順29以降は、学習済みmodelが本当に保存・評価されたかを確認する別の経路である。
 
 ## 24. 読むときのチェックリスト
 

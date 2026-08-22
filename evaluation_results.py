@@ -80,6 +80,8 @@ def _termination_reason(
         return "crash_vehicle"
     if bool(flags.get("crash_object", False)):
         return "crash_object"
+    if bool(flags.get("crash", False)):
+        return "crash"
     if terminated:
         return "other_termination"
     if truncated:
