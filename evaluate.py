@@ -11,7 +11,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping, TextIO
 
 from stable_baselines3 import PPO
@@ -29,7 +29,12 @@ from evaluation_visualization import (
     make_step_telemetry,
     read_runtime_road_metrics,
 )
-from configs.experiment_profiles import PROFILE_NAMES, get_experiment_profile
+from configs.experiment_config import (
+    ExperimentConfigError,
+    experiment_selection_from_args,
+    select_experiment,
+)
+from configs.experiment_profiles import PROFILE_NAMES
 from configs.phase0_config import (
     LOG_DIR,
     MODEL_DIR,
@@ -98,7 +103,15 @@ def _positive_int(value: str) -> int:
 def _output_prefix(value: str) -> str:
     """Accept a basename only so generated artifacts remain under outputs/."""
 
-    if not value or Path(value).name != value or value in {".", ".."}:
+    if (
+        not value
+        or value in {".", ".."}
+        or "\x00" in value
+        or "/" in value
+        or "\\" in value
+        or Path(value).name != value
+        or PureWindowsPath(value).name != value
+    ):
         raise argparse.ArgumentTypeError("--output-prefixはディレクトリを含まない名前にしてください")
     return value
 
@@ -141,42 +154,67 @@ def _evaluation_output_directory(profile_name: str, output_prefix: str) -> Path:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse deterministic evaluation options for the selected profile."""
+    """選択profileまたはTOML bundleを評価CLI既定値としてparseする。"""
 
-    profile_parser = argparse.ArgumentParser(add_help=False)
-    profile_parser.add_argument(
+    profile_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    selection_group = profile_parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
         "--profile",
         choices=PROFILE_NAMES,
-        default="official",
+        default=None,
     )
+    selection_group.add_argument("--config", type=Path, default=None)
     selected, _unknown = profile_parser.parse_known_args(argv)
-    profile = get_experiment_profile(selected.profile)
+    try:
+        experiment = select_experiment(
+            profile_name=selected.profile,
+            config_path=selected.config,
+        )
+    except ExperimentConfigError as error:
+        profile_parser.error(str(error))
+    profile = experiment.profile
+    evaluation_defaults = profile.evaluation_defaults
 
     parser = argparse.ArgumentParser(
         description="MetaDriveの保存済みPPOを評価",
+        allow_abbrev=False,
     )
-    parser.add_argument(
+    selection_group = parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
         "--profile",
         choices=PROFILE_NAMES,
-        default=selected.profile,
+        default=selected.profile or "official",
         help="評価環境profile（既定: official）",
+    )
+    selection_group.add_argument(
+        "--config",
+        type=Path,
+        default=selected.config,
+        help="実験bundle TOML（相対パスはproject直下基準）",
     )
     parser.add_argument(
         "--model",
         type=Path,
-        default=MODEL_DIR / f"{profile.default_model_name}.zip",
+        default=Path(
+            str(
+                evaluation_defaults.get(
+                    "model_path",
+                    MODEL_DIR / f"{profile.default_model_name}.zip",
+                )
+            )
+        ),
         help="PPO .zipモデル（相対パスはproject直下基準）",
     )
     parser.add_argument(
         "--episodes",
         type=_positive_int,
-        default=profile.evaluation_episodes,
+        default=int(evaluation_defaults.get("episodes", profile.evaluation_episodes)),
         help="評価episode数",
     )
     parser.add_argument(
         "--record-gif",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=bool(evaluation_defaults.get("record_gif", True)),
         help=(
             "全評価episodeをtop-down GIF/MP4とフレーム別PNGで記録"
             "（既定: 有効、--no-record-gifで全て無効）"
@@ -185,34 +223,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-prefix",
         type=_output_prefix,
-        default=profile.default_model_name,
+        default=str(evaluation_defaults.get("output_prefix", profile.default_model_name)),
         help="outputs/とlogs/で使うベース名",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=int(profile.training_config["seed"]),
+        default=int(
+            evaluation_defaults.get("seed", profile.training_config["seed"])
+        ),
         help="評価過程のRL乱数seed（scenario seed範囲とは別）",
     )
     parser.add_argument(
         "--device",
-        default="cpu",
+        default=str(evaluation_defaults.get("device", "cpu")),
         help="PPO.load()に指定するdevice",
     )
     parser.add_argument(
         "--log-file",
         type=Path,
-        default=None,
+        default=(
+            None
+            if evaluation_defaults.get("log_file") is None
+            else Path(str(evaluation_defaults["log_file"]))
+        ),
         help="標準出力/標準エラーの複製先（相対パスはPhase 0直下基準）",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=bool(evaluation_defaults.get("deterministic", True)),
+        help="PPOの決定論的action選択（既定: config値、--no-deterministicで無効）",
+    )
+    args = parser.parse_args(argv)
+    args.profile = experiment.name
+    args.config = experiment.source_path
+    args.experiment = experiment
+    args.experiment_selection = experiment
+    return args
 
 
 def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
-    """Run deterministic evaluation and optionally record every episode."""
+    """設定されたaction選択で評価し、必要なら全episodeを記録する。"""
 
-    profile = get_experiment_profile(args.profile)
+    experiment = experiment_selection_from_args(args)
+    profile = experiment.profile
     environment_config = profile.evaluation_env_config
+    record_gif = bool(getattr(args, "record_gif", True))
+    deterministic = bool(getattr(args, "deterministic", True))
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
     if scenario_count > 1 and args.episodes > scenario_count:
@@ -234,7 +292,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     set_random_seed(args.seed)
     model = PPO.load(str(model_path), device=args.device)
     actual_device = str(model.device)
-    run_dir = _evaluation_output_directory(args.profile, args.output_prefix)
+    run_dir = _evaluation_output_directory(experiment.name, args.output_prefix)
     _prepare_evaluation_output_directory(run_dir)
     result_path = run_dir / "evaluation.json"
     step_trace_path = run_dir / "evaluation_steps.jsonl"
@@ -271,7 +329,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         try:
             env = make_evaluation_env(
                 seed=args.seed,
-                record_gif=args.record_gif,
+                record_gif=record_gif,
                 env_config=environment_config,
             )
             check_for_correct_spaces(env, model.observation_space, model.action_space)
@@ -320,7 +378,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     history_length=action_history_length
                 )
                 active_recorder = _EpisodeVisualizationRecorder(
-                    requested=args.record_gif,
+                    requested=record_gif,
                     run_dir=run_dir,
                     episode_number=episode_number,
                     scenario_seed=actual_scenario_seed,
@@ -331,7 +389,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     active_recorder.set_timing(simulation_timing)
 
                 while True:
-                    action, _state = model.predict(obs, deterministic=True)
+                    action, _state = model.predict(obs, deterministic=deterministic)
                     decoded_action = decode_discrete_action(action, env.config)
                     obs, reward, terminated, truncated, info = env.step(action)
                     step_reward = float(reward)
@@ -496,7 +554,8 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             "requested_device": args.device,
             "actual_device": actual_device,
         },
-        "profile": args.profile,
+        "profile": experiment.name,
+        "config_source": experiment.source_metadata(),
         "output_directory": str(run_dir.resolve()),
         "environment_config": dict(environment_config),
         "scenario_seed_range": {
@@ -504,7 +563,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             "stop_exclusive": scenario_start + scenario_count,
         },
         "rl_seed": args.seed,
-        "deterministic": True,
+        "deterministic": deterministic,
         "simulation_timing": simulation_timing.to_dict(),
         "episode_count": args.episodes,
         "episodes": episodes,

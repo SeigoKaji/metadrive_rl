@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final, Literal, TypeAlias
 
 from .generalization_config import (
@@ -28,6 +28,10 @@ class ExperimentProfile:
     training_config: Mapping[str, object]
     default_model_name: str
     evaluation_episodes: int
+    # ``evaluation_episodes`` is retained for callers of the original profile
+    # API.  New external config files need a few more evaluation defaults, so
+    # keep them together without making the built-in profiles less compatible.
+    evaluation_defaults: Mapping[str, object] = field(default_factory=dict)
 
 
 OFFICIAL_PROFILE: Final[ExperimentProfile] = ExperimentProfile(
@@ -36,6 +40,14 @@ OFFICIAL_PROFILE: Final[ExperimentProfile] = ExperimentProfile(
     training_config=OFFICIAL_TRAINING_CONFIG,
     default_model_name="phase0_official",
     evaluation_episodes=1,
+    evaluation_defaults={
+        "episodes": 1,
+        "record_gif": True,
+        "output_prefix": "phase0_official",
+        "seed": int(OFFICIAL_TRAINING_CONFIG["seed"]),
+        "device": "cpu",
+        "deterministic": True,
+    },
 )
 
 GENERALIZATION_PROFILE: Final[ExperimentProfile] = ExperimentProfile(
@@ -44,6 +56,14 @@ GENERALIZATION_PROFILE: Final[ExperimentProfile] = ExperimentProfile(
     training_config=GENERALIZATION_TRAINING_CONFIG,
     default_model_name=GENERALIZATION_DEFAULT_MODEL_NAME,
     evaluation_episodes=GENERALIZATION_EVALUATION_EPISODES,
+    evaluation_defaults={
+        "episodes": GENERALIZATION_EVALUATION_EPISODES,
+        "record_gif": True,
+        "output_prefix": GENERALIZATION_DEFAULT_MODEL_NAME,
+        "seed": int(GENERALIZATION_TRAINING_CONFIG["seed"]),
+        "device": "cpu",
+        "deterministic": True,
+    },
 )
 
 PROFILE_NAMES: Final[tuple[ProfileName, ...]] = ("official", "generalization")

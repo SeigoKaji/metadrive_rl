@@ -22,7 +22,13 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from env_factory import make_training_env
-from configs.experiment_profiles import PROFILE_NAMES, get_experiment_profile
+from configs.experiment_config import (
+    ExperimentConfigError,
+    experiment_selection_from_args,
+    normalize_model_name,
+    select_experiment,
+)
+from configs.experiment_profiles import PROFILE_NAMES
 from configs.phase0_config import (
     LOG_DIR,
     MODEL_DIR,
@@ -68,12 +74,10 @@ def _positive_int(value: str) -> int:
 def _model_stem(value: str) -> str:
     """Validate a model basename and normalize an optional .zip suffix."""
 
-    if not value or Path(value).name != value:
-        raise argparse.ArgumentTypeError("--model-nameはディレクトリを含まないファイル名にしてください")
-    stem = value[:-4] if value.endswith(".zip") else value
-    if stem in {"", ".", ".."}:
-        raise argparse.ArgumentTypeError("--model-nameに有効な名前を指定してください")
-    return stem
+    try:
+        return normalize_model_name(value, "--model-name")
+    except ExperimentConfigError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
 
 
 def _default_training_log(model_name: str) -> Path:
@@ -149,26 +153,43 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse training options using the selected profile as CLI defaults."""
+    """選択profileまたはTOML bundleをCLI既定値としてparseする。"""
 
-    profile_parser = argparse.ArgumentParser(add_help=False)
-    profile_parser.add_argument(
+    profile_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    selection_group = profile_parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
         "--profile",
         choices=PROFILE_NAMES,
-        default="official",
+        default=None,
     )
+    selection_group.add_argument("--config", type=Path, default=None)
     selected, _unknown = profile_parser.parse_known_args(argv)
-    profile = get_experiment_profile(selected.profile)
+    try:
+        experiment = select_experiment(
+            profile_name=selected.profile,
+            config_path=selected.config,
+        )
+    except ExperimentConfigError as error:
+        profile_parser.error(str(error))
+    profile = experiment.profile
     training_config = profile.training_config
 
     parser = argparse.ArgumentParser(
         description="MetaDrive SB3 PPO学習",
+        allow_abbrev=False,
     )
-    parser.add_argument(
+    selection_group = parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
         "--profile",
         choices=PROFILE_NAMES,
-        default=selected.profile,
+        default=selected.profile or "official",
         help="環境・学習設定profile（既定: official）",
+    )
+    selection_group.add_argument(
+        "--config",
+        type=Path,
+        default=selected.config,
+        help="実験bundle TOML（相対パスはproject直下基準）",
     )
     parser.add_argument(
         "--timesteps",
@@ -196,13 +217,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        default="cpu",
+        default=str(training_config.get("device", "cpu")),
         help="SB3 PPOに明示するdevice（例: cpu, cuda, auto）",
     )
     parser.add_argument(
         "--model-name",
         type=_model_stem,
-        default=profile.default_model_name,
+        default=str(training_config.get("model_name", profile.default_model_name)),
         help="models/とoutputs/<profile>/training/で使うrun名",
     )
     parser.add_argument(
@@ -214,22 +235,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--log-file",
         type=Path,
-        default=None,
+        default=(
+            None
+            if training_config.get("log_file") is None
+            else Path(str(training_config["log_file"]))
+        ),
         help="標準出力/標準エラーの複製先（相対パスはPhase 0直下基準）",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # Do not re-read the source after defaults have been resolved.  Keeping the
+    # selection makes both runtime and saved metadata use the exact same bundle.
+    args.profile = experiment.name
+    args.config = experiment.source_path
+    args.experiment = experiment
+    args.experiment_selection = experiment
+    return args
 
 
 def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     """Train, save, validate, and reload one PPO model."""
 
-    profile = get_experiment_profile(args.profile)
+    experiment = experiment_selection_from_args(args)
+    profile = experiment.profile
     environment_config = profile.train_env_config
     training_config = profile.training_config
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
     training_output_dir = _training_output_directory(
-        args.profile,
+        experiment.name,
         args.model_name,
     )
 
@@ -314,7 +347,8 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             "platform": platform.platform(),
             "python_executable": sys.executable,
             "versions": _runtime_versions(),
-            "profile": args.profile,
+            "profile": experiment.name,
+            "config_source": experiment.source_metadata(),
             "environment_config": dict(environment_config),
             "profile_training_config": dict(training_config),
             "training": {
@@ -360,7 +394,10 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "device": reload_device,
             },
         }
-        if args.profile == "official":
+        if (
+            experiment.source_kind == "builtin_profile"
+            and experiment.name == "official"
+        ):
             # Keep the Phase 0 metadata field for existing consumers.
             metadata["official_environment_config"] = dict(environment_config)
             metadata["training"]["scenario_seed"] = scenario_start

@@ -1,0 +1,47 @@
+# Copy this file, change the bundle name and values, then pass the copy to
+# both ``train.py --config`` and ``evaluate.py --config``.
+schema_version = 1
+name = "example_generalization"
+algorithm = "ppo"
+default_model_name = "example_generalization"
+
+[training]
+policy = "MlpPolicy"
+seed = 0
+num_envs = 1
+n_steps = 256
+total_timesteps = 2000
+log_interval = 1
+device = "cpu"
+
+[evaluation]
+episodes = 5
+record_gif = false
+deterministic = true
+
+# These values are recursively merged into both stage-specific tables below.
+# MetaDrive settings remain pass-through values; this bundle intentionally uses
+# the same valid generalization task as configs/generalization_config.py.
+[environment.common]
+map = 3
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+horizon = 1000
+random_spawn_lane_index = true
+random_lane_width = true
+random_lane_num = true
+random_agent_model = true
+traffic_density = 0.1
+random_traffic = false
+accident_prob = 0.0
+store_map = false
+log_level = 50
+
+[environment.train]
+start_seed = 1000
+num_scenarios = 1000
+
+[environment.evaluation]
+start_seed = 0
+num_scenarios = 5

@@ -2,7 +2,7 @@
 
 このディレクトリは、MetaDrive公式ドキュメントの「Training > stable-baselines3」にある最小構成を、学習タスクを変えずに通常のPythonスクリプトへ分割したものです。固定された `map="C"` の道路でMetaDrive標準Observationを受け取り、9種類の離散Actionから操作を選び、MetaDrive標準Rewardを最大化しながら目的地へ向かうPolicyをSB3 PPOで学習します。
 
-既存の公式再現を既定の `official` profileとして残しつつ、複数の手続き生成道路で学習し、未見scenarioで評価する `generalization` profileも選択できます。追加設定と実行方法は17章にまとめています。
+既存の公式再現を既定の `official` profileとして残しつつ、複数の手続き生成道路で学習し、未見scenarioで評価する `generalization` profileも選択できます。組み込みprofileは17章、任意のTOML実験bundleは18章にまとめています。
 
 > **現在の環境:** Python 3.12.3の `.venv` を標準 `venv` で作成し、packageはpipで管理します。公式MetaDrive sourceは同階層の `metadrive/` に置き、`main` commit `85e5dadc6c7436d324348f6e3d8f8e680c06b4db` を `-e ../metadrive` でeditable installしています。現在の検証結果は `RUN_REPORT.md` を参照してください。
 
@@ -251,7 +251,9 @@ metadrive-workspace/
 │   ├── configs/                       # 実験設定をまとめたpackage
 │   │   ├── phase0_config.py           # 公式設定値と出力先の一元管理
 │   │   ├── generalization_config.py   # 複数scenario学習と未見評価の設定
-│   │   └── experiment_profiles.py     # official/generalizationの選択
+│   │   ├── experiment_profiles.py     # official/generalizationの選択
+│   │   ├── experiment_config.py       # 外部TOML bundleの検証と選択
+│   │   └── example_experiment.toml    # copyして使う短時間のbundle例
 │   ├── env_factory.py                 # MetaDrive生成と記録専用Monitor
 │   ├── inspect_env.py                 # version・空間・Action変換・check_env・random走行検査
 │   ├── train.py                       # SubprocVecEnvとPPO学習・モデル保存
@@ -554,3 +556,89 @@ upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計
 ```
 
 既定ではscenario 0から199を各1回評価し、各episodeの `scenario_seed`、reward、終了理由と、全体のsuccess rate / out-of-road rateをJSONへ保存するとともに、200 episodeすべてをepisode別のGIF/MP4/PNGへ記録します。短く確認するときは `--episodes 5` のように指定すると、scenario 0から4だけを重複なしで評価します。全件可視化はディスク使用量と実行時間が大きくなるため、数値評価だけが必要な場合は `--no-record-gif` を併用してください。既存のコマンドは `--profile official` が既定なので、Phase 0公式設定のtask自体は変わりません。
+
+## 18. 任意のTOML実験bundle
+
+新しい実験はPythonのprofile登録を変更せず、TOMLを1ファイル追加するだけで定義できます。`configs/example_experiment.toml` は1環境、2,000 timestep、rollout 256、5 scenario評価、可視化なしの短いgeneralization系の例です。コピーして実験名・環境・予算を変更してください。
+
+```bash
+cp configs/example_experiment.toml configs/my_experiment.toml
+
+.venv/bin/python train.py --config configs/my_experiment.toml
+.venv/bin/python evaluate.py --config configs/my_experiment.toml
+```
+
+`--profile {official,generalization}` と `--config PATH` は排他的です。何も指定しなければ従来どおり `official` profileを使います。相対の`--config`、TOML内の`model_path`、`log_file`はすべてこのprojectのroot（`metadrive-rl/`）を基準に解決します。TOMLファイル自身の置き場所を基準にはしません。絶対pathも指定できます。
+
+CLIの明示値はTOMLの既定値を上書きします。例えば短い配線確認だけにする場合は、同じbundleを使ったまま次のように指定できます。
+
+```bash
+.venv/bin/python train.py \
+  --config configs/my_experiment.toml \
+  --timesteps 2000 --num-envs 1 --n-steps 256
+
+.venv/bin/python evaluate.py \
+  --config configs/my_experiment.toml \
+  --episodes 5 --no-record-gif
+```
+
+### 18.1 schema version 1
+
+正式に対応する形式はPython 3.12標準の`tomllib`で読むTOMLだけです。JSON/YAMLやPython設定ファイルのimport・実行は行いません。rootで許可されるkeyは下表だけで、`training`、`evaluation`、`environment`の未知keyもエラーになります。`name`、`default_model_name`、`training.model_name`、`evaluation.output_prefix`は出力先を越えないbasenameだけを受け入れます。
+
+| table / key | 必須 | 型・既定値 | 用途 |
+| --- | --- | --- | --- |
+| `schema_version` | はい | integer `1` | schema version |
+| `name` | はい | basename string | `outputs/<name>/...` の実験名 |
+| `algorithm` | はい | string `"ppo"` | 現時点ではPPOだけを許可 |
+| `default_model_name` | いいえ | basename string、既定は`name` | `training.model_name`のfallback |
+| `[training].policy` | はい | 空でないstring | SB3 PPO policy（通常`MlpPolicy`） |
+| `[training].seed` | はい | boolではない`0`〜`2**32 - 1`のinteger | RL/PPOの乱数seed |
+| `[training].num_envs` | はい | 正のinteger | `SubprocVecEnv`数 |
+| `[training].n_steps` | はい | 正のinteger | 1環境あたりのPPO rollout長 |
+| `[training].total_timesteps` | はい | 正のinteger | `model.learn()`の下限step数 |
+| `[training].log_interval` | はい | 正のinteger | PPO log間隔 |
+| `[training].device` | いいえ | string、既定`cpu` | PPOのdevice |
+| `[training].model_name` | いいえ | basename string、既定`default_model_name` | 実際に保存する学習modelとtraining成果物名 |
+| `[training].log_file` | いいえ | path string | 学習console log。未指定時は従来の名前 |
+| `[evaluation].episodes` | はい | 正のinteger | 評価episode数 |
+| `[evaluation].model_path` | いいえ | path string、既定`models/<training.model_name>.zip` | 読み込むPPO model |
+| `[evaluation].record_gif` | いいえ | bool、既定`true` | GIF/MP4/PNGを全episodeへ記録するか |
+| `[evaluation].output_prefix` | いいえ | basename string、既定`training.model_name` | evaluation成果物名 |
+| `[evaluation].seed` | いいえ | boolではない`0`〜`2**32 - 1`のinteger、既定`training.seed` | 評価過程のRL乱数seed |
+| `[evaluation].device` | いいえ | string、既定`cpu` | `PPO.load()`のdevice |
+| `[evaluation].log_file` | いいえ | path string | 評価console log。未指定時は従来の名前 |
+| `[evaluation].deterministic` | いいえ | bool、既定`true` | `model.predict()`の決定論的選択。`--no-deterministic`で上書き可 |
+
+model名は、`default_model_name`（省略時は`name`）→`training.model_name`（省略時は前者）→評価の既定`model_path` / `output_prefix`という順に解決します。従って`training.model_name`だけを変え、評価側の両keyを省略しても、評価は学習直後に保存した`models/<training.model_name>.zip`を読む設定になります。評価側の明示値はこの連鎖を上書きします。
+
+PPOの既定`normalize_advantage`に合わせ、TOML既定の`training.num_envs * training.n_steps`は2以上でなければload時にエラーになります。CLIの両値上書きは既存どおりruntimeへ渡されます。
+
+`[environment.train]` と `[environment.evaluation]` は必須です。`[environment.common]` は任意で、commonを再帰的にcopyしてからstage tableで上書きします。いずれの解決済み環境にも`start_seed`（boolではないinteger）と`num_scenarios`（正のinteger）が必要です。TOMLの`evaluation.episodes`は、評価scenario数が複数ならその`num_scenarios`以下でなければload時にエラーになります。`num_scenarios=1`の複数episode反復は従来どおり許可し、CLIの`--episodes`上書きは実行時にも同じ制約を検証します。
+
+```toml
+[environment.common]
+discrete_action = true
+
+[environment.common.vehicle_config]
+enable_reverse = false
+
+[environment.train]
+start_seed = 1000
+num_scenarios = 1000
+
+[environment.train.vehicle_config]
+enable_reverse = true # commonのこのnested keyだけを上書き
+
+[environment.evaluation]
+start_seed = 0
+num_scenarios = 5
+```
+
+`[environment]`直下では上記3つのstage table以外を受け付けません。`wrapper`などのRL wrapper用tableは今回のschemaでは未対応のため明示的にエラーになります。一方、各stage内のMetaDrive keyはpass-throughです。値は再帰的に`bool`、`int`、有限`float`、`str`、list、tableだけを受け付けます。日時型、無限大/NaN、実行可能なPython objectなどは環境へ渡しません。外部TOMLではload時に、train/evaluation双方の`discrete_action = true`、`use_multi_discrete`未指定または`false`、`is_multi_agent`未指定または`false`を検証します。明示する`num_agents`はboolではないintegerの`1`だけ、`discrete_steering_dim` / `discrete_throttle_dim`はboolではない2以上のintegerでなければなりません。
+
+### 18.2 実行時の記録と現在の制約
+
+学習metadataと評価JSONには、`config_source`としてsource種別、bundle名、解決済みTOML path、SHA-256を記録します。そのため、同じ`name`を使った場合でも、どのTOML内容で実行したかを成果物から確認できます。TOMLをPythonとしてimport・実行することはありませんが、`model_path`はmodel artifactの読取先、`log_file`はconsole logの書込先を指定します。これらのpathを信頼できるbundleからだけ指定してください。
+
+この入口が汎用化するのは実験設定であり、実行基盤の制約まで解除するものではありません。algorithmはSB3 PPO固定、環境classは`MetaDriveEnv`固定、学習の`SubprocVecEnv`と`Monitor`も固定です。評価は現在のtelemetry/可視化経路が単一の離散Actionだけを復号するため、外部TOMLでは連続Action、MultiDiscrete、multi-agent設定をload時に拒否します。学習したmodelと評価環境のObservation/Action spaceも一致している必要があります。
