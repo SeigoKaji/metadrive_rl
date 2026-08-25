@@ -23,7 +23,6 @@
 | ラベル | 意味 |
 | --- | --- |
 | **confirmed** | 現在のローカルソース、設定、または現存artifactを直接確認した |
-| **reported** | `RUN_REPORT.md` など、既存の実行記録に記載されている |
 | **inferred** | confirmedな実装と数値から一意に導出できるが、専用runtime probeは行っていない |
 | **unverified** | 現在のsnapshotや今回の静的調査では確認できない |
 
@@ -1054,10 +1053,6 @@ steeringの符号は、vehicle進行方向を向いた運転者の視点で次�
 
 本書作成時点で、`generalization` のfull model、training metadata、Monitor/TensorBoard、evaluation JSONは存在しない。
 
-[RUN_REPORT.md](RUN_REPORT.md) は「4 workerで256 timestep」のgeneralization smoke、保存・再読込、未見seed 0～4評価、JSON生成を完了したと報告している。ただし、記載上の256が `n_steps`、requested total、actual totalのどれを意味するかは特定できない。そのsmoke artifactも現在のworkspaceに残っていないため、詳細はreported情報であり、full 1,000,000 timestep学習の証拠ではない。
-
-また、同レポートにあるPPO 64-stepやpytest結果も、今回再実行したのではなくreportedとして扱う。
-
 ## 23. ソースと本文の対応表・読む順序
 
 この章は、本文の説明を実ソース上で再確認するための案内図である。最初は23.2～23.4を番号順に一周し、その後で疑問に応じて23.5の枝へ進むと、「設定がどこで作られ、どのdataへ変換され、どのlossに消費されるか」を途切れずに追える。
@@ -1194,7 +1189,7 @@ worker process:
 | 30 | §21～§22 | [evaluate.py](evaluate.py)（`PPO.load`、`model.predict`、evaluation loop） | parameter更新はせず、`deterministic=True` でActionを選び、指定scenarioを1 episodeずつ走らせる。 |
 | 31 | §21～§22 | [evaluate.py](evaluate.py)（`episode_result`、`aggregate`、`evaluation.json`） | episode Reward、success、終了理由等が評価artifactへ集計される一方、現行実装ではcostを集計していない。 |
 | 32 | §22、§25 | [tests/test_phase0_contract.py](tests/test_phase0_contract.py)、[tests/test_generalization_config.py](tests/test_generalization_config.py) | testは設定・space・最小step等のcontractを確認するもので、full学習の完走や性能の証拠ではない。 |
-| 33 | §22 | [RUN_REPORT.md](RUN_REPORT.md)、`models/*.zip`、`outputs/**/training_metadata.json`、`outputs/**/evaluation.json` | reported記録、設定予定、現存artifactを分離する。実行済みの主張はmodel metadata、hash、evaluation JSON等の現物で確認する。 |
+| 33 | §22 | `models/*.zip`、`outputs/**/training_metadata.json`、`outputs/**/evaluation.json` | 設定予定と現存artifactを分離する。実行済みの主張はmodel metadata、hash、evaluation JSON等の現物で確認する。 |
 
 まず順1～28を一周すれば、「どのObservationからActionを選び、どのRewardをbufferへ保存し、どのlossでActor/Criticを更新するか」をprogramの実行順で理解できる。順29以降は、学習済みmodelが本当に保存・評価されたかを確認する別の経路である。
 
@@ -1305,7 +1300,6 @@ find models logs outputs -type f \
 ## 28. 関連資料
 
 - [CODE_WALKTHROUGH.md](CODE_WALKTHROUGH.md): 各ファイル・関数の責任分担を広く追う索引
-- [RUN_REPORT.md](RUN_REPORT.md): 既存環境と過去実行結果のreported記録
 - [README.md](README.md): setup、標準コマンド、profile利用方法
 - [評価結果](outputs/official/evaluation/phase0_official/evaluation.json): 現存する`official` 1 episode評価
 

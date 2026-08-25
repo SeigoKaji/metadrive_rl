@@ -4,7 +4,7 @@
 
 既存の公式再現を既定の `official` profileとして残しつつ、複数の手続き生成道路で学習し、未見scenarioで評価する `generalization` profileも選択できます。組み込みprofileは17章、任意のTOML実験bundleは18章にまとめています。
 
-> **現在の環境:** Python 3.12.3の `.venv` を標準 `venv` で作成し、packageはpipで管理します。公式MetaDrive sourceは同階層の `metadrive/` に置き、`main` commit `85e5dadc6c7436d324348f6e3d8f8e680c06b4db` を `-e ../metadrive` でeditable installしています。現在の検証結果は `RUN_REPORT.md` を参照してください。
+> **現在の環境:** Python 3.12.3の `.venv` を標準 `venv` で作成し、packageはpipで管理します。公式MetaDrive sourceは同階層の `metadrive/` に置き、`main` commit `85e5dadc6c7436d324348f6e3d8f8e680c06b4db` を `-e ../metadrive` でeditable installしています。
 
 ## 1. 今回のタスク
 
@@ -264,7 +264,6 @@ metadrive-workspace/
 │   ├── EVALUATION_TELEMETRY_GUIDE.xlsx # 右パネルの編集可能な日本語ガイド
 │   ├── README.md                      # タスク、設計、実行手順（本書）
 │   ├── CODE_WALKTHROUGH.md            # 自作・library内部処理の行番号付き解説
-│   ├── RUN_REPORT.md                  # 現在の環境と検証結果
 │   ├── tests/                         # 環境contractと汎化設定test
 │   ├── models/                        # 学習済みmodel
 │   ├── logs/                          # Monitor / TensorBoard / console log
@@ -280,12 +279,12 @@ MetaDrive sourceとRL projectを同階層へ置き、RL project内にはsource�
 
 ### 12.1 MetaDrive最新版を兄弟directoryへ取得
 
-初回は任意の場所にworkspaceを作り、RL projectとMetaDriveを兄弟directoryとしてcloneします。
+初回は任意の場所にworkspaceを作り、このRL projectのcheckoutを `metadrive-rl/` として配置して、MetaDriveを兄弟directoryとしてcloneします。
 
 ```bash
 mkdir -p metadrive-workspace
 cd metadrive-workspace
-git clone https://github.com/SeigoKaji/metadrive_rl.git metadrive-rl
+# このRL projectのcheckoutを ./metadrive-rl に配置してから続行
 git clone --branch main --single-branch \
   https://github.com/metadriverse/metadrive.git metadrive
 git -C metadrive status --short --branch
