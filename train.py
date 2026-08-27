@@ -85,15 +85,13 @@ def _model_stem(value: str) -> str:
 def _default_training_log(model_name: str) -> Path:
     """Keep the requested canonical log names while supporting custom runs."""
 
-    if model_name == "phase0_smoke":
-        return LOG_DIR / "smoke_train.log"
-    if model_name == "phase0_official":
+    if model_name == "official_baseline":
         return LOG_DIR / "full_train.log"
     return LOG_DIR / f"{model_name}_train.log"
 
 
 def _resolve_log_path(path: Path | None, model_name: str) -> Path:
-    """Resolve an optional log path relative to this Phase 0 project."""
+    """Resolve an optional log path relative to this project."""
 
     if path is None:
         return _default_training_log(model_name)
@@ -436,7 +434,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             },
         }
         if experiment.name == "official":
-            # Keep the Phase 0 metadata field for existing consumers.
+            # Keep official baseline metadata available to existing consumers.
             metadata["official_environment_config"] = dict(environment_config)
             metadata["training"]["scenario_seed"] = scenario_start
         _write_json(metadata_path, metadata)

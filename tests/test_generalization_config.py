@@ -128,7 +128,7 @@ def test_profile_selector_returns_typed_config_bundles() -> None:
     official = get_experiment_profile("official")
     assert official.train_env_config == official.evaluation_env_config == OFFICIAL_ENV_CONFIG
     assert official.training_config == OFFICIAL_TRAINING_CONFIG
-    assert official.default_model_name == "phase0_official"
+    assert official.default_model_name == "official_baseline"
     assert {
         key: official.train_env_config[key]
         for key in ("start_seed", "num_scenarios")
@@ -155,10 +155,11 @@ def test_generalization_profile_is_connected_to_both_clis() -> None:
     official_training_args = parse_training_args([])
     assert official_training_args.profile == "official"
     assert official_training_args.timesteps == 300_000
-    assert official_training_args.model_name == "phase0_official"
+    assert official_training_args.model_name == "official_baseline"
 
     official_evaluation_args = parse_evaluation_args([])
-    assert official_evaluation_args.model.name == "phase0_official.zip"
+    assert official_evaluation_args.model.name == "official_baseline.zip"
+    assert official_evaluation_args.output_prefix == "official_baseline"
 
     training_args = parse_training_args(["--profile", "generalization"])
     assert training_args.timesteps == 1_000_000

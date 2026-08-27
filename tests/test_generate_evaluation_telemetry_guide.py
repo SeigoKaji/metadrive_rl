@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from io import BytesIO
-from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
@@ -15,11 +14,13 @@ from generate_evaluation_telemetry_guide import (
     CANONICAL_EVALUATION_PATH,
     CANONICAL_FRAME_PATH,
     CANONICAL_STEPS_PATH,
+    DEFAULT_EVALUATION_PATH,
+    DEFAULT_FRAME_PATH,
+    DEFAULT_STEPS_PATH,
     OFFICIAL_EVALUATION_OUTPUT_DIR,
     _add_table,
     _action_history,
     _build_workbook,
-    _select_default_inputs,
     _validate_workbook_tables,
 )
 from project_paths import OUTPUT_DIR
@@ -53,25 +54,10 @@ def _workbook_with_table() -> Workbook:
     return workbook
 
 
-def test_default_inputs_prefer_complete_canonical_set_and_fall_back_as_a_set(
-    tmp_path: Path,
-) -> None:
-    filenames = ("frame.png", "steps.jsonl", "evaluation.json")
-    canonical = tuple(tmp_path / "canonical" / name for name in filenames)
-    legacy = tuple(tmp_path / "legacy" / name for name in filenames)
-    for path in legacy:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-
-    assert _select_default_inputs(canonical, legacy) == legacy
-
-    canonical[0].parent.mkdir(parents=True, exist_ok=True)
-    canonical[0].touch()
-    assert _select_default_inputs(canonical, legacy) == legacy
-
-    canonical[1].touch()
-    canonical[2].touch()
-    assert _select_default_inputs(canonical, legacy) == canonical
+def test_default_inputs_are_canonical_paths() -> None:
+    assert DEFAULT_FRAME_PATH == CANONICAL_FRAME_PATH
+    assert DEFAULT_STEPS_PATH == CANONICAL_STEPS_PATH
+    assert DEFAULT_EVALUATION_PATH == CANONICAL_EVALUATION_PATH
 
 
 def test_table_rejects_duplicate_worksheet_auto_filter() -> None:

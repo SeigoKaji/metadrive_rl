@@ -1,4 +1,4 @@
-"""元の公式例を基準にしたPhase 0の現在のprofile契約を検証する。"""
+"""元の公式例を基準にしたofficial baselineの現在のprofile契約を検証する。"""
 
 import hashlib
 import json

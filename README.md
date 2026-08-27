@@ -37,7 +37,7 @@ python3 -m venv .venv
 .venv/bin/python train.py --config configs/official.toml
 ```
 
-学習が完了すると、モデルは `models/phase0_official.zip`、実行メタデータは `outputs/official/training/phase0_official/training_metadata.json` に保存されます。Monitor ログと TensorBoard ログはそれぞれ `logs/monitor/`、`logs/tensorboard/` に保存されます。
+学習が完了すると、モデルは `models/official_baseline.zip`、実行メタデータは `outputs/official/training/official_baseline/training_metadata.json` に保存されます。Monitor ログと TensorBoard ログはそれぞれ `logs/monitor/`、`logs/tensorboard/` に保存されます。
 
 ## 評価方法
 
@@ -47,7 +47,7 @@ python3 -m venv .venv
 .venv/bin/python evaluate.py --config configs/official.toml
 ```
 
-この設定では `models/phase0_official.zip` を読み込み、`outputs/official/evaluation/phase0_official/` に `evaluation.json`、`evaluation_steps.jsonl`、可視化成果物を保存します。可視化を出力しない場合は次を実行します。
+この設定では `models/official_baseline.zip` を読み込み、`outputs/official/evaluation/official_baseline/` に `evaluation.json`、`evaluation_steps.jsonl`、可視化成果物を保存します。可視化を出力しない場合は次を実行します。
 
 ```bash
 .venv/bin/python evaluate.py --config configs/official.toml --no-record-gif

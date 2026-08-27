@@ -59,32 +59,9 @@ CANONICAL_FRAME_PATH = (
 )
 CANONICAL_STEPS_PATH = OFFICIAL_EVALUATION_OUTPUT_DIR / "evaluation_steps.jsonl"
 CANONICAL_EVALUATION_PATH = OFFICIAL_EVALUATION_OUTPUT_DIR / "evaluation.json"
-LEGACY_FRAME_PATH = PROJECT_ROOT / "outputs/phase0_official_evaluation_frames/frame_000030.png"
-LEGACY_STEPS_PATH = PROJECT_ROOT / "outputs/phase0_official_evaluation_steps.jsonl"
-LEGACY_EVALUATION_PATH = PROJECT_ROOT / "outputs/phase0_official_evaluation.json"
-
-
-def _select_default_inputs(
-    canonical: tuple[Path, Path, Path],
-    legacy: tuple[Path, Path, Path],
-) -> tuple[Path, Path, Path]:
-    """Use one complete input set, preferring the current output layout."""
-
-    if all(path.is_file() for path in canonical):
-        return canonical
-    if all(path.is_file() for path in legacy):
-        return legacy
-    # Keep the current layout authoritative when neither set is complete, so
-    # the eventual error points users to the path produced by a new evaluation.
-    return canonical
-
-
-DEFAULT_FRAME_PATH, DEFAULT_STEPS_PATH, DEFAULT_EVALUATION_PATH = (
-    _select_default_inputs(
-        (CANONICAL_FRAME_PATH, CANONICAL_STEPS_PATH, CANONICAL_EVALUATION_PATH),
-        (LEGACY_FRAME_PATH, LEGACY_STEPS_PATH, LEGACY_EVALUATION_PATH),
-    )
-)
+DEFAULT_FRAME_PATH = CANONICAL_FRAME_PATH
+DEFAULT_STEPS_PATH = CANONICAL_STEPS_PATH
+DEFAULT_EVALUATION_PATH = CANONICAL_EVALUATION_PATH
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "EVALUATION_TELEMETRY_GUIDE.xlsx"
 
 MAP_WIDTH = 600

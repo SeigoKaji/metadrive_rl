@@ -3,7 +3,7 @@
 schema_version = 2
 name = "official"
 algorithm = "ppo"
-default_model_name = "phase0_official"
+default_model_name = "official_baseline"
 
 [training]
 policy = "MlpPolicy"
@@ -26,7 +26,7 @@ max_grad_norm = 0.5
 
 [evaluation]
 record_gif = true
-output_prefix = "phase0_official"
+output_prefix = "official_baseline"
 seed = 0
 device = "cpu"
 deterministic = true

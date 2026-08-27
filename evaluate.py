@@ -114,10 +114,11 @@ def _resolve_project_path(path: Path) -> Path:
 
 
 def _default_evaluation_log(output_prefix: str) -> Path:
-    """Use the requested official/smoke names and a predictable custom fallback."""
+    """Use the canonical official log name and a predictable custom fallback."""
 
-    suffix = output_prefix.removeprefix("phase0_")
-    return LOG_DIR / f"evaluate_{suffix}.log"
+    if output_prefix == "official_baseline":
+        return LOG_DIR / "evaluate_official.log"
+    return LOG_DIR / f"evaluate_{output_prefix}.log"
 
 
 def _resolve_log_path(path: Path | None, output_prefix: str) -> Path:
@@ -563,7 +564,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "console_log_path": str(log_path.resolve()),
     }
     if scenario_count == 1:
-        # Keep the Phase 0 scalar field for existing result consumers.
+        # Preserve the scalar scenario_seed alongside scenario_seed_range.
         result["scenario_seed"] = scenario_start
     _write_json(result_path, result)
     print(f"evaluation_saved={result_path.resolve()}")
