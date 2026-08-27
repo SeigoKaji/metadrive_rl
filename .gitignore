@@ -32,3 +32,8 @@ outputs/*
 panda3d-log.txt
 .idea/
 .vscode/
+
+# Local investigation notes (do not version)
+/CODE_WALKTHROUGH.md
+/LEARNING_INVESTIGATION.md
+/REWARD_COST_SOURCE_TRACE.md

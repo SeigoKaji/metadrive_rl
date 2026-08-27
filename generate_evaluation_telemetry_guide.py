@@ -35,13 +35,27 @@ from evaluation_visualization import (
     compose_telemetry_panel,
     decode_discrete_action,
 )
-from configs.phase0_config import OFFICIAL_EVALUATION_OUTPUT_DIR
+from configs.experiment_config import select_experiment
+from project_paths import OUTPUT_DIR, PROJECT_ROOT
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+_OFFICIAL_EXPERIMENT = select_experiment(profile_name="official")
+_OFFICIAL_EVALUATION_DEFAULTS = _OFFICIAL_EXPERIMENT.profile.evaluation_defaults
+_OFFICIAL_OUTPUT_PREFIX = str(_OFFICIAL_EVALUATION_DEFAULTS["output_prefix"])
+_OFFICIAL_SCENARIO_SEED = int(
+    _OFFICIAL_EXPERIMENT.profile.evaluation_env_config["start_seed"]
+)
+OFFICIAL_EVALUATION_OUTPUT_DIR = (
+    OUTPUT_DIR
+    / _OFFICIAL_EXPERIMENT.name
+    / "evaluation"
+    / _OFFICIAL_OUTPUT_PREFIX
+)
 CANONICAL_FRAME_PATH = (
     OFFICIAL_EVALUATION_OUTPUT_DIR
-    / "episodes/episode_0001_scenario_000005/frames/frame_000030.png"
+    / "episodes"
+    / f"episode_0001_scenario_{_OFFICIAL_SCENARIO_SEED:06d}"
+    / "frames/frame_000030.png"
 )
 CANONICAL_STEPS_PATH = OFFICIAL_EVALUATION_OUTPUT_DIR / "evaluation_steps.jsonl"
 CANONICAL_EVALUATION_PATH = OFFICIAL_EVALUATION_OUTPUT_DIR / "evaluation.json"

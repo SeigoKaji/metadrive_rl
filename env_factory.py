@@ -9,33 +9,31 @@ from typing import TYPE_CHECKING
 import gymnasium as gym
 from stable_baselines3.common.monitor import Monitor
 
-from configs.phase0_config import MONITOR_LOG_DIR, OFFICIAL_ENV_CONFIG, RL_SEED
-
 if TYPE_CHECKING:
     from metadrive.envs import MetaDriveEnv
 
 
-def make_env(env_config: Mapping[str, object] | None = None) -> MetaDriveEnv:
+def make_env(env_config: Mapping[str, object]) -> MetaDriveEnv:
     """指定設定を適用した、wrapperなしのMetaDrive環境を返す。
 
-    ``env_config`` を省略した場合は、Phase 0の公式設定を維持する。
+    呼出元は解決済みTOMLのstage設定を明示して渡す。
     """
 
     # Importを実際の生成時まで遅らせ、未導入時にもinspect_env側が先に
-    # outputs/inspect_env.logを開いてImportError全文を記録できるようにする。
+    # outputs/inspect_env/<experiment>/<stage>.logを開いてImportError全文を
+    # 記録できるようにする。
     from metadrive.envs import MetaDriveEnv
 
     # MetaDriveは受け取った設定を内部でmergeする。呼出元のconstantの
     # 偶発的な変更を防ぐため、環境ごとに浅いcopyを渡す。
-    selected_config = OFFICIAL_ENV_CONFIG if env_config is None else env_config
-    return MetaDriveEnv(dict(selected_config))
+    return MetaDriveEnv(dict(env_config))
 
 
 def make_training_env(
     rank: int,
-    seed: int = RL_SEED,
-    monitor_dir: Path | str = MONITOR_LOG_DIR,
-    env_config: Mapping[str, object] | None = None,
+    seed: int,
+    monitor_dir: Path | str,
+    env_config: Mapping[str, object],
 ) -> gym.Env:
     """rank固有のMonitorログを持つ学習用環境を生成する。
 
@@ -43,7 +41,7 @@ def make_training_env(
         rank: SubprocVecEnv内のworker番号。
         seed: Action/Observation spaceの乱数seedの基準値。
         monitor_dir: ``*.monitor.csv`` の保存先。
-        env_config: MetaDriveへ渡す環境設定。省略時はPhase 0公式設定。
+        env_config: MetaDriveへ渡す解決済みTOMLの環境設定。
 
     Returns:
         記録専用のSB3 ``Monitor`` で包んだMetaDrive環境。
@@ -74,19 +72,15 @@ def make_training_env(
 
 
 def make_evaluation_env(
-    seed: int = RL_SEED,
-    record_gif: bool = False,
-    env_config: Mapping[str, object] | None = None,
+    seed: int,
+    env_config: Mapping[str, object],
 ) -> MetaDriveEnv:
     """評価用の単一raw環境を生成する。
 
-    ``record_gif`` は呼出側の意図を明示する引数である。MetaDrive 0.4.3は
-    construction時のconfigではなく ``env.render(..., screen_record=True)`` で
-    top-down記録を開始するため、ここでは選択された環境設定を変更しない。
+    MetaDrive 0.4.3のtop-down記録はconstruction時のconfigではなく
+    ``env.render(..., screen_record=True)`` で開始する。録画の有無は評価側の
+    recorderが扱い、このfactoryには渡さない。
     """
-
-    if not isinstance(record_gif, bool):
-        raise TypeError("record_gif must be bool")
 
     env = make_env(env_config)
     try:

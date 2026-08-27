@@ -12,6 +12,7 @@ import platform
 import sys
 import time
 import traceback
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -24,12 +25,13 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from env_factory import make_training_env
 from configs.experiment_config import (
     ExperimentConfigError,
+    PPO_COMMON_SCALAR_KEYS,
+    PROFILE_NAMES,
     experiment_selection_from_args,
     normalize_model_name,
     select_experiment,
 )
-from configs.experiment_profiles import PROFILE_NAMES
-from configs.phase0_config import (
+from project_paths import (
     LOG_DIR,
     MODEL_DIR,
     MONITOR_LOG_DIR,
@@ -100,6 +102,32 @@ def _resolve_log_path(path: Path | None, model_name: str) -> Path:
     return LOG_DIR.parent / path
 
 
+def _resolved_ppo_config(
+    args: argparse.Namespace,
+    training_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Return the exact scalar PPO configuration after CLI rollout overrides."""
+
+    ppo_config = {
+        "n_steps": int(args.n_steps),
+        **{
+            key: training_config[key]
+            for key in PPO_COMMON_SCALAR_KEYS
+        },
+    }
+    if bool(ppo_config["normalize_advantage"]):
+        rollout_batch_size = int(args.num_envs) * int(ppo_config["n_steps"])
+        if rollout_batch_size <= 1:
+            raise ValueError(
+                "normalize_advantage=trueでは--num-envs * --n-stepsを2以上にしてください"
+            )
+        if int(ppo_config["batch_size"]) <= 1:
+            raise ValueError(
+                "normalize_advantage=trueではtraining.batch_sizeを2以上にしてください"
+            )
+    return ppo_config
+
+
 def _training_output_directory(profile_name: str, model_name: str) -> Path:
     """Return the profile- and run-specific directory for training metadata."""
 
@@ -153,7 +181,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """選択profileまたはTOML bundleをCLI既定値としてparseする。"""
+    """canonical TOML aliasまたは外部bundleをCLI既定値としてparseする。"""
 
     profile_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     selection_group = profile_parser.add_mutually_exclusive_group()
@@ -183,7 +211,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--profile",
         choices=PROFILE_NAMES,
         default=selected.profile or "official",
-        help="環境・学習設定profile（既定: official）",
+        help="canonical TOMLへの互換alias（既定: official.toml）",
     )
     selection_group.add_argument(
         "--config",
@@ -240,9 +268,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             if training_config.get("log_file") is None
             else Path(str(training_config["log_file"]))
         ),
-        help="標準出力/標準エラーの複製先（相対パスはPhase 0直下基準）",
+        help="標準出力/標準エラーの複製先（相対pathはproject直下基準）",
     )
     args = parser.parse_args(argv)
+    try:
+        _resolved_ppo_config(args, training_config)
+    except ValueError as error:
+        parser.error(str(error))
     # Do not re-read the source after defaults have been resolved.  Keeping the
     # selection makes both runtime and saved metadata use the exact same bundle.
     args.profile = experiment.name
@@ -259,6 +291,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     profile = experiment.profile
     environment_config = profile.train_env_config
     training_config = profile.training_config
+    ppo_config = _resolved_ppo_config(args, training_config)
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
     training_output_dir = _training_output_directory(
@@ -297,7 +330,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         model = PPO(
             str(training_config["policy"]),
             train_env,
-            n_steps=args.n_steps,
+            **ppo_config,
             verbose=1,
             device=args.device,
             tensorboard_log=str(TENSORBOARD_LOG_DIR),
@@ -317,6 +350,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 ],
                 "requested_device": args.device,
                 "actual_device": actual_device,
+                "ppo_config": ppo_config,
             },
         )
         model.learn(total_timesteps=args.timesteps, log_interval=args.log_interval)
@@ -377,7 +411,14 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                     "scenario range; this sampling is separate from the RL seed"
                 ),
                 "scenario_sampling_reproducible_from_rl_seed": scenario_count == 1,
-                "ppo_unspecified_parameters": "stable-baselines3 defaults",
+                "resolved_ppo_config": {
+                    "policy": str(training_config["policy"]),
+                    **ppo_config,
+                    "device": args.device,
+                    "verbose": 1,
+                    "tensorboard_log": str(TENSORBOARD_LOG_DIR),
+                },
+                "ppo_nonconfigured_parameters": "stable-baselines3 defaults",
             },
             "artifacts": {
                 "output_directory": str(training_output_dir.resolve()),
@@ -394,10 +435,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "device": reload_device,
             },
         }
-        if (
-            experiment.source_kind == "builtin_profile"
-            and experiment.name == "official"
-        ):
+        if experiment.name == "official":
             # Keep the Phase 0 metadata field for existing consumers.
             metadata["official_environment_config"] = dict(environment_config)
             metadata["training"]["scenario_seed"] = scenario_start

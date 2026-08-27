@@ -8,19 +8,24 @@ from types import SimpleNamespace
 
 import pytest
 
+import configs.experiment_config as experiment_config_module
 from configs.experiment_config import (
     ExperimentConfigError,
+    PPO_COMMON_SCALAR_DEFAULTS,
+    PPO_COMMON_SCALAR_KEYS,
+    PROFILE_NAMES,
+    canonical_config_path,
     experiment_selection_from_args,
     load_experiment_config,
     select_experiment,
 )
-from configs.phase0_config import PROJECT_ROOT
 from evaluate import parse_args as parse_evaluation_args
+from project_paths import PROJECT_ROOT
 from train import parse_args as parse_training_args
 
 
 VALID_TOML = """\
-schema_version = 1
+schema_version = 2
 name = "custom_bundle"
 algorithm = "ppo"
 default_model_name = "custom_model"
@@ -37,7 +42,6 @@ model_name = "custom_training.zip"
 log_file = "logs/custom_train.log"
 
 [evaluation]
-episodes = 2
 model_path = "models/custom_model.zip"
 record_gif = false
 output_prefix = "custom_evaluation"
@@ -74,6 +78,56 @@ def _write_config(tmp_path: Path, text: str = VALID_TOML) -> Path:
     return path
 
 
+@pytest.mark.parametrize("profile_name", PROFILE_NAMES)
+def test_profile_aliases_resolve_to_canonical_toml_with_source_hash(
+    profile_name: str,
+) -> None:
+    """互換aliasも実行時metadataでは実TOMLのpathとhashを残す。"""
+
+    selection = select_experiment(profile_name=profile_name)
+    expected_path = canonical_config_path(profile_name).resolve()
+
+    assert selection.source_kind == "toml"
+    assert selection.source_path == expected_path
+    assert selection.source_sha256 == hashlib.sha256(expected_path.read_bytes()).hexdigest()
+
+
+def test_default_cli_selection_is_the_official_canonical_toml() -> None:
+    """引数なし学習・評価はbuiltin Pythonではなくofficial.tomlを使う。"""
+
+    expected_path = canonical_config_path("official").resolve()
+    expected_sha256 = hashlib.sha256(expected_path.read_bytes()).hexdigest()
+
+    training_args = parse_training_args([])
+    evaluation_args = parse_evaluation_args([])
+
+    for args in (training_args, evaluation_args):
+        assert args.config == expected_path
+        assert args.experiment.source_path == expected_path
+        assert args.experiment.source_sha256 == expected_sha256
+        assert args.experiment.source_metadata()["path"] == str(expected_path)
+
+
+def test_profile_alias_rejects_a_canonical_toml_with_a_different_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """alias先の誤編集で成果物が別名directoryへ流れることを防ぐ。"""
+
+    mismatched = _write_config(
+        tmp_path,
+        VALID_TOML.replace('name = "custom_bundle"', 'name = "other_name"'),
+    )
+    monkeypatch.setitem(
+        experiment_config_module._PROFILE_FILENAMES,
+        "official",
+        str(mismatched),
+    )
+
+    with pytest.raises(ExperimentConfigError, match="nameはaliasと一致"):
+        select_experiment(profile_name="official")
+
+
 def test_example_bundle_drives_both_cli_default_sets() -> None:
     """同じTOMLだけで学習・評価の既定値とsourceを解決できる。"""
 
@@ -97,7 +151,6 @@ def test_example_bundle_drives_both_cli_default_sets() -> None:
     assert evaluation_args.profile == "example_generalization"
     assert evaluation_args.config == expected_path
     assert evaluation_args.model == Path("models/example_generalization.zip")
-    assert evaluation_args.episodes == 5
     assert evaluation_args.record_gif is False
     assert evaluation_args.output_prefix == "example_generalization"
     assert evaluation_args.seed == 0
@@ -149,8 +202,6 @@ def test_cli_options_override_toml_defaults() -> None:
             config_path,
             "--model",
             "models/override.zip",
-            "--episodes",
-            "3",
             "--record-gif",
             "--output-prefix",
             "override_evaluation",
@@ -164,13 +215,28 @@ def test_cli_options_override_toml_defaults() -> None:
         ]
     )
     assert evaluation_args.model == Path("models/override.zip")
-    assert evaluation_args.episodes == 3
     assert evaluation_args.record_gif is True
     assert evaluation_args.output_prefix == "override_evaluation"
     assert evaluation_args.seed == 10
     assert evaluation_args.device == "auto"
     assert evaluation_args.log_file == Path("logs/override_evaluate.log")
     assert evaluation_args.deterministic is False
+
+
+def test_training_cli_rejects_single_item_rollout_after_overrides() -> None:
+    """TOMLは有効でもCLIのnum-envs/n-steps上書き後に再検証する。"""
+
+    with pytest.raises(SystemExit):
+        parse_training_args(
+            [
+                "--config",
+                "configs/example_experiment.toml",
+                "--num-envs",
+                "1",
+                "--n-steps",
+                "1",
+            ]
+        )
 
 
 def test_training_model_name_is_the_default_evaluation_model_and_prefix(
@@ -226,7 +292,6 @@ def test_loader_deep_merges_common_environment_and_records_source(
     }
     assert selection.profile.training_config["model_name"] == "custom_training"
     assert selection.profile.evaluation_defaults == {
-        "episodes": 2,
         "model_path": "models/custom_model.zip",
         "record_gif": False,
         "output_prefix": "custom_evaluation",
@@ -234,6 +299,149 @@ def test_loader_deep_merges_common_environment_and_records_source(
         "device": "cpu",
         "log_file": "logs/custom_evaluate.log",
         "deterministic": False,
+    }
+
+
+def test_loader_resolves_optional_ppo_scalars_to_sb3_defaults(tmp_path: Path) -> None:
+    """既存schema v2 bundleでも全PPO scalarを明示した解決値として受け取る。"""
+
+    selection = load_experiment_config(_write_config(tmp_path))
+
+    assert tuple(PPO_COMMON_SCALAR_DEFAULTS) == PPO_COMMON_SCALAR_KEYS
+    assert {
+        key: selection.profile.training_config[key]
+        for key in PPO_COMMON_SCALAR_KEYS
+    } == PPO_COMMON_SCALAR_DEFAULTS
+
+
+@pytest.mark.parametrize(
+    ("key", "toml_value", "expected"),
+    [
+        ("learning_rate", "0.001", 0.001),
+        ("batch_size", "32", 32),
+        ("n_epochs", "3", 3),
+        ("gamma", "0.9", 0.9),
+        ("gae_lambda", "0.8", 0.8),
+        ("clip_range", "0.1", 0.1),
+        ("normalize_advantage", "false", False),
+        ("ent_coef", "0.02", 0.02),
+        ("vf_coef", "0.7", 0.7),
+        ("max_grad_norm", "0.3", 0.3),
+    ],
+)
+def test_loader_accepts_each_ppo_scalar(
+    tmp_path: Path,
+    key: str,
+    toml_value: str,
+    expected: object,
+) -> None:
+    """ユーザー向けTOMLはPPOの10個のcommon scalarを個別に設定できる。"""
+
+    path = _write_config(
+        tmp_path,
+        VALID_TOML.replace(
+            "log_interval = 2",
+            f"log_interval = 2\n{key} = {toml_value}",
+        ),
+    )
+
+    assert load_experiment_config(path).profile.training_config[key] == expected
+
+
+@pytest.mark.parametrize(
+    ("key", "toml_value", "match"),
+    [
+        ("learning_rate", "0", "training.learning_rate"),
+        ("batch_size", "0", "training.batch_size"),
+        ("n_epochs", "0", "training.n_epochs"),
+        ("gamma", "1.01", "training.gamma"),
+        ("gae_lambda", "-0.01", "training.gae_lambda"),
+        ("clip_range", "0", "training.clip_range"),
+        ("normalize_advantage", "\"true\"", "training.normalize_advantage"),
+        ("ent_coef", "-0.01", "training.ent_coef"),
+        ("vf_coef", "-0.01", "training.vf_coef"),
+        ("max_grad_norm", "-0.01", "training.max_grad_norm"),
+    ],
+)
+def test_loader_rejects_invalid_ppo_scalar_ranges(
+    tmp_path: Path,
+    key: str,
+    toml_value: str,
+    match: str,
+) -> None:
+    """不正なPPO scalarをSB3 construction前にTOML loaderで止める。"""
+
+    path = _write_config(
+        tmp_path,
+        VALID_TOML.replace(
+            "log_interval = 2",
+            f"log_interval = 2\n{key} = {toml_value}",
+        ),
+    )
+
+    with pytest.raises(ExperimentConfigError, match=match):
+        load_experiment_config(path)
+
+
+def test_loader_checks_normalize_advantage_batch_and_rollout_sizes(
+    tmp_path: Path,
+) -> None:
+    """normalize_advantageが有効ならSB3が拒否する1件batchを防ぐ。"""
+
+    single_batch = _write_config(
+        tmp_path,
+        VALID_TOML.replace("log_interval = 2", "log_interval = 2\nbatch_size = 1"),
+    )
+    with pytest.raises(ExperimentConfigError, match="training.batch_size"):
+        load_experiment_config(single_batch)
+
+    single_rollout = _write_config(
+        tmp_path,
+        VALID_TOML.replace("num_envs = 2", "num_envs = 1").replace(
+            "n_steps = 64", "n_steps = 1"
+        ),
+    )
+    with pytest.raises(ExperimentConfigError, match=r"num_envs \* n_steps"):
+        load_experiment_config(single_rollout)
+
+    no_normalization = _write_config(
+        tmp_path,
+        VALID_TOML.replace("num_envs = 2", "num_envs = 1")
+        .replace("n_steps = 64", "n_steps = 1")
+        .replace("log_interval = 2", "log_interval = 2\nbatch_size = 1\nnormalize_advantage = false"),
+    )
+    assert load_experiment_config(no_normalization).profile.training_config[
+        "normalize_advantage"
+    ] is False
+
+
+def test_loader_allows_an_empty_required_evaluation_table(tmp_path: Path) -> None:
+    """[evaluation]自体は必須だが、各評価既定値は省略できる。"""
+
+    populated_evaluation = (
+        "[evaluation]\n"
+        "model_path = \"models/custom_model.zip\"\n"
+        "record_gif = false\n"
+        "output_prefix = \"custom_evaluation\"\n"
+        "seed = 12\n"
+        "device = \"cpu\"\n"
+        "log_file = \"logs/custom_evaluate.log\"\n"
+        "deterministic = false\n\n"
+    )
+    path = _write_config(
+        tmp_path,
+        VALID_TOML.replace(populated_evaluation, "[evaluation]\n\n"),
+    )
+
+    selection = load_experiment_config(path)
+
+    assert selection.profile.evaluation_defaults == {
+        "model_path": "models/custom_training.zip",
+        "record_gif": True,
+        "output_prefix": "custom_training",
+        "seed": 11,
+        "device": "cpu",
+        "deterministic": True,
     }
 
 
@@ -280,6 +488,18 @@ def test_loader_wraps_invalid_utf8_as_a_config_error(tmp_path: Path) -> None:
             "",
             "environment.evaluation",
         ),
+        (
+            "[evaluation]\n"
+            "model_path = \"models/custom_model.zip\"\n"
+            "record_gif = false\n"
+            "output_prefix = \"custom_evaluation\"\n"
+            "seed = 12\n"
+            "device = \"cpu\"\n"
+            "log_file = \"logs/custom_evaluate.log\"\n"
+            "deterministic = false\n\n",
+            "",
+            "evaluation",
+        ),
     ],
 )
 def test_loader_rejects_missing_required_tables_and_keys(
@@ -301,7 +521,7 @@ def test_loader_rejects_missing_required_tables_and_keys(
     [
         ("algorithm = \"ppo\"", "algorithm = \"sac\""),
         ("algorithm = \"ppo\"", "algorithm = \"ppo\"\nextra = true"),
-        ("log_interval = 2", "log_interval = 2\nlearning_rate = 0.001"),
+        ("log_interval = 2", "log_interval = 2\nunsupported_ppo_scalar = 0.001"),
         (
             "[environment.train]",
             "[environment.wrapper]\nunknown = true\n\n[environment.train]",
@@ -488,14 +708,34 @@ def test_loader_validates_action_compatibility_for_each_stage(
         load_experiment_config(path)
 
 
-def test_loader_rejects_toml_episode_default_larger_than_scenario_range(
-    tmp_path: Path,
-) -> None:
-    """複数scenario評価の重複をTOML既定値の解決時に防ぐ。"""
+def test_loader_rejects_schema_version_1(tmp_path: Path) -> None:
+    """評価全件走査を導入した外部bundle schemaはv2だけを受け入れる。"""
 
-    path = _write_config(tmp_path, VALID_TOML.replace("episodes = 2", "episodes = 3"))
+    path = _write_config(
+        tmp_path,
+        VALID_TOML.replace("schema_version = 2", "schema_version = 1"),
+    )
 
-    with pytest.raises(ExperimentConfigError, match="evaluation.episodes"):
+    with pytest.raises(ExperimentConfigError, match="versionは2だけです"):
+        load_experiment_config(path)
+
+
+def test_loader_rejects_removed_evaluation_count_key(tmp_path: Path) -> None:
+    """v2では旧評価回数keyを黙って受理・無視しない。"""
+
+    path = _write_config(
+        tmp_path,
+        VALID_TOML.replace(
+            "[evaluation]\n",
+            "[evaluation]\nepisodes = 2\n",
+            1,
+        ),
+    )
+
+    with pytest.raises(
+        ExperimentConfigError,
+        match="evaluation: 未対応のkeyがあります: episodes",
+    ):
         load_experiment_config(path)
 
 
@@ -513,17 +753,11 @@ def test_loader_rejects_single_item_ppo_rollout_batch(tmp_path: Path) -> None:
         load_experiment_config(path)
 
 
-def test_loader_allows_repeated_episodes_for_a_single_scenario(tmp_path: Path) -> None:
-    """単一scenario profileの従来どおりの複数episode反復を維持する。"""
+def test_evaluation_cli_rejects_removed_count_option() -> None:
+    """評価件数は環境設定だけで決まり、旧CLI optionは受理しない。"""
 
-    path = _write_config(
-        tmp_path,
-        VALID_TOML.replace("episodes = 2", "episodes = 3").replace(
-            "num_scenarios = 2", "num_scenarios = 1", 1
-        ),
-    )
-
-    assert load_experiment_config(path).profile.evaluation_episodes == 3
+    with pytest.raises(SystemExit):
+        parse_evaluation_args(["--episodes", "1"])
 
 
 def test_profile_and_config_are_mutually_exclusive_for_both_clis() -> None:
@@ -541,18 +775,20 @@ def test_profile_and_config_are_mutually_exclusive_for_both_clis() -> None:
         parse_evaluation_args(argv)
 
 
-def test_builtin_selection_and_legacy_namespace_keep_working() -> None:
-    """既存profileとconfig属性を持たない評価test用Namespaceを維持する。"""
+def test_profile_alias_and_legacy_namespace_resolve_the_same_toml() -> None:
+    """profile aliasも古いNamespace fallbackも実TOML sourceを返す。"""
 
     selection = select_experiment(profile_name="official")
     legacy_selection = experiment_selection_from_args(
         SimpleNamespace(profile="official")
     )
 
-    assert selection.source_kind == "builtin_profile"
-    assert selection.source_path is None
-    assert selection.source_sha256 is None
-    assert selection.profile is legacy_selection.profile
+    assert selection.source_kind == "toml"
+    assert selection.source_path == canonical_config_path("official").resolve()
+    assert selection.source_sha256 == hashlib.sha256(
+        selection.source_path.read_bytes()
+    ).hexdigest()
+    assert selection.profile.train_env_config == legacy_selection.profile.train_env_config
     assert selection.source_metadata()["profile"] == "official"
 
 

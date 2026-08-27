@@ -7,16 +7,28 @@ from evaluate import (
     _evaluation_output_directory,
     parse_args as parse_evaluation_args,
 )
-from configs.experiment_profiles import PROFILE_NAMES, get_experiment_profile
-from configs.generalization_config import (
-    COMMON_GENERALIZATION_ENV_CONFIG,
-    GENERALIZATION_EVALUATION_ENV_CONFIG,
-    GENERALIZATION_EVALUATION_EPISODES,
-    GENERALIZATION_TRAIN_ENV_CONFIG,
-    GENERALIZATION_TRAINING_CONFIG,
+from configs.experiment_config import (
+    PPO_COMMON_SCALAR_DEFAULTS,
+    PPO_COMMON_SCALAR_KEYS,
+    PROFILE_NAMES,
+    get_experiment_profile,
 )
-from configs.phase0_config import OFFICIAL_ENV_CONFIG, OFFICIAL_TRAINING_CONFIG, OUTPUT_DIR
+from project_paths import OUTPUT_DIR
 from train import _training_output_directory, parse_args as parse_training_args
+
+
+_OFFICIAL_PROFILE = get_experiment_profile("official")
+_GENERALIZATION_PROFILE = get_experiment_profile("generalization")
+OFFICIAL_ENV_CONFIG = _OFFICIAL_PROFILE.train_env_config
+OFFICIAL_TRAINING_CONFIG = _OFFICIAL_PROFILE.training_config
+GENERALIZATION_TRAIN_ENV_CONFIG = _GENERALIZATION_PROFILE.train_env_config
+GENERALIZATION_EVALUATION_ENV_CONFIG = _GENERALIZATION_PROFILE.evaluation_env_config
+GENERALIZATION_TRAINING_CONFIG = _GENERALIZATION_PROFILE.training_config
+COMMON_GENERALIZATION_ENV_CONFIG = {
+    key: value
+    for key, value in GENERALIZATION_TRAIN_ENV_CONFIG.items()
+    if GENERALIZATION_EVALUATION_ENV_CONFIG.get(key) == value
+}
 
 
 EXPECTED_COMMON_CONFIG = {
@@ -81,10 +93,20 @@ def test_generalization_scenario_ranges_are_disjoint() -> None:
     assert set(train_seeds).isdisjoint(evaluation_seeds)
 
 
-def test_generalization_training_and_evaluation_defaults() -> None:
-    """汎化実験のPPO予算と評価episode数を固定する。"""
+def test_generalization_training_defaults() -> None:
+    """汎化実験のPPO予算を固定する。"""
 
-    assert GENERALIZATION_TRAINING_CONFIG == {
+    assert {
+        key: GENERALIZATION_TRAINING_CONFIG[key]
+        for key in (
+            "seed",
+            "num_envs",
+            "n_steps",
+            "total_timesteps",
+            "log_interval",
+            "policy",
+        )
+    } == {
         "seed": 0,
         "num_envs": 4,
         "n_steps": 4096,
@@ -92,7 +114,10 @@ def test_generalization_training_and_evaluation_defaults() -> None:
         "log_interval": 4,
         "policy": "MlpPolicy",
     }
-    assert GENERALIZATION_EVALUATION_EPISODES == 200
+    assert {
+        key: GENERALIZATION_TRAINING_CONFIG[key]
+        for key in PPO_COMMON_SCALAR_KEYS
+    } == PPO_COMMON_SCALAR_DEFAULTS
 
 
 def test_profile_selector_returns_typed_config_bundles() -> None:
@@ -101,21 +126,20 @@ def test_profile_selector_returns_typed_config_bundles() -> None:
     assert PROFILE_NAMES == ("official", "generalization")
 
     official = get_experiment_profile("official")
-    assert official.train_env_config is OFFICIAL_ENV_CONFIG
-    assert official.evaluation_env_config is OFFICIAL_ENV_CONFIG
-    assert official.training_config is OFFICIAL_TRAINING_CONFIG
+    assert official.train_env_config == official.evaluation_env_config == OFFICIAL_ENV_CONFIG
+    assert official.training_config == OFFICIAL_TRAINING_CONFIG
     assert official.default_model_name == "phase0_official"
-    assert official.evaluation_episodes == 1
+    assert {
+        key: official.train_env_config[key]
+        for key in ("start_seed", "num_scenarios")
+    } == {"start_seed": 5, "num_scenarios": 1}
 
     generalization = get_experiment_profile("generalization")
-    assert generalization.train_env_config is GENERALIZATION_TRAIN_ENV_CONFIG
-    assert (
-        generalization.evaluation_env_config
-        is GENERALIZATION_EVALUATION_ENV_CONFIG
-    )
-    assert generalization.training_config is GENERALIZATION_TRAINING_CONFIG
+    assert generalization.train_env_config == GENERALIZATION_TRAIN_ENV_CONFIG
+    assert generalization.evaluation_env_config == GENERALIZATION_EVALUATION_ENV_CONFIG
+    assert generalization.training_config == GENERALIZATION_TRAINING_CONFIG
     assert generalization.default_model_name == "generalization"
-    assert generalization.evaluation_episodes == 200
+    assert generalization.evaluation_env_config["num_scenarios"] == 200
 
 
 def test_profile_selector_rejects_unknown_name() -> None:
@@ -134,7 +158,6 @@ def test_generalization_profile_is_connected_to_both_clis() -> None:
     assert official_training_args.model_name == "phase0_official"
 
     official_evaluation_args = parse_evaluation_args([])
-    assert official_evaluation_args.episodes == 1
     assert official_evaluation_args.model.name == "phase0_official.zip"
 
     training_args = parse_training_args(["--profile", "generalization"])
@@ -144,7 +167,6 @@ def test_generalization_profile_is_connected_to_both_clis() -> None:
     assert training_args.model_name == "generalization"
 
     evaluation_args = parse_evaluation_args(["--profile", "generalization"])
-    assert evaluation_args.episodes == 200
     assert evaluation_args.model.name == "generalization.zip"
     assert evaluation_args.output_prefix == "generalization"
 

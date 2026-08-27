@@ -2,7 +2,7 @@
 
 このディレクトリは、MetaDrive公式ドキュメントの「Training > stable-baselines3」にある最小構成を、学習タスクを変えずに通常のPythonスクリプトへ分割したものです。固定された `map="C"` の道路でMetaDrive標準Observationを受け取り、9種類の離散Actionから操作を選び、MetaDrive標準Rewardを最大化しながら目的地へ向かうPolicyをSB3 PPOで学習します。
 
-既存の公式再現を既定の `official` profileとして残しつつ、複数の手続き生成道路で学習し、未見scenarioで評価する `generalization` profileも選択できます。組み込みprofileは17章、任意のTOML実験bundleは18章にまとめています。
+公式再現は既定の `configs/official.toml`、複数の手続き生成道路で学習し未見scenarioで評価する設定は `configs/generalization.toml` にあります。`--profile official` / `--profile generalization` はこれらのTOMLを指す互換aliasであり、設定の正本はすべてTOMLです。
 
 > **現在の環境:** Python 3.12.3の `.venv` を標準 `venv` で作成し、packageはpipで管理します。公式MetaDrive sourceは同階層の `metadrive/` に置き、`main` commit `85e5dadc6c7436d324348f6e3d8f8e680c06b4db` を `-e ../metadrive` でeditable installしています。
 
@@ -10,14 +10,14 @@
 
 ### 学習すること
 
-- 道路とシナリオは `map="C"`、`num_scenarios=1`、`start_seed=5` に固定します。確認したsourceではブロックID `C` は `Curve` です。公式ミニ例と同じ対象を使い、複数マップやseedに対する一般化は扱いません。
+- 道路とシナリオは `map="C"`、`num_scenarios=1`、`start_seed=5` に固定します。確認したsourceではブロックID `C` は `Curve` です。学習・評価とも公式ミニ例と同じseed 5の単一scenarioを使い、複数mapや未見seedに対する一般化は扱いません。
 - 交通量を0、事故生成確率を0にし、周辺車との交渉ではなく、自己車両の経路追従と目的地到達という最小の接続を検証します。
 - `discrete_steering_dim=3` と `discrete_throttle_dim=3` の直積を単一の `Discrete(9)` とし、操作候補を小さくします。
 - PPOと `MlpPolicy` を使います。これは公式ミニ例と同じ組合せであり、離散Actionを直接扱えて、MetaDriveとSB3の接続確認に必要十分だからです。
 
 ### 学習しないこと
 
-この章で定義するPhase 0公式再現では、他車回避、交通交渉、障害物回避、複数マップ・複数scenario seedへの一般化は対象外です。また、独自Observation、独自Reward、独自終了条件、独自Policyネットワーク、独自Feature Extractor、独自Controller、連続Action、画像Observation、マルチエージェント、SAC/TD3との比較、ハイパーパラメータ探索は導入しません。`generalization` profileは後続の任意設定であり、この固定契約を置換しません。
+この章で定義するPhase 0公式再現では、他車回避、交通交渉、障害物回避、複数map・未見scenario seedへの一般化は対象外です。また、独自Observation、独自Reward、独自終了条件、独自Policyネットワーク、独自Feature Extractor、独自Controller、連続Action、画像Observation、マルチエージェント、SAC/TD3との比較、ハイパーパラメータ探索は導入しません。`generalization` profileは後続の任意設定であり、この固定契約を置換しません。
 
 `map="C"`、離散Action、PPOを採用する第一の理由は、公式例の学習問題そのものを再現し、後続研究の変更を混ぜる前に「MetaDrive → SB3 → PPO更新 → 保存モデルの評価」という配線を検証するためです。
 
@@ -25,20 +25,28 @@
 
 環境へ明示的に渡す設定は次の11項目だけです。Rewardや終了条件に関する設定は追加せず、確認したMetaDrive sourceのデフォルトを使います。
 
-```python
-OFFICIAL_ENV_CONFIG = {
-    "map": "C",
-    "discrete_action": True,
-    "discrete_throttle_dim": 3,
-    "discrete_steering_dim": 3,
-    "horizon": 500,
-    "random_spawn_lane_index": False,
-    "num_scenarios": 1,
-    "start_seed": 5,
-    "traffic_density": 0,
-    "accident_prob": 0,
-    "log_level": 50,
-}
+```toml
+# configs/official.toml
+[environment.common]
+map = "C"
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+horizon = 500
+random_spawn_lane_index = false
+traffic_density = 0
+accident_prob = 0
+log_level = 50
+
+[environment.train]
+# 学習は公式サンプルどおりseed 5の単一scenario
+start_seed = 5
+num_scenarios = 1
+
+[environment.evaluation]
+# 評価も同じseed 5の単一scenario
+start_seed = 5
+num_scenarios = 1
 ```
 
 契約を短くまとめると次のとおりです。
@@ -49,27 +57,36 @@ OFFICIAL_ENV_CONFIG = {
 | Action | `Discrete(9)` |
 | Reward | MetaDrive標準 |
 | 終了条件 | MetaDrive標準 |
-| シナリオ | 1個、`start_seed=5` |
+| シナリオ | 学習・評価とも1個、`start_seed=5`（seed 5のみ） |
 | 交通量 / 事故生成 | `0` / `0` |
 | RL algorithm | SB3 PPO |
 | Policy | `MlpPolicy` |
 
 本学習の設定も公式例に合わせます。
 
-```python
-OFFICIAL_TRAINING_CONFIG = {
-    "seed": 0,
-    "num_envs": 4,
-    "n_steps": 4096,
-    "total_timesteps": 300_000,
-    "log_interval": 4,
-    "policy": "MlpPolicy",
-}
+```toml
+[training]
+policy = "MlpPolicy"
+seed = 0
+num_envs = 4
+n_steps = 4096
+total_timesteps = 300000
+log_interval = 4
+learning_rate = 0.0003
+batch_size = 64
+n_epochs = 10
+gamma = 0.99
+gae_lambda = 0.95
+clip_range = 0.2
+normalize_advantage = true
+ent_coef = 0.0
+vf_coef = 0.5
+max_grad_norm = 0.5
 ```
 
-PPOのその他のハイパーパラメータはSB3のデフォルトを使います。`device` だけは実行環境を曖昧にしないためCLIで指定し、既定を `cpu` とします。これはSB3がPPO + `MlpPolicy`にCPUを推奨していることに合わせた性能上の既定値であり、ホストGPUが存在しないという判定ではありません。CUDA対応PyTorch環境では`--device cuda`を明示してGPU学習も実行できます。
+上記10個のPPO scalarはTOMLで明示し、任意のbundleで省略した場合もSB3 2.9.0の同じ既定値をloaderが補完してmetadataへ記録します。`device` は実行環境を曖昧にしないためTOMLまたはCLIで指定し、既定を `cpu` とします。CUDA対応PyTorch環境では`--device cuda`を明示してGPU学習も実行できます。
 
-RL seedは公式例どおり `set_random_seed(0)` で設定し、`PPO(seed=...)` は指定しません。SB3 2.9.0でPPOへseedを渡すとVecEnvにもseedが転送されますが、MetaDrive 0.4.3の `reset(seed=...)` は通常の乱数seedではなくscenario indexとして扱われます。今回の有効なscenario indexは5だけなので、RL seed 0を環境resetへ流すと固定scenarioを壊して失敗します。Action/Observation spaceの乱数だけはworkerごとにseedし、環境resetは引数なしで行います。
+RL seedは公式例どおり `set_random_seed(0)` で設定し、`PPO(seed=...)` は指定しません。SB3 2.9.0でPPOへseedを渡すとVecEnvにもseedが転送されますが、MetaDrive 0.4.3の `reset(seed=...)` は通常の乱数seedではなくscenario indexとして扱われます。学習・評価とも有効なscenario indexは5だけなので、RL seed 0を環境resetへ流すと固定scenario範囲を壊して失敗します。Action/Observation spaceの乱数だけはworkerごとにseedし、環境resetは引数なしで行います。
 
 ### Action IDの意味
 
@@ -199,6 +216,7 @@ TensorBoardの記録間隔は `log_interval` に依存するため、最終scala
 | Action | `Discrete(9)` | 同じ |
 | PPO | `MlpPolicy` | 同じ |
 | 本学習 | 4環境、300,000 step | 同じ |
+| scenario範囲 | `start_seed=5` の単一scenario | 学習・評価ともseed 5の単一scenario（公式例と同じ） |
 | コード構成 | Notebook的な一連の例 | 複数ファイルへ分割 |
 | 環境検査 | なし | `check_env` 等を追加 |
 | Smoke Test | `TEST_DOC` 時の簡略実行 | 明示的な短時間設定 |
@@ -226,7 +244,7 @@ TensorBoardの記録間隔は `log_interval` に依存するため、最終scala
 
 2026-08-18の単一 `.venv` で実測した主なversionは、Python 3.12.3、pip 26.2.1、MetaDrive 0.4.3、SB3 2.9.0、Gymnasium 1.3.0、PyTorch 2.13.0+cu130、NumPy 2.5.2、Panda3D 1.10.16です。標準pipが解決したPyTorchはCUDA 13.0 buildですが、現在の実行コンテキストではGPU accessがOSによりblockされ、`torch.cuda.is_available()`は`False`、`nvidia-smi`もNVML初期化に失敗しました。この値だけからホストGPUの有無は判定しません。
 
-raw環境への `check_env` にあるseed契約衝突は最新`main`でも残っています。SB3 2.9.0のcheckerは `env.reset(seed=0)` を呼びますが、MetaDrive側はその値を乱数seedではなくscenario indexとして扱い、許容範囲は `[5, 6)` です。`inspect_env.py`はこのraw failureを隠さず表示した後、検査時だけscenario 5を維持するseed adapterでも検査し、全体として終了コード0になりました。adapterは学習・評価には使いません。
+raw環境への `check_env` にあるseed契約衝突は最新`main`でも残っています。SB3 2.9.0のcheckerは `env.reset(seed=0)` を呼びますが、MetaDrive側はその値を乱数seedではなくscenario indexとして扱い、学習・評価とも許容範囲は `[5, 6)` です。`inspect_env.py`はこのraw failureを隠さず表示した後、選択したTOML stageの開始scenarioを維持するseed adapterでも検査します。adapterは学習・評価には使いません。
 
 参照先:
 
@@ -249,11 +267,11 @@ metadrive-workspace/
 │   ├── requirements.txt              # MetaDrive sibling pathと直接依存
 │   ├── requirements.lock.txt         # 検証済みvenvのversion snapshot
 │   ├── configs/                       # 実験設定をまとめたpackage
-│   │   ├── phase0_config.py           # 公式設定値と出力先の一元管理
-│   │   ├── generalization_config.py   # 複数scenario学習と未見評価の設定
-│   │   ├── experiment_profiles.py     # official/generalizationの選択
-│   │   ├── experiment_config.py       # 外部TOML bundleの検証と選択
-│   │   └── example_experiment.toml    # copyして使う短時間のbundle例
+│   │   ├── official.toml              # 既定の公式再現bundle
+│   │   ├── generalization.toml        # 複数scenario/未見評価bundle
+│   │   ├── example_experiment.toml    # copyして使う短時間のbundle例
+│   │   └── experiment_config.py       # TOML検証・canonical alias解決
+│   ├── project_paths.py                # configs/models/logs/outputsの共通path
 │   ├── env_factory.py                 # MetaDrive生成と記録専用Monitor
 │   ├── inspect_env.py                 # version・空間・Action変換・check_env・random走行検査
 │   ├── train.py                       # SubprocVecEnvとPPO学習・モデル保存
@@ -263,7 +281,6 @@ metadrive-workspace/
 │   ├── generate_evaluation_telemetry_guide.py # 編集可能なExcelガイドの生成
 │   ├── EVALUATION_TELEMETRY_GUIDE.xlsx # 右パネルの編集可能な日本語ガイド
 │   ├── README.md                      # タスク、設計、実行手順（本書）
-│   ├── CODE_WALKTHROUGH.md            # 自作・library内部処理の行番号付き解説
 │   ├── tests/                         # 環境contractと汎化設定test
 │   ├── models/                        # 学習済みmodel
 │   ├── logs/                          # Monitor / TensorBoard / console log
@@ -357,6 +374,8 @@ version、適用config、Observation/Action space、Gymnasium API、`check_env`�
 
 ```bash
 .venv/bin/python inspect_env.py
+.venv/bin/python inspect_env.py --profile generalization --stage evaluation
+.venv/bin/python inspect_env.py --config configs/my_experiment.toml --stage train
 ```
 
 raw環境へのSB3 `check_env`では既知のscenario seed衝突を報告します。その後、検査専用adapterとrandom走行が成功すればcommand全体は終了コード0です。
@@ -388,11 +407,10 @@ PPO初期化、rollout、勾配更新、保存、再読込までを短時間で�
 ```bash
 .venv/bin/python evaluate.py \
   --model models/phase0_smoke.zip \
-  --episodes 1 \
   --output-prefix phase0_smoke
 ```
 
-評価では全episodeのtop-down GIF、MP4、フレーム別PNGを既定で `outputs/official/evaluation/phase0_smoke/episodes/` 以下へepisode別に保存します。記録が不要な場合は `--no-record-gif` を指定します。同じprofileとoutput prefixで再実行すると、古い `episodes/` を評価開始時に削除して対応する成果物を置き換えます。`--no-record-gif` での再実行時も古い可視化は削除されるため、結果を残す場合は別のoutput prefixを指定してください。
+評価は `start_seed=5`、`num_scenarios=1` のseed 5だけを1回走らせます。top-down GIF、MP4、フレーム別PNGを既定で `outputs/official/evaluation/phase0_smoke/episodes/` 以下へepisode別に保存します。記録が不要な場合は `--no-record-gif` を指定します。同じprofileとoutput prefixで再実行すると、古い `episodes/` を評価開始時に削除して対応する成果物を置き換えます。`--no-record-gif` での再実行時も古い可視化は削除されるため、結果を残す場合は別のoutput prefixを指定してください。
 
 ### 13.6 公式設定の学習
 
@@ -411,18 +429,16 @@ PPO初期化、rollout、勾配更新、保存、再読込までを短時間で�
 ```bash
 .venv/bin/python evaluate.py \
   --model models/phase0_official.zip \
-  --episodes 1 \
   --output-prefix phase0_official
 ```
 
-`evaluate.py` は既定で全評価episodeを、合成済みtelemetry panel付きのtop-down GIF、MP4、フレーム別PNGとしてepisode別に保存します。`--record-gif` は後方互換の記録スイッチ名で、`--record-gif` / `--no-record-gif` により全episodeの3種類すべてを切り替えます。GIF・MP4・PNGが不要な場合は、実行時に `--no-record-gif` を指定します。
+`official` profileの `evaluate.py` はseed 5の単一scenarioを1回だけ走査し、合成済みtelemetry panel付きのtop-down GIF、MP4、フレーム別PNGとしてepisode別に保存します。`--record-gif` は後方互換の記録スイッチ名で、`--record-gif` / `--no-record-gif` により全episodeの3種類すべてを切り替えます。GIF・MP4・PNGが不要な場合は、実行時に `--no-record-gif` を指定します。
 
 評価のCLI、モデル読込、`model.predict(..., deterministic=True)` と `env.step()` の順序は `evaluate.py` が担当し、JSON/JSONLの直列化とepisode別artifactの保持・保存は `evaluation_results.py` が担当します。この分割は評価経路と出力形式を変えず、ファイルI/Oの責務だけを推論loopから分離しています。
 
 ```bash
 .venv/bin/python evaluate.py \
   --model models/phase0_official.zip \
-  --episodes 1 \
   --no-record-gif \
   --output-prefix phase0_official
 ```
@@ -444,7 +460,7 @@ PPO初期化、rollout、勾配更新、保存、再読込までを短時間で�
 
 ## 14. 評価とGIF/MP4 API
 
-評価は単一環境で、保存済みPPOを `deterministic=True` で呼び出します。各エピソードは `terminated or truncated` で終了し、total reward、length、速度要約、Action切替回数・頻度、元の終了flag、`route_completion`、model SHA-256、実行時間を `outputs/<profile>/evaluation/<output-prefix>/evaluation.json` へ保存します。さらに全episodeの全stepを同じrunディレクトリの `evaluation_steps.jsonl` へ1行ずつ保存し、評価JSONの `step_telemetry` からpath・schema・row数を参照できます。各行はAction適用後の状態で、速度、Action、simulation時刻、現在区間のruntime道路値、Reward、終了flagを含みます。
+評価は単一環境で、保存済みPPOを `deterministic=True` で呼び出します。`[environment.evaluation]` の `start_seed` から `start_seed + num_scenarios - 1` までを昇順に各1回ずつ走査するため、結果の `episode_count` は常に `num_scenarios` と一致します。各エピソードは `terminated or truncated` で終了し、total reward、length、速度要約、Action切替回数・頻度、元の終了flag、`route_completion`、model SHA-256、実行時間を `outputs/<profile>/evaluation/<output-prefix>/evaluation.json` へ保存します。さらに全episodeの全stepを同じrunディレクトリの `evaluation_steps.jsonl` へ1行ずつ保存し、評価JSONの `step_telemetry` からpath・schema・row数を参照できます。各行はAction適用後の状態で、速度、Action、simulation時刻、現在区間のruntime道路値、Reward、終了flagを含みます。
 
 全評価episodeは既定でGIF、MP4、フレーム別PNGへ記録され、`episodes/episode_<番号>_scenario_<seed>/` ごとに分離されます。`--no-record-gif` 指定時だけ全episodeの記録を行いません。3種類の出力は同じpost-stepの合成済みpanel frameを使います。GIFは元の600×600地図を隠さず、右側へ320pxのtelemetry panelを追加します。panelには、実行時configから導出した物理更新Hz・制御Hz、適用済みAction、速度、累積切替回数と `switches/s`、直近2秒のAction履歴、Reward・route進捗・終了状態を表示します。`switches/s` の分母は再生時間やwall-clockではなく、episode開始から現在frameまでのsimulation経過秒です。道路値は固定設定ではなく、そのframeで車両がいる区間から取得し、`CURRENT SEGMENT (runtime)` と明記します。取得できない道路値は評価を止めず `N/A` とします。`info` のoptional項目は `info.get(...)` で取得し、存在しないキーを成功・失敗どちらにも推測しません。
 
@@ -483,7 +499,7 @@ MetaDrive 0.4.3の公開 `screen_frames` propertyはdeep copyを返すため、�
 
 ## 15. 主な成果物
 
-`outputs/` は設定を選ぶprofileごとに分離します。`official` は `configs/phase0_config.py`、`generalization` は `configs/generalization_config.py` に対応し、その下を学習runと評価runに分けます。既存のroot直下の成果物は自動移動せず、新しい実行から次の構成を使います。
+`outputs/` は解決済みTOMLの`name`ごとに分離します。既定の`official`と`generalization`はそれぞれ `configs/official.toml` と `configs/generalization.toml` を使い、その下を学習runと評価runに分けます。既存のroot直下の成果物は自動移動せず、新しい実行から次の構成を使います。
 
 | 種類 | 保存先 |
 | --- | --- |
@@ -498,12 +514,12 @@ MetaDrive 0.4.3の公開 `screen_frames` propertyはdeep copyを返すため、�
 | episode別top-down MP4（既定で全episodeを生成） | `outputs/<profile>/evaluation/<output-prefix>/episodes/episode_<番号>_scenario_<seed>/evaluation.mp4` |
 | episode別の合成済みtop-down PNG連番 | `outputs/<profile>/evaluation/<output-prefix>/episodes/episode_<番号>_scenario_<seed>/frames/frame_*.png` |
 | 評価テレメトリ表示ガイド（編集可能Excel） | `EVALUATION_TELEMETRY_GUIDE.xlsx` |
-| 環境検査log | `outputs/inspect_env.log` |
+| 環境検査log | `outputs/inspect_env/<experiment-name>/<train|evaluation>.log` |
 | 直接依存 / dependency lock | `requirements.txt` / `requirements.lock.txt` |
 
 ## 16. 既知の制約
 
-公式11設定のraw `MetaDriveEnv`へSB3 2.9.0の`check_env`を直接適用すると、最新`main`でもfatalになります。SB3が送る`reset(seed=0)`をMetaDriveがscenario indexとして解釈し、固定scenario範囲`[5, 6)`から外れるためです。検査専用seed adapter、50step random走行、対象pytest 30件はpassしていますが、adapter成功をraw直接検査成功とは扱いません。公式config、upstream source、SB3 checkerは改変していません。
+元の公式ミニ例と同じseed 5の単一scenarioを使う現行11設定のraw `MetaDriveEnv`へSB3 2.9.0の`check_env`を直接適用すると、最新`main`でもfatalになります。SB3が送る`reset(seed=0)`をMetaDriveがscenario indexとして解釈し、固定scenario範囲`[5, 6)`から外れるためです。検査専用seed adapter、50step random走行、対象pytest 30件はpassしていますが、adapter成功をraw直接検査成功とは扱いません。upstream sourceとSB3 checkerは改変していません。
 
 upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計まで出力した後、終了コード139になりました。確認したscriptは生成したenvを明示closeしません。同じruntimeでenvを `finally` からcloseする1,000-step走行、本projectのtest、`inspect_env.py` は終了コード0なので、install不能とは判定しませんが、upstream profileのプロセス全体もpassとは判定しません。
 
@@ -511,7 +527,7 @@ upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計
 
 ## 17. 複数scenarioへ一般化するprofile
 
-`configs/generalization_config.py` は、固定されたCurve 1本ではなく、scenario seedごとに生成される3-block道路を学習対象にします。MetaDrive同梱のgeneralization例に合わせて学習用と評価用のseed集合を分離し、評価時はランダム抽選せず先頭から一度ずつ走査します。
+`configs/generalization.toml` は、固定されたCurve 1本ではなく、scenario seedごとに生成される3-block道路を学習対象にします。MetaDrive同梱のgeneralization例に合わせて学習用と評価用のseed集合を分離し、評価時はランダム抽選せず先頭から一度ずつ走査します。
 
 | 項目 | 学習 | 未見評価 |
 | --- | --- | --- |
@@ -554,11 +570,11 @@ upstreamの `metadrive.examples.profile_metadrive` は10,000 stepの最終統計
 .venv/bin/python evaluate.py --profile generalization
 ```
 
-既定ではscenario 0から199を各1回評価し、各episodeの `scenario_seed`、reward、終了理由と、全体のsuccess rate / out-of-road rateをJSONへ保存するとともに、200 episodeすべてをepisode別のGIF/MP4/PNGへ記録します。短く確認するときは `--episodes 5` のように指定すると、scenario 0から4だけを重複なしで評価します。全件可視化はディスク使用量と実行時間が大きくなるため、数値評価だけが必要な場合は `--no-record-gif` を併用してください。既存のコマンドは `--profile official` が既定なので、Phase 0公式設定のtask自体は変わりません。
+既定ではscenario 0から199を各1回評価し、各episodeの `scenario_seed`、reward、終了理由と、全体のsuccess rate / out-of-road rateをJSONへ保存するとともに、200 episodeすべてをepisode別のGIF/MP4/PNGへ記録します。より短い評価を作る場合は、別のTOML bundleの `[environment.evaluation].num_scenarios` を必要な件数に設定してください。全件可視化はディスク使用量と実行時間が大きくなるため、数値評価だけが必要な場合は `--no-record-gif` を併用してください。既存のコマンドは `--profile official` が既定なので、Phase 0公式設定のtask自体は変わりません。
 
 ## 18. 任意のTOML実験bundle
 
-新しい実験はPythonのprofile登録を変更せず、TOMLを1ファイル追加するだけで定義できます。`configs/example_experiment.toml` は1環境、2,000 timestep、rollout 256、5 scenario評価、可視化なしの短いgeneralization系の例です。コピーして実験名・環境・予算を変更してください。
+新しい実験はPythonのprofile登録を変更せず、TOMLを1ファイル追加するだけで定義できます。`configs/example_experiment.toml` は1環境、2,000 timestep、rollout 256、5 scenario評価、可視化なしの短いgeneralization系の例です。コピーして実験名・環境・PPO値・予算を変更してください。
 
 ```bash
 cp configs/example_experiment.toml configs/my_experiment.toml
@@ -567,9 +583,9 @@ cp configs/example_experiment.toml configs/my_experiment.toml
 .venv/bin/python evaluate.py --config configs/my_experiment.toml
 ```
 
-`--profile {official,generalization}` と `--config PATH` は排他的です。何も指定しなければ従来どおり `official` profileを使います。相対の`--config`、TOML内の`model_path`、`log_file`はすべてこのprojectのroot（`metadrive-rl/`）を基準に解決します。TOMLファイル自身の置き場所を基準にはしません。絶対pathも指定できます。
+`--profile {official,generalization}` と `--config PATH` は排他的です。前者はcanonical TOMLへの互換aliasで、何も指定しなければ `configs/official.toml` を使います。相対の`--config`、TOML内の`model_path`、`log_file`はすべてこのprojectのroot（`metadrive-rl/`）を基準に解決します。TOMLファイル自身の置き場所を基準にはしません。絶対pathも指定できます。
 
-CLIの明示値はTOMLの既定値を上書きします。例えば短い配線確認だけにする場合は、同じbundleを使ったまま次のように指定できます。
+CLIの明示値はTOMLのCLI対応既定値を上書きします。評価するscenario数は実験bundleの環境設定で決まるため、短い配線確認では `[environment.evaluation].num_scenarios` を小さくしたbundleを用意してください。例えば、可視化だけを無効にする場合は次のように指定できます。
 
 ```bash
 .venv/bin/python train.py \
@@ -578,16 +594,16 @@ CLIの明示値はTOMLの既定値を上書きします。例えば短い配線�
 
 .venv/bin/python evaluate.py \
   --config configs/my_experiment.toml \
-  --episodes 5 --no-record-gif
+  --no-record-gif
 ```
 
-### 18.1 schema version 1
+### 18.1 schema version 2
 
-正式に対応する形式はPython 3.12標準の`tomllib`で読むTOMLだけです。JSON/YAMLやPython設定ファイルのimport・実行は行いません。rootで許可されるkeyは下表だけで、`training`、`evaluation`、`environment`の未知keyもエラーになります。`name`、`default_model_name`、`training.model_name`、`evaluation.output_prefix`は出力先を越えないbasenameだけを受け入れます。
+正式に対応する形式はPython 3.12標準の`tomllib`で読むTOMLだけです。JSON/YAMLやPython設定ファイルのimport・実行は行いません。`[training]`、`[evaluation]`、`[environment]` の3 tableはすべて必須ですが、`[evaluation]` は空でも構いません。その場合は全評価既定値が学習設定とmodel名から解決されます。rootで許可されるkeyは下表だけで、`training`、`evaluation`、`environment`の未知keyもエラーになります。`name`、`default_model_name`、`training.model_name`、`evaluation.output_prefix`は出力先を越えないbasenameだけを受け入れます。
 
 | table / key | 必須 | 型・既定値 | 用途 |
 | --- | --- | --- | --- |
-| `schema_version` | はい | integer `1` | schema version |
+| `schema_version` | はい | integer `2` | schema version |
 | `name` | はい | basename string | `outputs/<name>/...` の実験名 |
 | `algorithm` | はい | string `"ppo"` | 現時点ではPPOだけを許可 |
 | `default_model_name` | いいえ | basename string、既定は`name` | `training.model_name`のfallback |
@@ -597,10 +613,17 @@ CLIの明示値はTOMLの既定値を上書きします。例えば短い配線�
 | `[training].n_steps` | はい | 正のinteger | 1環境あたりのPPO rollout長 |
 | `[training].total_timesteps` | はい | 正のinteger | `model.learn()`の下限step数 |
 | `[training].log_interval` | はい | 正のinteger | PPO log間隔 |
+| `[training].learning_rate` | いいえ | 有限の正数、既定`0.0003` | PPO optimizer learning rate |
+| `[training].batch_size` | いいえ | 正のinteger、既定`64` | PPO minibatch size |
+| `[training].n_epochs` | いいえ | 正のinteger、既定`10` | rolloutごとのPPO epoch数 |
+| `[training].gamma` / `gae_lambda` | いいえ | `0`〜`1`、既定`0.99` / `0.95` | discount / GAE係数 |
+| `[training].clip_range` | いいえ | 有限の正数、既定`0.2` | PPO policy clip幅 |
+| `[training].normalize_advantage` | いいえ | bool、既定`true` | advantage正規化の有効化 |
+| `[training].ent_coef` / `vf_coef` | いいえ | 有限の0以上、既定`0.0` / `0.5` | entropy / value loss係数 |
+| `[training].max_grad_norm` | いいえ | 有限の0以上、既定`0.5` | gradient clipping上限 |
 | `[training].device` | いいえ | string、既定`cpu` | PPOのdevice |
 | `[training].model_name` | いいえ | basename string、既定`default_model_name` | 実際に保存する学習modelとtraining成果物名 |
 | `[training].log_file` | いいえ | path string | 学習console log。未指定時は従来の名前 |
-| `[evaluation].episodes` | はい | 正のinteger | 評価episode数 |
 | `[evaluation].model_path` | いいえ | path string、既定`models/<training.model_name>.zip` | 読み込むPPO model |
 | `[evaluation].record_gif` | いいえ | bool、既定`true` | GIF/MP4/PNGを全episodeへ記録するか |
 | `[evaluation].output_prefix` | いいえ | basename string、既定`training.model_name` | evaluation成果物名 |
@@ -611,9 +634,9 @@ CLIの明示値はTOMLの既定値を上書きします。例えば短い配線�
 
 model名は、`default_model_name`（省略時は`name`）→`training.model_name`（省略時は前者）→評価の既定`model_path` / `output_prefix`という順に解決します。従って`training.model_name`だけを変え、評価側の両keyを省略しても、評価は学習直後に保存した`models/<training.model_name>.zip`を読む設定になります。評価側の明示値はこの連鎖を上書きします。
 
-PPOの既定`normalize_advantage`に合わせ、TOML既定の`training.num_envs * training.n_steps`は2以上でなければload時にエラーになります。CLIの両値上書きは既存どおりruntimeへ渡されます。
+`normalize_advantage=true` のとき、`training.num_envs * training.n_steps`と`training.batch_size`はどちらも2以上でなければload時にエラーになります。`--num-envs` / `--n-steps`をCLIで上書きした場合も、その実効rollout sizeを再検証します。全10 scalarは解決済み値のまま`PPO(...)`とtraining metadataへ渡ります。
 
-`[environment.train]` と `[environment.evaluation]` は必須です。`[environment.common]` は任意で、commonを再帰的にcopyしてからstage tableで上書きします。いずれの解決済み環境にも`start_seed`（boolではないinteger）と`num_scenarios`（正のinteger）が必要です。TOMLの`evaluation.episodes`は、評価scenario数が複数ならその`num_scenarios`以下でなければload時にエラーになります。`num_scenarios=1`の複数episode反復は従来どおり許可し、CLIの`--episodes`上書きは実行時にも同じ制約を検証します。
+`[environment.train]` と `[environment.evaluation]` は必須です。`[environment.common]` は任意で、commonを再帰的にcopyしてからstage tableで上書きします。いずれの解決済み環境にも`start_seed`（boolではないinteger）と`num_scenarios`（正のinteger）が必要です。評価はevaluation環境の全scenarioを昇順に各1回ずつ走査します。外部bundleはschema version 2だけを受け入れ、version 1や削除済みの評価回数keyを含むversion 2 bundleは明示的なエラーになります。
 
 ```toml
 [environment.common]

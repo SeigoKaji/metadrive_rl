@@ -31,11 +31,11 @@ from evaluation_visualization import (
 )
 from configs.experiment_config import (
     ExperimentConfigError,
+    PROFILE_NAMES,
     experiment_selection_from_args,
     select_experiment,
 )
-from configs.experiment_profiles import PROFILE_NAMES
-from configs.phase0_config import (
+from project_paths import (
     LOG_DIR,
     MODEL_DIR,
     OUTPUT_DIR,
@@ -89,15 +89,6 @@ class _Tee:
     @property
     def encoding(self) -> str | None:
         return self._terminal.encoding
-
-
-def _positive_int(value: str) -> int:
-    """Parse a strictly positive CLI integer."""
-
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("0より大きい整数を指定してください")
-    return parsed
 
 
 def _output_prefix(value: str) -> str:
@@ -154,7 +145,7 @@ def _evaluation_output_directory(profile_name: str, output_prefix: str) -> Path:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """選択profileまたはTOML bundleを評価CLI既定値としてparseする。"""
+    """canonical TOML aliasまたは外部bundleを評価CLI既定値としてparseする。"""
 
     profile_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     selection_group = profile_parser.add_mutually_exclusive_group()
@@ -184,7 +175,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--profile",
         choices=PROFILE_NAMES,
         default=selected.profile or "official",
-        help="評価環境profile（既定: official）",
+        help="canonical TOMLへの互換alias（既定: official.toml）",
     )
     selection_group.add_argument(
         "--config",
@@ -204,12 +195,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         ),
         help="PPO .zipモデル（相対パスはproject直下基準）",
-    )
-    parser.add_argument(
-        "--episodes",
-        type=_positive_int,
-        default=int(evaluation_defaults.get("episodes", profile.evaluation_episodes)),
-        help="評価episode数",
     )
     parser.add_argument(
         "--record-gif",
@@ -247,7 +232,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             if evaluation_defaults.get("log_file") is None
             else Path(str(evaluation_defaults["log_file"]))
         ),
-        help="標準出力/標準エラーの複製先（相対パスはPhase 0直下基準）",
+        help="標準出力/標準エラーの複製先（相対pathはproject直下基準）",
     )
     parser.add_argument(
         "--deterministic",
@@ -273,11 +258,6 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     deterministic = bool(getattr(args, "deterministic", True))
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
-    if scenario_count > 1 and args.episodes > scenario_count:
-        raise ValueError(
-            "評価episode数はprofileのscenario数以下にしてください: "
-            f"episodes={args.episodes}, num_scenarios={scenario_count}"
-        )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -329,7 +309,6 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         try:
             env = make_evaluation_env(
                 seed=args.seed,
-                record_gif=record_gif,
                 env_config=environment_config,
             )
             check_for_correct_spaces(env, model.observation_space, model.action_space)
@@ -352,15 +331,11 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                 f"mp4_fps={simulation_timing.control_hz:.3f}"
             )
 
-            for episode_number in range(1, args.episodes + 1):
+            for episode_number in range(1, scenario_count + 1):
                 episode_start_time = time.perf_counter()
-                # MetaDriveのseedはRL乱数ではなくscenario indexである。複数scenario
-                # profileでは先頭から一度ずつ走査し、ランダム抽選による重複を避ける。
-                scenario_seed = (
-                    scenario_start
-                    if scenario_count == 1
-                    else scenario_start + episode_number - 1
-                )
+                # MetaDriveのseedはRL乱数ではなくscenario indexである。設定された
+                # scenario範囲を先頭から一度ずつ走査し、ランダム抽選による重複を避ける。
+                scenario_seed = scenario_start + episode_number - 1
                 obs, reset_info = env.reset(seed=scenario_seed)
                 actual_scenario_seed = int(env.current_seed)
                 if actual_scenario_seed != scenario_seed:
@@ -565,7 +540,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "rl_seed": args.seed,
         "deterministic": deterministic,
         "simulation_timing": simulation_timing.to_dict(),
-        "episode_count": args.episodes,
+        "episode_count": scenario_count,
         "episodes": episodes,
         "aggregate": {
             "mean_reward": statistics.fmean(rewards),

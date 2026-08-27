@@ -1,17 +1,17 @@
-# Copy this file, change the bundle name and values, then pass the copy to
-# both ``train.py --config`` and ``evaluate.py --config``.
+# Canonical bundle for multi-scenario training and unseen-scenario evaluation.
+# `--profile generalization` resolves to this file.
 schema_version = 2
-name = "example_generalization"
+name = "generalization"
 algorithm = "ppo"
-default_model_name = "example_generalization"
+default_model_name = "generalization"
 
 [training]
 policy = "MlpPolicy"
 seed = 0
-num_envs = 1
-n_steps = 256
-total_timesteps = 2000
-log_interval = 1
+num_envs = 4
+n_steps = 4096
+total_timesteps = 1000000
+log_interval = 4
 device = "cpu"
 learning_rate = 0.0003
 batch_size = 64
@@ -25,12 +25,12 @@ vf_coef = 0.5
 max_grad_norm = 0.5
 
 [evaluation]
-record_gif = false
+record_gif = true
+output_prefix = "generalization"
+seed = 0
+device = "cpu"
 deterministic = true
 
-# These values are recursively merged into both stage-specific tables below.
-# MetaDrive settings remain pass-through values; this bundle intentionally uses
-# the same valid generalization task as configs/generalization.toml.
 [environment.common]
 map = 3
 discrete_action = true
@@ -53,4 +53,4 @@ num_scenarios = 1000
 
 [environment.evaluation]
 start_seed = 0
-num_scenarios = 5
+num_scenarios = 200

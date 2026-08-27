@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import io
 import math
 from pathlib import Path, PureWindowsPath
 import tomllib
-from typing import Literal, TypeAlias
+from typing import Final, Literal, TypeAlias
 
-from .experiment_profiles import ExperimentProfile, get_experiment_profile
-from .phase0_config import PROJECT_ROOT
+from project_paths import CONFIG_DIR, PROJECT_ROOT
 
 
-ConfigSourceKind: TypeAlias = Literal["builtin_profile", "toml"]
+ConfigSourceKind: TypeAlias = Literal["toml"]
+ExperimentStage: TypeAlias = Literal["train", "evaluation"]
 PlainData: TypeAlias = (
     str | int | float | bool | list["PlainData"] | dict[str, "PlainData"]
 )
@@ -26,14 +26,25 @@ class ExperimentConfigError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ExperimentProfile:
+    """1回の学習と評価に必要な、TOMLから解決済みの設定一式。"""
+
+    train_env_config: Mapping[str, object]
+    evaluation_env_config: Mapping[str, object]
+    training_config: Mapping[str, object]
+    default_model_name: str
+    evaluation_defaults: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentSelection:
-    """CLIが使う、設定sourceを含む解決済み実験bundle。"""
+    """CLIが使う、実TOML sourceを含む解決済み実験bundle。"""
 
     name: str
     profile: ExperimentProfile
     source_kind: ConfigSourceKind
-    source_path: Path | None
-    source_sha256: str | None
+    source_path: Path
+    source_sha256: str
 
     @property
     def profile_name(self) -> str:
@@ -41,16 +52,25 @@ class ExperimentSelection:
 
         return self.name
 
-    def source_metadata(self) -> dict[str, str | None]:
-        """JSON metadataへそのまま記録できる設定source情報。"""
+    def source_metadata(self) -> dict[str, str]:
+        """JSON metadataへそのまま記録できる実TOML source情報。"""
 
         return {
             "kind": self.source_kind,
             "name": self.name,
             "profile": self.name,
-            "path": None if self.source_path is None else str(self.source_path),
+            "path": str(self.source_path),
             "sha256": self.source_sha256,
         }
+
+
+# ``--profile`` はユーザー向けの互換aliasに留め、設定値そのものはすべて
+# 同じconfigs/内のTOMLから読む。追加の組み込み設定をここへ書かないこと。
+PROFILE_NAMES: Final[tuple[str, ...]] = ("official", "generalization")
+_PROFILE_FILENAMES: Final[dict[str, str]] = {
+    "official": "official.toml",
+    "generalization": "generalization.toml",
+}
 
 
 _ROOT_KEYS = frozenset(
@@ -74,8 +94,35 @@ _TRAINING_REQUIRED_KEYS = frozenset(
         "log_interval",
     }
 )
-_TRAINING_OPTIONAL_KEYS = frozenset({"device", "model_name", "log_file"})
-_EVALUATION_REQUIRED_KEYS = frozenset({"episodes"})
+PPO_COMMON_SCALAR_KEYS: Final[tuple[str, ...]] = (
+    "learning_rate",
+    "batch_size",
+    "n_epochs",
+    "gamma",
+    "gae_lambda",
+    "clip_range",
+    "normalize_advantage",
+    "ent_coef",
+    "vf_coef",
+    "max_grad_norm",
+)
+# SB3 2.9.0 PPO.__init__ defaults. Optional TOML keys are filled explicitly
+# so metadata and constructor inputs stay reproducible across future defaults.
+PPO_COMMON_SCALAR_DEFAULTS: Final[dict[str, object]] = {
+    "learning_rate": 0.0003,
+    "batch_size": 64,
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "normalize_advantage": True,
+    "ent_coef": 0.0,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+}
+_TRAINING_OPTIONAL_KEYS = frozenset(
+    {"device", "model_name", "log_file", *PPO_COMMON_SCALAR_KEYS}
+)
 _EVALUATION_OPTIONAL_KEYS = frozenset(
     {
         "model_path",
@@ -145,6 +192,31 @@ def _require_int(
     if positive and value <= 0:
         raise _error(location, "0より大きい整数で指定してください")
     return value
+
+
+def _require_real(
+    value: object,
+    location: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    minimum_inclusive: bool = True,
+) -> float:
+    """有限のPPO scalarを検証し、floatへ正規化する。"""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _error(location, "boolではない有限の数値で指定してください")
+    number = float(value)
+    if not math.isfinite(number):
+        raise _error(location, "有限の数値で指定してください")
+    if minimum is not None:
+        is_too_small = number < minimum if minimum_inclusive else number <= minimum
+        if is_too_small:
+            comparator = "以上" if minimum_inclusive else "より大きい"
+            raise _error(location, f"{minimum} {comparator}の数値で指定してください")
+    if maximum is not None and number > maximum:
+        raise _error(location, f"{maximum} 以下の数値で指定してください")
+    return number
 
 
 def _require_bool(value: object, location: str) -> bool:
@@ -322,6 +394,87 @@ def _validate_evaluation_action_compatibility(
             )
 
 
+def _validate_ppo_batching(training: Mapping[str, object]) -> None:
+    """SB3 PPOのnormalize_advantage前提を設定読込時に満たす。"""
+
+    if not bool(training["normalize_advantage"]):
+        return
+    rollout_batch_size = int(training["num_envs"]) * int(training["n_steps"])
+    if rollout_batch_size <= 1:
+        raise _error(
+            "training",
+            "normalize_advantage=trueではnum_envs * n_stepsを2以上にしてください",
+        )
+    if int(training["batch_size"]) <= 1:
+        raise _error(
+            "training.batch_size",
+            "normalize_advantage=trueでは2以上にしてください",
+        )
+
+
+def _validate_ppo_common_scalars(table: Mapping[str, object]) -> dict[str, object]:
+    """TOMLのPPO scalarを検証し、SB3既定値を明示して補完する。"""
+
+    return {
+        "learning_rate": _require_real(
+            table.get("learning_rate", PPO_COMMON_SCALAR_DEFAULTS["learning_rate"]),
+            "training.learning_rate",
+            minimum=0.0,
+            minimum_inclusive=False,
+        ),
+        "batch_size": _require_int(
+            table.get("batch_size", PPO_COMMON_SCALAR_DEFAULTS["batch_size"]),
+            "training.batch_size",
+            positive=True,
+        ),
+        "n_epochs": _require_int(
+            table.get("n_epochs", PPO_COMMON_SCALAR_DEFAULTS["n_epochs"]),
+            "training.n_epochs",
+            positive=True,
+        ),
+        "gamma": _require_real(
+            table.get("gamma", PPO_COMMON_SCALAR_DEFAULTS["gamma"]),
+            "training.gamma",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        "gae_lambda": _require_real(
+            table.get("gae_lambda", PPO_COMMON_SCALAR_DEFAULTS["gae_lambda"]),
+            "training.gae_lambda",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        "clip_range": _require_real(
+            table.get("clip_range", PPO_COMMON_SCALAR_DEFAULTS["clip_range"]),
+            "training.clip_range",
+            minimum=0.0,
+            minimum_inclusive=False,
+        ),
+        "normalize_advantage": _require_bool(
+            table.get(
+                "normalize_advantage",
+                PPO_COMMON_SCALAR_DEFAULTS["normalize_advantage"],
+            ),
+            "training.normalize_advantage",
+        ),
+        "ent_coef": _require_real(
+            table.get("ent_coef", PPO_COMMON_SCALAR_DEFAULTS["ent_coef"]),
+            "training.ent_coef",
+            minimum=0.0,
+        ),
+        "vf_coef": _require_real(
+            table.get("vf_coef", PPO_COMMON_SCALAR_DEFAULTS["vf_coef"]),
+            "training.vf_coef",
+            minimum=0.0,
+        ),
+        "max_grad_norm": _require_real(
+            table.get("max_grad_norm", PPO_COMMON_SCALAR_DEFAULTS["max_grad_norm"]),
+            "training.max_grad_norm",
+            minimum=0.0,
+        ),
+    }
+
+
 def _validate_training(value: object) -> dict[str, object]:
     table = _table(value, "training")
     _reject_unknown_keys(
@@ -349,6 +502,8 @@ def _validate_training(value: object) -> dict[str, object]:
             table["log_interval"], "training.log_interval", positive=True
         ),
     }
+    training.update(_validate_ppo_common_scalars(table))
+    _validate_ppo_batching(training)
     if "device" in table:
         training["device"] = _require_string(table["device"], "training.device")
     if "model_name" in table:
@@ -369,15 +524,11 @@ def _validate_evaluation(
     table = _table(value, "evaluation")
     _reject_unknown_keys(
         table,
-        allowed=_EVALUATION_REQUIRED_KEYS | _EVALUATION_OPTIONAL_KEYS,
+        allowed=_EVALUATION_OPTIONAL_KEYS,
         location="evaluation",
     )
-    missing = sorted(_EVALUATION_REQUIRED_KEYS - set(table))
-    if missing:
-        raise _error("evaluation", f"必須keyがありません: {', '.join(missing)}")
 
     evaluation: dict[str, object] = {
-        "episodes": _require_int(table["episodes"], "evaluation.episodes", positive=True),
         "model_path": _path_string(
             table.get("model_path", f"models/{default_training_model_name}.zip"),
             "evaluation.model_path",
@@ -409,8 +560,8 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
     _reject_unknown_keys(root, allowed=_ROOT_KEYS, location="root")
 
     schema_version = _require_int(root.get("schema_version"), "schema_version")
-    if schema_version != 1:
-        raise _error("schema_version", "対応しているversionは1だけです")
+    if schema_version != 2:
+        raise _error("schema_version", "対応しているversionは2だけです")
     name = _safe_basename(root.get("name"), "name")
     algorithm = _require_string(root.get("algorithm"), "algorithm")
     if algorithm != "ppo":
@@ -422,12 +573,6 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
     training = _validate_training(_required_table(root, "training", "training"))
     if "model_name" not in training:
         training["model_name"] = default_model_name
-    rollout_batch_size = int(training["num_envs"]) * int(training["n_steps"])
-    if rollout_batch_size <= 1:
-        raise _error(
-            "training",
-            "PPOの既定normalize_advantageではnum_envs * n_stepsを2以上にしてください",
-        )
 
     evaluation = _validate_evaluation(
         _required_table(root, "evaluation", "evaluation"),
@@ -461,24 +606,11 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
         evaluation_env_config,
         "environment.evaluation",
     )
-    evaluation_scenario_count = int(evaluation_env_config["num_scenarios"])
-    if (
-        evaluation_scenario_count > 1
-        and int(evaluation["episodes"]) > evaluation_scenario_count
-    ):
-        raise _error(
-            "evaluation.episodes",
-            "評価scenario数が複数の場合はnum_scenarios以下にしてください: "
-            f"episodes={evaluation['episodes']}, "
-            f"num_scenarios={evaluation_scenario_count}",
-        )
-
     return name, ExperimentProfile(
         train_env_config=train_env_config,
         evaluation_env_config=evaluation_env_config,
         training_config=training,
         default_model_name=default_model_name,
-        evaluation_episodes=int(evaluation["episodes"]),
         evaluation_defaults=evaluation,
     )
 
@@ -529,26 +661,64 @@ def load_experiment_config(path: str | Path) -> ExperimentSelection:
     )
 
 
+def canonical_config_path(profile_name: str) -> Path:
+    """互換profile aliasが指すcanonical TOMLの絶対pathを返す。"""
+
+    try:
+        filename = _PROFILE_FILENAMES[profile_name]
+    except KeyError:
+        choices = ", ".join(PROFILE_NAMES)
+        raise ExperimentConfigError(
+            f"unknown experiment profile {profile_name!r}; choose from: {choices}"
+        ) from None
+    return CONFIG_DIR / filename
+
+
+def get_experiment_profile(name: str) -> ExperimentProfile:
+    """互換profile aliasから、実TOMLで解決した設定bundleを返す。"""
+
+    return select_experiment(profile_name=name).profile
+
+
+def _load_canonical_profile(profile_name: str) -> ExperimentSelection:
+    """alias先TOMLのnameもaliasと一致することを確認して読み込む。"""
+
+    selection = load_experiment_config(canonical_config_path(profile_name))
+    if selection.name != profile_name:
+        raise ExperimentConfigError(
+            "canonical profile TOMLのnameはaliasと一致してください: "
+            f"alias={profile_name!r}, name={selection.name!r}, "
+            f"path={selection.source_path}"
+        )
+    return selection
+
+
 def select_experiment(
     *,
     profile_name: str | None = None,
     config_path: str | Path | None = None,
 ) -> ExperimentSelection:
-    """組み込みprofileまたは外部TOMLを同じ形へ解決する。"""
+    """canonical aliasまたは外部TOMLを同じ実TOML selectionへ解決する。"""
 
     if profile_name is not None and config_path is not None:
         raise ExperimentConfigError("--profileと--configは同時に指定できません")
     if config_path is not None:
         return load_experiment_config(config_path)
 
-    name = "official" if profile_name is None else profile_name
-    return ExperimentSelection(
-        name=name,
-        profile=get_experiment_profile(name),
-        source_kind="builtin_profile",
-        source_path=None,
-        source_sha256=None,
-    )
+    return _load_canonical_profile(profile_name or "official")
+
+
+def environment_config_for_stage(
+    experiment: ExperimentSelection,
+    stage: ExperimentStage | str,
+) -> Mapping[str, object]:
+    """選択済みbundleからtrain/evaluation向け環境設定を返す。"""
+
+    if stage == "train":
+        return experiment.profile.train_env_config
+    if stage == "evaluation":
+        return experiment.profile.evaluation_env_config
+    raise ValueError(f"unknown experiment stage: {stage!r}")
 
 
 def experiment_selection_from_args(args: object) -> ExperimentSelection:
@@ -562,4 +732,4 @@ def experiment_selection_from_args(args: object) -> ExperimentSelection:
     config_path = getattr(args, "config", None)
     if config_path is not None:
         return select_experiment(config_path=config_path)
-    return select_experiment(profile_name=getattr(args, "profile", "official"))
+    return select_experiment(profile_name=getattr(args, "profile", None))

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import platform
 import sys
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version
-from numbers import Real
+from numbers import Integral, Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -16,14 +18,20 @@ import gymnasium as gym
 import numpy as np
 from stable_baselines3.common.env_checker import check_env
 
+from configs.experiment_config import (
+    ExperimentConfigError,
+    ExperimentSelection,
+    PROFILE_NAMES,
+    environment_config_for_stage,
+    select_experiment,
+)
 from env_factory import make_env
-from configs.phase0_config import OFFICIAL_ENV_CONFIG, OUTPUT_DIR, SCENARIO_SEED
+from project_paths import OUTPUT_DIR
 
 if TYPE_CHECKING:
     from metadrive.envs import MetaDriveEnv
 
 
-INSPECTION_LOG: Path = OUTPUT_DIR / "inspect_env.log"
 PACKAGE_DISTRIBUTIONS: tuple[tuple[str, str], ...] = (
     ("MetaDrive", "metadrive-simulator"),
     ("Stable-Baselines3", "stable-baselines3"),
@@ -40,9 +48,13 @@ class _CheckEnvFixedScenarioAdapter(gym.Wrapper):
     MetaDrive 0.4.3は``reset(seed=...)``をGymnasiumの乱数seedではなく
     scenario indexとして扱う。一方、SB3 2.9の``check_env``は契約確認のため
     必ず``seed=0``を渡す。このwrapperはcheckerが渡すseedをspacesへ適用し、
-    underlying raw環境は公式scenario 5でresetする。stepやspaces、Reward、
+    underlying raw環境は選択stageの開始scenarioでresetする。stepやspaces、Reward、
     終了値には手を加えず、学習・評価にも使用しない。
     """
+
+    def __init__(self, env: gym.Env, *, scenario_seed: int) -> None:
+        super().__init__(env)
+        self._scenario_seed = scenario_seed
 
     def reset(
         self,
@@ -50,28 +62,39 @@ class _CheckEnvFixedScenarioAdapter(gym.Wrapper):
         seed: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> tuple[Any, dict[str, Any]]:
-        """checkerの乱数seedを受理しつつ公式scenarioを固定してresetする。"""
+        """checkerの乱数seedを受理しつつ開始scenarioでresetする。"""
 
         if options:
             raise NotImplementedError(
-                "Phase 0 check_env adapter does not support non-empty reset options"
+                "check_env adapter does not support non-empty reset options"
             )
         if seed is not None:
             self.action_space.seed(seed)
             self.observation_space.seed(seed)
 
-        reset_result = self.env.reset(seed=SCENARIO_SEED)
-        assert getattr(self.env, "current_seed", None) == SCENARIO_SEED
+        reset_result = self.env.reset(seed=self._scenario_seed)
+        assert getattr(self.env, "current_seed", None) == self._scenario_seed
         return reset_result
 
 
-def _is_known_check_env_seed_conflict(error: Exception) -> bool:
+def _scenario_seed_bounds(env_config: Mapping[str, object]) -> tuple[int, int]:
+    """Return an environment config's half-open scenario seed range."""
+
+    scenario_start = int(env_config["start_seed"])
+    scenario_count = int(env_config["num_scenarios"])
+    return scenario_start, scenario_start + scenario_count
+
+
+def _is_known_check_env_seed_conflict(
+    error: Exception,
+    env_config: Mapping[str, object],
+) -> bool:
     """MetaDrive 0.4.3とSB3 2.9の既知のseed意味衝突だけを識別する。"""
 
-    scenario_count = int(OFFICIAL_ENV_CONFIG["num_scenarios"])
+    scenario_start, scenario_stop = _scenario_seed_bounds(env_config)
     expected_message = (
         f"scenario_index (seed) should be in "
-        f"[{SCENARIO_SEED}:{SCENARIO_SEED + scenario_count})"
+        f"[{scenario_start}:{scenario_stop})"
     )
     return isinstance(error, AssertionError) and expected_message in str(error)
 
@@ -137,18 +160,33 @@ def _assert_valid_observation(env: MetaDriveEnv, observation: object) -> np.ndar
 
 
 def _print_action_conversion(env: MetaDriveEnv) -> None:
-    """実環境のEnvInputPolicyを使い、9 Actionすべての変換値を表示する。"""
+    """実環境のEnvInputPolicyを使い、設定された離散Actionを全て表示する。"""
 
     from metadrive.policy.env_input_policy import EnvInputPolicy
 
     action_space = env.action_space
-    assert getattr(action_space, "n", None) == 9, f"expected Discrete(9), got {action_space}"
+    action_count = getattr(action_space, "n", None)
+    assert isinstance(action_count, Integral) and action_count > 0, (
+        f"expected a non-empty Discrete action space, got {action_space}"
+    )
+    action_count = int(action_count)
+    steering_dim = int(env.config["discrete_steering_dim"])
+    throttle_dim = int(env.config["discrete_throttle_dim"])
+    expected_count = steering_dim * throttle_dim
+    assert action_count == expected_count, (
+        "discrete action space and configured dimensions disagree: "
+        f"n={action_count}, steering={steering_dim}, throttle={throttle_dim}"
+    )
 
     policy = env.engine.get_policy(env.agent.name)
     assert isinstance(policy, EnvInputPolicy), f"unexpected policy: {type(policy)!r}"
 
     print("== Discrete action conversion ==")
-    for action_id in range(action_space.n):
+    print(
+        f"action_count={action_count} "
+        f"(steering={steering_dim} * throttle={throttle_dim})"
+    )
+    for action_id in range(action_count):
         steering, throttle_brake = policy.convert_to_continuous_action(action_id)
         print(
             f"action_id={action_id} -> steering={steering:+.1f}, "
@@ -191,23 +229,37 @@ def _run_random_actions(env: MetaDriveEnv, max_steps: int = 50) -> None:
     print("random action run: PASS")
 
 
-def _run_inspection() -> None:
-    """単一のraw MetaDrive環境に対して全検査を実行する。"""
+def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
+    """選択されたstageの単一raw MetaDrive環境に対して全検査を実行する。"""
 
+    environment_config = environment_config_for_stage(experiment, stage)
+    scenario_start, scenario_stop = _scenario_seed_bounds(environment_config)
     _print_versions()
+    print("\n== Selected experiment ==")
+    print(
+        json.dumps(
+            {
+                "stage": stage,
+                "config_source": experiment.source_metadata(),
+                "scenario_seed_range": [scenario_start, scenario_stop],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     print("\n== Applied environment config ==")
-    print(json.dumps(OFFICIAL_ENV_CONFIG, ensure_ascii=False, indent=2))
+    print(json.dumps(environment_config, ensure_ascii=False, indent=2))
 
-    env = make_env()
+    env = make_env(environment_config)
     checker_error: Exception | None = None
     try:
         observation, reset_info = env.reset()
         observation_array = _assert_valid_observation(env, observation)
 
-        actual_config = {key: env.config[key] for key in OFFICIAL_ENV_CONFIG}
+        actual_config = {key: env.config[key] for key in environment_config}
         print("\n== Effective values in env.config ==")
         print(json.dumps(actual_config, ensure_ascii=False, indent=2))
-        assert actual_config == OFFICIAL_ENV_CONFIG
+        assert actual_config == environment_config
 
         print("\n== Spaces and reset observation ==")
         print(f"observation_space: {env.observation_space}")
@@ -240,14 +292,18 @@ def _run_inspection() -> None:
         except Exception as error:
             print(f"raw check_env fatal error: {type(error).__name__}: {error}")
             traceback.print_exc()
-            if _is_known_check_env_seed_conflict(error):
+            if _is_known_check_env_seed_conflict(error, environment_config):
                 print(
                     "raw check_env compatibility finding: SB3 seed=0 conflicts "
-                    "with MetaDrive's fixed scenario range [5:6); task config "
-                    "remains unchanged"
+                    "with MetaDrive's configured scenario range "
+                    f"[{scenario_start}:{scenario_stop}); the adapter does not "
+                    "modify the task configuration"
                 )
                 print("\n== Stable-Baselines3 check_env: seed-only inspection adapter ==")
-                checker_env = _CheckEnvFixedScenarioAdapter(env)
+                checker_env = _CheckEnvFixedScenarioAdapter(
+                    env,
+                    scenario_seed=scenario_start,
+                )
                 try:
                     check_env(checker_env, warn=True)
                 except Exception as adapter_error:
@@ -259,8 +315,9 @@ def _run_inspection() -> None:
                     traceback.print_exc()
                 else:
                     print(
-                        "adapted check_env: PASS (official scenario=5; "
-                        "warnings, if any, are shown above)"
+                        "adapted check_env: PASS "
+                        f"(stage start scenario={scenario_start}; warnings, if any, "
+                        "are shown above)"
                     )
             else:
                 checker_error = error
@@ -274,24 +331,81 @@ def _run_inspection() -> None:
         print("environment closed: PASS")
 
     if checker_error is not None:
-        raise RuntimeError("check_env reported a fatal error; see outputs/inspect_env.log") from checker_error
+        raise RuntimeError("check_env reported a fatal error; see the inspection log") from checker_error
 
 
-def main() -> None:
-    """terminal表示を維持しながら検査結果をoutputsへ保存する。"""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """選択TOMLと検査対象stageを解決する。"""
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with INSPECTION_LOG.open("w", encoding="utf-8") as log_file:
+    selection_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    selection_group = selection_parser.add_mutually_exclusive_group()
+    selection_group.add_argument("--profile", choices=PROFILE_NAMES, default=None)
+    selection_group.add_argument("--config", type=Path, default=None)
+    selected, _unknown = selection_parser.parse_known_args(argv)
+    try:
+        experiment = select_experiment(
+            profile_name=selected.profile,
+            config_path=selected.config,
+        )
+    except ExperimentConfigError as error:
+        selection_parser.error(str(error))
+
+    parser = argparse.ArgumentParser(
+        description="MetaDrive環境を学習・評価前に検査します",
+        allow_abbrev=False,
+    )
+    selection_group = parser.add_mutually_exclusive_group()
+    selection_group.add_argument(
+        "--profile",
+        choices=PROFILE_NAMES,
+        default=selected.profile or "official",
+        help="canonical TOMLへの互換alias（既定: official.toml）",
+    )
+    selection_group.add_argument(
+        "--config",
+        type=Path,
+        default=selected.config,
+        help="実験bundle TOML（相対pathはproject直下基準）",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=("train", "evaluation"),
+        default="train",
+        help="検査する環境設定（既定: train）",
+    )
+    args = parser.parse_args(argv)
+    args.profile = experiment.name
+    args.config = experiment.source_path
+    args.experiment = experiment
+    args.experiment_selection = experiment
+    return args
+
+
+def _inspection_log_path(experiment: ExperimentSelection, stage: str) -> Path:
+    """選択sourceとstageが分かる、outputs配下の検査ログpathを返す。"""
+
+    return OUTPUT_DIR / "inspect_env" / experiment.name / f"{stage}.log"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """terminal表示を維持しながら選択sourceの検査結果をoutputsへ保存する。"""
+
+    args = parse_args(argv)
+    log_path = _inspection_log_path(args.experiment, args.stage)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log_file:
         stdout_tee = _Tee(sys.stdout, log_file)
         stderr_tee = _Tee(sys.stderr, log_file)
         with redirect_stdout(stdout_tee), redirect_stderr(stderr_tee):
+            print(f"inspection_log={log_path.resolve()}")
             try:
-                _run_inspection()
+                _run_inspection(args.experiment, args.stage)
             except Exception:
                 print("inspect_env: FATAL ERROR")
                 traceback.print_exc()
                 raise
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

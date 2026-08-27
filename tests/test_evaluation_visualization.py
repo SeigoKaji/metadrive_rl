@@ -25,7 +25,16 @@ from evaluation_visualization import (
     read_runtime_road_metrics,
     replace_latest_recorded_frame,
 )
-from configs.phase0_config import OFFICIAL_ENV_CONFIG, SCENARIO_SEED
+from configs.experiment_config import (
+    ExperimentProfile,
+    ExperimentSelection,
+    select_experiment,
+)
+
+
+_OFFICIAL_SELECTION = select_experiment(profile_name="official")
+OFFICIAL_ENV_CONFIG = _OFFICIAL_SELECTION.profile.evaluation_env_config
+SCENARIO_SEED = int(OFFICIAL_ENV_CONFIG["start_seed"])
 
 
 ACTION_CONFIG = {
@@ -350,7 +359,6 @@ def test_one_step_connects_to_metadrive_043_recorded_frame(
 
     env = make_evaluation_env(
         seed=0,
-        record_gif=True,
         env_config=OFFICIAL_ENV_CONFIG,
     )
     try:
@@ -502,7 +510,7 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
             deterministic: bool,
         ) -> tuple[np.ndarray, None]:
             assert deterministic is True
-            action_id = (7, 8)[self.index]
+            action_id = (7, 8)[self.index % 2]
             self.index += 1
             return np.asarray([action_id]), None
 
@@ -538,7 +546,6 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
     args = SimpleNamespace(
         profile="official",
         model=model_path,
-        episodes=1,
         record_gif=True,
         output_prefix="failure_case",
         seed=0,
@@ -555,6 +562,10 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
 
     assert fake_env.closed is True
     assert result["evaluation_status"] == "success"
+    assert result["episode_count"] == 1
+    assert [episode["scenario_seed"] for episode in result["episodes"]] == [
+        SCENARIO_SEED
+    ]
     assert result["gif"]["status"] == "failed"
     assert result["gif"]["traceback_path"] is None
     assert "injected GIF trace write failure" in result["gif"][
@@ -567,12 +578,152 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
         "evaluation.tmp.mp4"
     ).exists()
     assert result["episodes"][0]["visualization"]["artifact_directory"]
-    assert result["visualizations"] == [result["episodes"][0]["visualization"]]
+    assert result["visualizations"] == [
+        episode["visualization"] for episode in result["episodes"]
+    ]
     assert result["step_telemetry"]["row_count"] == 2
     assert [row["speed_m_s"] for row in step_rows] == [1.0, 2.0]
     assert step_rows[-1]["action_switch_count"] == 1
     assert step_rows[-1]["action_switches_per_second"] == pytest.approx(5.0)
     assert result["episodes"][0]["termination_reason"] == "success"
+
+
+def test_evaluate_traverses_custom_scenario_range_once_in_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """評価回数ではなく選択profileのscenario範囲が評価対象を決める。"""
+
+    custom_environment_config = {
+        "start_seed": 41,
+        "num_scenarios": 2,
+        "discrete_action": True,
+        "discrete_steering_dim": 3,
+        "discrete_throttle_dim": 3,
+        "use_multi_discrete": False,
+        "physics_world_step_size": 0.02,
+        "decision_repeat": 5,
+        "horizon": 1,
+        "vehicle_config": {"enable_reverse": False},
+    }
+
+    class FakeEnv:
+        def __init__(self) -> None:
+            self.config = dict(custom_environment_config)
+            self.observation_space = object()
+            self.action_space = object()
+            self.current_seed = -1
+            self.reset_seeds: list[int] = []
+            self.closed = False
+            self.agent = SimpleNamespace(
+                navigation=None,
+                lane=None,
+                dist_to_left_side=None,
+                dist_to_right_side=None,
+                position=(0.0, 0.0),
+                engine=None,
+            )
+
+        def reset(self, *, seed: int) -> tuple[np.ndarray, dict[str, object]]:
+            self.current_seed = seed
+            self.reset_seeds.append(seed)
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(
+            self,
+            _action: object,
+        ) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
+            return (
+                np.zeros(1, dtype=np.float32),
+                1.0,
+                True,
+                False,
+                {
+                    "velocity": 1.0,
+                    "steering": 0.0,
+                    "acceleration": 1.0,
+                    "route_completion": 1.0,
+                    "arrive_dest": True,
+                    "out_of_road": False,
+                    "crash": False,
+                    "crash_vehicle": False,
+                    "crash_object": False,
+                    "max_step": False,
+                },
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeModel:
+        observation_space = object()
+        action_space = object()
+        device = "cpu"
+
+        def predict(
+            self,
+            _observation: object,
+            *,
+            deterministic: bool,
+        ) -> tuple[np.ndarray, None]:
+            assert deterministic is True
+            return np.asarray([7]), None
+
+    profile = ExperimentProfile(
+        train_env_config=custom_environment_config,
+        evaluation_env_config=custom_environment_config,
+        training_config={"seed": 0},
+        default_model_name="custom_range",
+    )
+    experiment = ExperimentSelection(
+        name="custom_range",
+        profile=profile,
+        source_kind="toml",
+        source_path=tmp_path / "custom_range.toml",
+        source_sha256="test-only",
+    )
+    output_dir = tmp_path / "outputs"
+    log_dir = tmp_path / "logs"
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"fake-model")
+    fake_env = FakeEnv()
+    fake_model = FakeModel()
+
+    monkeypatch.setattr(evaluate_module, "OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(evaluate_module, "LOG_DIR", log_dir)
+    monkeypatch.setattr(
+        evaluate_module.PPO,
+        "load",
+        lambda *_args, **_kwargs: fake_model,
+    )
+    monkeypatch.setattr(
+        evaluate_module,
+        "make_evaluation_env",
+        lambda **_kwargs: fake_env,
+    )
+    monkeypatch.setattr(
+        evaluate_module,
+        "check_for_correct_spaces",
+        lambda *_args, **_kwargs: None,
+    )
+    args = SimpleNamespace(
+        model=model_path,
+        record_gif=False,
+        output_prefix="custom_range",
+        seed=0,
+        device="cpu",
+        experiment=experiment,
+    )
+
+    result_path = evaluate_module._evaluate(args, log_dir / "evaluate.log")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    evaluated_seeds = [episode["scenario_seed"] for episode in result["episodes"]]
+
+    assert fake_env.closed is True
+    assert fake_env.reset_seeds == [41, 42]
+    assert evaluated_seeds == [41, 42]
+    assert len(set(evaluated_seeds)) == 2
+    assert result["episode_count"] == 2
 
 
 def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(
@@ -685,7 +836,7 @@ def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(
             deterministic: bool,
         ) -> tuple[np.ndarray, None]:
             assert deterministic is True
-            action_id = (7, 7, 8, 7, 7, 8)[self.index]
+            action_id = (7, 7, 8)[self.index % 3]
             self.index += 1
             return np.asarray([action_id]), None
 
@@ -722,7 +873,6 @@ def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(
     args = SimpleNamespace(
         profile="official",
         model=model_path,
-        episodes=2,
         record_gif=True,
         output_prefix="success_case",
         seed=0,
@@ -731,8 +881,12 @@ def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(
 
     result_path = evaluate_module._evaluate(args, log_dir / "evaluate.log")
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    assert len(result["episodes"]) == 2
-    assert len(result["visualizations"]) == 2
+    assert result["episode_count"] == 1
+    assert len(result["episodes"]) == 1
+    assert len(result["visualizations"]) == 1
+    assert [episode["scenario_seed"] for episode in result["episodes"]] == [
+        SCENARIO_SEED
+    ]
     assert result["visualizations"] == [
         episode["visualization"] for episode in result["episodes"]
     ]
@@ -782,9 +936,10 @@ def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(
         Path(episode["visualization"]["artifact_directory"])
         for episode in result["episodes"]
     ]
-    assert artifact_directories[0] != artifact_directories[1]
-    assert artifact_directories[0].name == "episode_0001_scenario_000005"
-    assert artifact_directories[1].name == "episode_0002_scenario_000005"
+    assert artifact_directories == [
+        output_dir
+        / "official/evaluation/success_case/episodes/episode_0001_scenario_000005"
+    ]
     assert not stale_episode_dir.exists()
 
     for episode in result["episodes"]:

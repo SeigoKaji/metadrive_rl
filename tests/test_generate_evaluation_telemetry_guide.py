@@ -10,13 +10,38 @@ import pytest
 from PIL import Image
 from openpyxl import Workbook
 
+from configs.experiment_config import select_experiment
 from generate_evaluation_telemetry_guide import (
+    CANONICAL_EVALUATION_PATH,
+    CANONICAL_FRAME_PATH,
+    CANONICAL_STEPS_PATH,
+    OFFICIAL_EVALUATION_OUTPUT_DIR,
     _add_table,
     _action_history,
     _build_workbook,
     _select_default_inputs,
     _validate_workbook_tables,
 )
+from project_paths import OUTPUT_DIR
+
+
+def test_canonical_generator_inputs_follow_official_toml() -> None:
+    """ガイドの既定入力先はPython定数でなくofficial TOMLから導出する。"""
+
+    experiment = select_experiment(profile_name="official")
+    output_prefix = str(experiment.profile.evaluation_defaults["output_prefix"])
+    scenario_seed = int(experiment.profile.evaluation_env_config["start_seed"])
+    expected_run_dir = OUTPUT_DIR / experiment.name / "evaluation" / output_prefix
+
+    assert OFFICIAL_EVALUATION_OUTPUT_DIR == expected_run_dir
+    assert CANONICAL_EVALUATION_PATH == expected_run_dir / "evaluation.json"
+    assert CANONICAL_STEPS_PATH == expected_run_dir / "evaluation_steps.jsonl"
+    assert CANONICAL_FRAME_PATH == (
+        expected_run_dir
+        / "episodes"
+        / f"episode_0001_scenario_{scenario_seed:06d}"
+        / "frames/frame_000030.png"
+    )
 
 
 def _workbook_with_table() -> Workbook:
