@@ -82,6 +82,10 @@ def _termination_reason(
         return "crash_object"
     if bool(flags.get("crash", False)):
         return "crash"
+    if bool(flags.get("start_lane_departure", False)):
+        return "start_lane_departure"
+    if bool(flags.get("wrong_lane_arrival", False)):
+        return "wrong_lane_arrival"
     if terminated:
         return "other_termination"
     if truncated:

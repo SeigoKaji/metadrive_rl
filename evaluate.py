@@ -139,6 +139,124 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+_FINAL_TARGET_LANE_FIELDS: tuple[str, ...] = (
+    "target_lane_valid",
+    "ever_departed_target_lane",
+    "lane_departure_count",
+    "off_target_duration_seconds",
+    "time_in_target_lane_ratio",
+)
+
+
+def _final_target_lane_metrics(
+    final_info: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return final target-lane metrics only when this env emitted them.
+
+    Legacy/official environments never expose ``target_lane_valid``.  Keeping
+    the nested result absent in that case avoids presenting a fabricated zero
+    as a lane-keeping measurement.
+    """
+
+    if not any(key in final_info for key in _FINAL_TARGET_LANE_FIELDS):
+        return None
+    return {
+        key: _optional_info_value(final_info, key)
+        for key in _FINAL_TARGET_LANE_FIELDS
+    }
+
+
+def _finite_target_lane_value(
+    metrics: Mapping[str, Any],
+    key: str,
+) -> float | None:
+    """Read an optional finite numeric metric from JSON-safe episode data."""
+
+    value = metrics.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _mean_target_lane_metric(
+    metrics: list[Mapping[str, Any]],
+    key: str,
+) -> float | None:
+    values = [
+        value
+        for metric in metrics
+        if (value := _finite_target_lane_value(metric, key)) is not None
+    ]
+    return statistics.fmean(values) if values else None
+
+
+def _aggregate_target_lane_metrics(
+    episodes: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate only episodes that supplied a target-lane objective metric."""
+
+    tracked = [
+        metric
+        for episode in episodes
+        if isinstance((metric := episode.get("target_lane")), Mapping)
+        and "target_lane_valid" in metric
+    ]
+    if not tracked:
+        return {
+            "status": "not_available",
+            "tracked_episode_count": 0,
+            "tracked_episode_rate": None,
+            "valid_episode_count": 0,
+            "valid_episode_rate_among_tracked": None,
+            "ever_departed_episode_count": None,
+            "ever_departed_episode_rate_among_valid": None,
+            "mean_lane_departure_count_among_valid": None,
+            "mean_off_target_duration_seconds_among_valid": None,
+            "mean_time_in_target_lane_ratio_among_valid": None,
+        }
+
+    valid = [metric for metric in tracked if metric.get("target_lane_valid") is True]
+    if not valid:
+        return {
+            "status": "available_no_valid_final_target_lane",
+            "tracked_episode_count": len(tracked),
+            "tracked_episode_rate": len(tracked) / len(episodes),
+            "valid_episode_count": 0,
+            "valid_episode_rate_among_tracked": 0.0,
+            "ever_departed_episode_count": None,
+            "ever_departed_episode_rate_among_valid": None,
+            "mean_lane_departure_count_among_valid": None,
+            "mean_off_target_duration_seconds_among_valid": None,
+            "mean_time_in_target_lane_ratio_among_valid": None,
+        }
+
+    ever_departed_count = sum(
+        metric.get("ever_departed_target_lane") is True for metric in valid
+    )
+    return {
+        "status": "available",
+        "tracked_episode_count": len(tracked),
+        "tracked_episode_rate": len(tracked) / len(episodes),
+        "valid_episode_count": len(valid),
+        "valid_episode_rate_among_tracked": len(valid) / len(tracked),
+        "ever_departed_episode_count": ever_departed_count,
+        "ever_departed_episode_rate_among_valid": ever_departed_count / len(valid),
+        "mean_lane_departure_count_among_valid": _mean_target_lane_metric(
+            valid,
+            "lane_departure_count",
+        ),
+        "mean_off_target_duration_seconds_among_valid": _mean_target_lane_metric(
+            valid,
+            "off_target_duration_seconds",
+        ),
+        "mean_time_in_target_lane_ratio_among_valid": _mean_target_lane_metric(
+            valid,
+            "time_in_target_lane_ratio",
+        ),
+    }
+
+
 def _evaluation_output_directory(profile_name: str, output_prefix: str) -> Path:
     """Return the run directory shared by evaluation JSON and artifacts."""
 
@@ -420,6 +538,8 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                         "crash_vehicle",
                         "crash_object",
                         "max_step",
+                        "wrong_lane_arrival",
+                        "start_lane_departure",
                         "route_completion",
                     )
                 }
@@ -458,6 +578,9 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     ),
                     "execution_seconds": time.perf_counter() - episode_start_time,
                 }
+                target_lane_metrics = _final_target_lane_metrics(final_info)
+                if target_lane_metrics is not None:
+                    episode_result["target_lane"] = target_lane_metrics
                 episode_result["visualization"] = active_recorder.finalize(
                     env=env,
                     timing=simulation_timing,
@@ -512,6 +635,15 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     out_of_road_count = sum(
         episode["termination_reason"] == "out_of_road" for episode in episodes
     )
+    wrong_lane_arrival_count = sum(
+        episode["termination_reason"] == "wrong_lane_arrival"
+        for episode in episodes
+    )
+    start_lane_departure_count = sum(
+        episode["termination_reason"] == "start_lane_departure"
+        for episode in episodes
+    )
+    target_lane_aggregate = _aggregate_target_lane_metrics(episodes)
     if simulation_timing is None:
         raise AssertionError("successful evaluation has no simulation timing")
     visualizations = [episode["visualization"] for episode in episodes]
@@ -552,6 +684,12 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             "success_rate": success_count / len(episodes),
             "out_of_road_count": out_of_road_count,
             "out_of_road_rate": out_of_road_count / len(episodes),
+            "wrong_lane_arrival_count": wrong_lane_arrival_count,
+            "wrong_lane_arrival_rate": wrong_lane_arrival_count / len(episodes),
+            "start_lane_departure_count": start_lane_departure_count,
+            "start_lane_departure_rate": start_lane_departure_count
+            / len(episodes),
+            "target_lane": target_lane_aggregate,
         },
         # Recording failures are deliberately independent of successful policy
         # evaluation and of each other where they do not share rendering.

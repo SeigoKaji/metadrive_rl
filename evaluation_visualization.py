@@ -47,6 +47,17 @@ STEP_TELEMETRY_FIELDS: tuple[str, ...] = (
     "center_to_left_boundary_m",
     "center_to_right_boundary_m",
     "lane_center_offset_m",
+    "target_lane_valid",
+    "target_lane_ordinal",
+    "current_lane_ordinal",
+    "target_lane_offset_m",
+    "normalized_target_lane_error",
+    "in_target_lane",
+    "ever_departed_target_lane",
+    "lane_departure_count",
+    "off_target_duration_seconds",
+    "time_in_target_lane_ratio",
+    "target_lane_cost",
     "route_completion",
     "step_reward",
     "cumulative_reward",
@@ -58,6 +69,8 @@ STEP_TELEMETRY_FIELDS: tuple[str, ...] = (
     "crash_vehicle",
     "crash_object",
     "max_step",
+    "wrong_lane_arrival",
+    "start_lane_departure",
     "status",
     "action_switch_count",
     "action_switches_per_second",
@@ -342,6 +355,10 @@ def step_status(*, terminated: bool, truncated: bool, info: Mapping[str, Any]) -
         return "CRASH_OBJECT"
     if bool(info.get("crash", False)):
         return "CRASH"
+    if bool(info.get("start_lane_departure", False)):
+        return "START_LANE_DEPARTURE"
+    if bool(info.get("wrong_lane_arrival", False)):
+        return "WRONG_LANE_ARRIVAL"
     if truncated or bool(info.get("max_step", False)):
         return "MAX_STEP"
     if terminated:
@@ -405,6 +422,23 @@ def make_step_telemetry(
         "center_to_left_boundary_m": road.center_to_left_boundary_m,
         "center_to_right_boundary_m": road.center_to_right_boundary_m,
         "lane_center_offset_m": road.lane_center_offset_m,
+        "target_lane_valid": info.get("target_lane_valid"),
+        "target_lane_ordinal": info.get("target_lane_ordinal"),
+        "current_lane_ordinal": info.get("current_lane_ordinal"),
+        "target_lane_offset_m": _optional_float(info.get("target_lane_offset_m")),
+        "normalized_target_lane_error": _optional_float(
+            info.get("normalized_target_lane_error")
+        ),
+        "in_target_lane": info.get("in_target_lane"),
+        "ever_departed_target_lane": info.get("ever_departed_target_lane"),
+        "lane_departure_count": info.get("lane_departure_count"),
+        "off_target_duration_seconds": _optional_float(
+            info.get("off_target_duration_seconds")
+        ),
+        "time_in_target_lane_ratio": _optional_float(
+            info.get("time_in_target_lane_ratio")
+        ),
+        "target_lane_cost": _optional_float(info.get("target_lane_cost")),
         "route_completion": _optional_float(info.get("route_completion")),
         "step_reward": float(reward),
         "cumulative_reward": float(cumulative_reward),
@@ -416,6 +450,8 @@ def make_step_telemetry(
         "crash_vehicle": info.get("crash_vehicle"),
         "crash_object": info.get("crash_object"),
         "max_step": info.get("max_step"),
+        "wrong_lane_arrival": info.get("wrong_lane_arrival"),
+        "start_lane_departure": info.get("start_lane_departure"),
         "status": step_status(terminated=terminated, truncated=truncated, info=info),
         "action_switch_count": int(action_switch_count),
         "action_switches_per_second": float(action_switches_per_second),

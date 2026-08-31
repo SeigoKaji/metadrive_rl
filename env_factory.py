@@ -22,11 +22,23 @@ def make_env(env_config: Mapping[str, object]) -> MetaDriveEnv:
     # Importを実際の生成時まで遅らせ、未導入時にもinspect_env側が先に
     # outputs/inspect_env/<experiment>/<stage>.logを開いてImportError全文を
     # 記録できるようにする。
-    from metadrive.envs import MetaDriveEnv
-
     # MetaDriveは受け取った設定を内部でmergeする。呼出元のconstantの
     # 偶発的な変更を防ぐため、環境ごとに浅いcopyを渡す。
-    return MetaDriveEnv(dict(env_config))
+    config = dict(env_config)
+    # A missing key means the canonical upstream environment.  An explicitly
+    # supplied ``off`` still needs this subclass so MetaDrive's closed config
+    # schema recognizes the project-local key while retaining upstream runtime
+    # reward/done behavior.
+    if "start_lane_objective" in config:
+        # The custom task stays project-local so the installed/vendored
+        # MetaDrive implementation remains byte-for-byte untouched.
+        from start_lane_env import StartLaneMetaDriveEnv
+
+        return StartLaneMetaDriveEnv(config)
+
+    from metadrive.envs import MetaDriveEnv
+
+    return MetaDriveEnv(config)
 
 
 def make_training_env(
