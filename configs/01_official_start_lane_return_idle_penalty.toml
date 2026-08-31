@@ -1,0 +1,66 @@
+# Single-factor ablation of official_start_lane_return: discourage idling.
+# All PPO, seed, scenario, and ordinary start-lane settings match the baseline.
+schema_version = 2
+name = "official_start_lane_return_idle_penalty"
+algorithm = "ppo"
+default_model_name = "official_start_lane_return_idle_penalty"
+
+[training]
+policy = "MlpPolicy"
+seed = 0
+num_envs = 4
+n_steps = 4096
+total_timesteps = 300000
+log_interval = 4
+device = "cpu"
+learning_rate = 0.0003
+batch_size = 64
+n_epochs = 10
+gamma = 0.99
+gae_lambda = 0.95
+clip_range = 0.2
+normalize_advantage = true
+ent_coef = 0.0
+vf_coef = 0.5
+max_grad_norm = 0.5
+
+[evaluation]
+record_gif = true
+output_prefix = "official_start_lane_return_idle_penalty"
+seed = 0
+device = "cpu"
+deterministic = true
+
+[environment.common]
+map = "C"
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+horizon = 500
+random_spawn_lane_index = false
+traffic_density = 0
+accident_prob = 0
+log_level = 50
+use_lateral_reward = false
+on_broken_line_done = false
+out_of_road_done = true
+out_of_road_penalty = 200.0
+
+start_lane_objective = "return"
+start_lane_center_coef = 0.25
+start_lane_wrong_coef = 0.10
+start_lane_tolerance_ratio = 0.05
+start_lane_violation_hold_steps = 2
+start_lane_terminal_penalty = 200.0
+
+# At rest this costs 0.5 reward/s x 0.1 s = 0.05 per control decision.
+low_speed_threshold_km_h = 10.0
+low_speed_penalty_rate = 0.5
+
+[environment.train]
+start_seed = 5
+num_scenarios = 1
+
+[environment.evaluation]
+start_seed = 5
+num_scenarios = 1

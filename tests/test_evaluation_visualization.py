@@ -224,12 +224,26 @@ def test_post_step_speed_and_runtime_road_values_are_kept_in_each_row() -> None:
     }
     first = make_step_telemetry(
         step=1,
-        info={"velocity": 2.0, "route_completion": 0.1},
+        info={
+            "velocity": 2.0,
+            "route_completion": 0.1,
+            "low_speed_penalty": 0.05,
+            "timeout_penalty": 0.0,
+            "target_lane_forward_distance_m": 0.25,
+            "target_lane_progress_reward": 0.25,
+        },
         **common,
     )
     second = make_step_telemetry(
         step=2,
-        info={"velocity": 3.0, "route_completion": 0.2},
+        info={
+            "velocity": 3.0,
+            "route_completion": 0.2,
+            "low_speed_penalty": 0.025,
+            "timeout_penalty": 25.0,
+            "target_lane_forward_distance_m": 0.5,
+            "target_lane_progress_reward": 0.5,
+        },
         **common,
     )
 
@@ -239,6 +253,11 @@ def test_post_step_speed_and_runtime_road_values_are_kept_in_each_row() -> None:
     assert second["speed_m_s"] == 3.0
     assert second["sim_time_seconds"] == pytest.approx(0.2)
     assert second["current_segment_drivable_width_m"] == 11.2
+    assert first["low_speed_penalty"] == pytest.approx(0.05)
+    assert second["low_speed_penalty"] == pytest.approx(0.025)
+    assert second["timeout_penalty"] == pytest.approx(25.0)
+    assert first["target_lane_forward_distance_m"] == pytest.approx(0.25)
+    assert second["target_lane_progress_reward"] == pytest.approx(0.5)
 
 
 def test_runtime_road_reader_uses_current_navigation_segment() -> None:

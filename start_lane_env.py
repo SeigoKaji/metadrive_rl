@@ -36,6 +36,15 @@ START_LANE_DEFAULT_CONFIG: dict[str, object] = {
     "start_lane_tolerance_ratio": 0.05,
     "start_lane_violation_hold_steps": 2,
     "start_lane_terminal_penalty": 50.0,
+    # A duration-normalized low-speed cost can be enabled for the idle-policy
+    # ablation without changing the existing start-lane objective by default.
+    "low_speed_threshold_km_h": 10.0,
+    "low_speed_penalty_rate": 0.0,
+    # Applied only to a pure horizon truncation, never to another terminal.
+    "timeout_penalty": 0.0,
+    # Duckietown-style fallback: replace the ordinary dense scalar with only
+    # forward distance travelled while remaining in the reset target lane.
+    "target_lane_progress_only": False,
 }
 
 
@@ -236,6 +245,101 @@ def target_lane_cost(
     )
 
 
+def low_speed_penalty(
+    *,
+    speed_km_h: float,
+    threshold_km_h: float,
+    penalty_rate: float,
+    action_duration_seconds: float,
+) -> float:
+    """Return the duration-normalized penalty for speed below ``threshold``.
+
+    Negative measured speeds are treated as stationary.  The rate is expressed
+    in reward per second, so the same experiment has the same real-time cost
+    when MetaDrive's physics rate or decision repeat changes.
+    """
+
+    values = (
+        speed_km_h,
+        threshold_km_h,
+        penalty_rate,
+        action_duration_seconds,
+    )
+    if any(isinstance(value, bool) for value in values):
+        raise TypeError("low-speed penalty inputs must be numeric, not bool")
+    try:
+        numeric_values = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as error:
+        raise TypeError("low-speed penalty inputs must be numeric") from error
+    if any(not math.isfinite(value) for value in numeric_values):
+        raise ValueError("low-speed penalty inputs must be finite")
+
+    speed, threshold, rate, action_duration = numeric_values
+    if threshold <= 0:
+        raise ValueError("low_speed_threshold_km_h must be positive")
+    if action_duration <= 0:
+        raise ValueError("action_duration_seconds must be positive")
+    if rate < 0:
+        raise ValueError("low_speed_penalty_rate must be non-negative")
+    return rate * action_duration * max(
+        0.0,
+        1.0 - max(speed, 0.0) / threshold,
+    )
+
+
+def _finite_float(value: Any, *, name: str) -> float:
+    """Convert one runtime scalar while rejecting booleans and non-finite values."""
+
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be numeric, not bool")
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be numeric") from error
+    if not math.isfinite(numeric_value):
+        raise ValueError(f"{name} must be finite")
+    return numeric_value
+
+
+def target_lane_forward_distance(
+    *,
+    previous_travelled_length_m: float | None,
+    travelled_length_m: float,
+    previous_in_target_lane: bool,
+    state: TargetLaneState,
+) -> float:
+    """Return one Duckietown-style, target-lane-gated forward distance.
+
+    ``navigation.travelled_length`` is route-cumulative, unlike a lane's local
+    longitudinal coordinate, so it stays monotonic at PG-map segment
+    boundaries.  The caller still updates its previous values on every actual
+    decision: a target-lane re-entry must not retroactively earn distance that
+    was driven outside the target lane.
+    """
+
+    current_length = _finite_float(
+        travelled_length_m,
+        name="navigation.travelled_length",
+    )
+    if previous_travelled_length_m is None:
+        return 0.0
+    previous_length = _finite_float(
+        previous_travelled_length_m,
+        name="previous navigation.travelled_length",
+    )
+    if (
+        not state.valid
+        or state.in_target_lane is not True
+        or previous_in_target_lane is not True
+    ):
+        return 0.0
+
+    distance = max(0.0, current_length - previous_length)
+    if not math.isfinite(distance):
+        raise ValueError("target-lane forward distance must be finite")
+    return distance
+
+
 class StartLaneMetaDriveEnv(MetaDriveEnv):
     """MetaDrive environment with return/strict reset-lane objectives.
 
@@ -264,6 +368,12 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
         self._wrong_lane_arrivals: dict[str, bool] = defaultdict(bool)
         self._start_lane_departures: dict[str, bool] = defaultdict(bool)
         self._target_lane_costs: dict[str, float] = defaultdict(float)
+        self._low_speed_penalties: dict[str, float] = defaultdict(float)
+        self._timeout_penalties: dict[str, float] = defaultdict(float)
+        self._target_lane_previous_travelled_lengths: dict[str, float] = {}
+        self._target_lane_previous_in_target_lane: dict[str, bool] = {}
+        self._target_lane_forward_distances: dict[str, float] = defaultdict(float)
+        self._target_lane_progress_rewards: dict[str, float] = defaultdict(float)
         super().__init__(config)
 
     def _post_process_config(self, config: Config) -> Config:
@@ -279,11 +389,16 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
                 "start_lane_objective must be one of 'off', 'return', or 'strict': "
                 f"{objective!r}"
             )
+        if not isinstance(config["target_lane_progress_only"], bool):
+            raise TypeError("target_lane_progress_only must be a bool")
         for key in (
             "start_lane_center_coef",
             "start_lane_wrong_coef",
             "start_lane_tolerance_ratio",
             "start_lane_terminal_penalty",
+            "low_speed_threshold_km_h",
+            "low_speed_penalty_rate",
+            "timeout_penalty",
         ):
             value = config[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -294,9 +409,13 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
             "start_lane_center_coef",
             "start_lane_wrong_coef",
             "start_lane_tolerance_ratio",
+            "low_speed_penalty_rate",
+            "timeout_penalty",
         ):
             if float(config[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
+        if float(config["low_speed_threshold_km_h"]) <= 0:
+            raise ValueError("low_speed_threshold_km_h must be positive")
         if float(config["start_lane_terminal_penalty"]) <= 0:
             raise ValueError("start_lane_terminal_penalty must be positive")
         hold_steps = config["start_lane_violation_hold_steps"]
@@ -310,6 +429,11 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
         # Validation in _post_process_config establishes this narrowed type.
         return self.config["start_lane_objective"]  # type: ignore[return-value]
 
+    @property
+    def _target_lane_progress_only(self) -> bool:
+        # Validation in _post_process_config rejects truthy non-bool values.
+        return self.config["target_lane_progress_only"]  # type: ignore[return-value]
+
     def _get_reset_return(self, reset_info: dict[str, Any]):
         """Capture reset ordinals before BaseEnv invokes reward/done functions."""
 
@@ -319,6 +443,7 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
                 self._target_lane_ordinals[vehicle_id] = _lane_ordinal(
                     getattr(vehicle, "lane_index", None)
                 )
+                self._assert_target_lane_progress_supported(vehicle_id)
         return super()._get_reset_return(reset_info)
 
     def _reset_target_lane_tracking(self) -> None:
@@ -332,6 +457,12 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
         self._wrong_lane_arrivals.clear()
         self._start_lane_departures.clear()
         self._target_lane_costs.clear()
+        self._low_speed_penalties.clear()
+        self._timeout_penalties.clear()
+        self._target_lane_previous_travelled_lengths.clear()
+        self._target_lane_previous_in_target_lane.clear()
+        self._target_lane_forward_distances.clear()
+        self._target_lane_progress_rewards.clear()
 
     def _target_lane_state(self, vehicle_id: str) -> TargetLaneState:
         return resolve_target_lane_state(
@@ -339,6 +470,20 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
             target_ordinal=self._target_lane_ordinals.get(vehicle_id),
             tolerance_ratio=float(self.config["start_lane_tolerance_ratio"]),
         )
+
+    def _assert_target_lane_progress_supported(self, vehicle_id: str) -> None:
+        """Fail closed outside the official bundle's reference-lane-0 scope."""
+
+        if not self._target_lane_progress_only:
+            return
+        target_ordinal = self._target_lane_ordinals.get(vehicle_id)
+        if target_ordinal != 0:
+            raise NotImplementedError(
+                "target_lane_progress_only currently supports only reset target "
+                "lane ordinal 0, because navigation.travelled_length follows "
+                "the route reference lane 0; got "
+                f"{target_ordinal!r}"
+            )
 
     def _is_post_step(self, vehicle_id: str) -> bool:
         """Exclude BaseEnv's reset-time reward/done probes from accounting."""
@@ -364,6 +509,97 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
             center_coef=float(self.config["start_lane_center_coef"]),
             wrong_coef=float(self.config["start_lane_wrong_coef"]),
         )
+
+    def _low_speed_penalty(self, vehicle_id: str) -> float:
+        """Return the configured post-step low-speed penalty, if enabled."""
+
+        penalty_rate = float(self.config["low_speed_penalty_rate"])
+        if penalty_rate == 0.0:
+            return 0.0
+        vehicle = self.agents[vehicle_id]
+        return low_speed_penalty(
+            speed_km_h=float(vehicle.speed_km_h),
+            threshold_km_h=float(self.config["low_speed_threshold_km_h"]),
+            penalty_rate=penalty_rate,
+            action_duration_seconds=self._action_duration_seconds(),
+        )
+
+    def _navigation_travelled_length(self, vehicle_id: str) -> float:
+        """Read the route-cumulative progress used by the narrow fallback."""
+
+        try:
+            value = self.agents[vehicle_id].navigation.travelled_length
+        except (AttributeError, KeyError, TypeError) as error:
+            raise ValueError(
+                "target_lane_progress_only requires "
+                "vehicle.navigation.travelled_length"
+            ) from error
+        return _finite_float(value, name="navigation.travelled_length")
+
+    def _clear_target_lane_progress_telemetry(self, vehicle_id: str) -> None:
+        """Record that no target-lane progress scalar survived this transition."""
+
+        self._target_lane_forward_distances[vehicle_id] = 0.0
+        self._target_lane_progress_rewards[vehicle_id] = 0.0
+
+    def _initialize_target_lane_progress_tracking(
+        self,
+        vehicle_id: str,
+        state: TargetLaneState,
+    ) -> None:
+        """Save the reset probe as the first non-rewarded progress endpoint."""
+
+        self._assert_target_lane_progress_supported(vehicle_id)
+        self._target_lane_previous_travelled_lengths[vehicle_id] = (
+            self._navigation_travelled_length(vehicle_id)
+        )
+        self._target_lane_previous_in_target_lane[vehicle_id] = bool(
+            state.valid and state.in_target_lane is True
+        )
+        self._clear_target_lane_progress_telemetry(vehicle_id)
+
+    def _update_target_lane_progress(
+        self,
+        vehicle_id: str,
+        state: TargetLaneState,
+    ) -> float:
+        """Update one target-lane progress interval and return its reward.
+
+        This is deliberately limited to target ordinal 0.  For the official
+        map-C bundle that ordinal matches MetaDrive's route reference lane,
+        whose ``travelled_length`` remains cumulative over segment boundaries.
+        Other target ordinals can have different lane lengths and must not use
+        this value as a silent proxy.
+        """
+
+        self._assert_target_lane_progress_supported(vehicle_id)
+        travelled_length = self._navigation_travelled_length(vehicle_id)
+        forward_distance = target_lane_forward_distance(
+            previous_travelled_length_m=(
+                self._target_lane_previous_travelled_lengths.get(vehicle_id)
+            ),
+            travelled_length_m=travelled_length,
+            previous_in_target_lane=(
+                self._target_lane_previous_in_target_lane.get(vehicle_id, False)
+            ),
+            state=state,
+        )
+        # Update even for invalid/off-target/reverse transitions.  Otherwise a
+        # later re-entry could accidentally claim distance driven outside the
+        # reset lane.
+        self._target_lane_previous_travelled_lengths[vehicle_id] = travelled_length
+        self._target_lane_previous_in_target_lane[vehicle_id] = bool(
+            state.valid and state.in_target_lane is True
+        )
+        progress_reward = _finite_float(
+            self.config["driving_reward"],
+            name="driving_reward",
+        ) * forward_distance
+        if not math.isfinite(progress_reward):
+            raise ValueError("target-lane progress reward must be finite")
+        self._target_lane_forward_distances[vehicle_id] = forward_distance
+        self._target_lane_progress_rewards[vehicle_id] = progress_reward
+        return progress_reward
 
     def _update_target_lane_tracking(
         self,
@@ -396,6 +632,34 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
             self._start_lane_objective == "strict"
             and self._violation_steps[vehicle_id]
             >= int(self.config["start_lane_violation_hold_steps"])
+        )
+
+    def _is_pure_max_step(
+        self,
+        vehicle_id: str,
+        *,
+        arrive_destination: bool,
+        upstream_failure: bool,
+        strict_departure: bool,
+        wrong_lane_arrival: bool,
+    ) -> bool:
+        """Whether this transition is a horizon truncation with no terminal peer.
+
+        ``reward_function`` runs before MetaDrive gathers done info, so mirror
+        the stock max-step predicate here.  A timeout cost is intentionally not
+        charged when arrival, upstream failure, or a project-local terminal
+        condition shares the same final transition.
+        """
+
+        horizon = self.config["horizon"]
+        return bool(
+            self._is_post_step(vehicle_id)
+            and horizon is not None
+            and self.episode_lengths[vehicle_id] >= int(horizon)
+            and not arrive_destination
+            and not upstream_failure
+            and not strict_departure
+            and not wrong_lane_arrival
         )
 
     @staticmethod
@@ -433,6 +697,14 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
             "wrong_lane_arrival": self._wrong_lane_arrivals[vehicle_id],
             "start_lane_departure": self._start_lane_departures[vehicle_id],
             "target_lane_cost": self._target_lane_costs[vehicle_id],
+            "low_speed_penalty": self._low_speed_penalties[vehicle_id],
+            "timeout_penalty": self._timeout_penalties[vehicle_id],
+            "target_lane_forward_distance_m": self._target_lane_forward_distances[
+                vehicle_id
+            ],
+            "target_lane_progress_reward": self._target_lane_progress_rewards[
+                vehicle_id
+            ],
         }
 
     def _has_upstream_terminal_failure(self, vehicle: Any) -> bool:
@@ -489,25 +761,48 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
             return reward, step_info
 
         state = self._target_lane_state(vehicle_id)
+        progress_only = self._target_lane_progress_only
+        upstream_step_reward = float(reward) if progress_only else 0.0
         if self._is_post_step(vehicle_id):
-            lane_cost = self._target_lane_cost(vehicle_id, state)
-            self._target_lane_costs[vehicle_id] = lane_cost
+            self._timeout_penalties[vehicle_id] = 0.0
             self._update_target_lane_tracking(vehicle_id, state)
-            reward -= lane_cost
+            if progress_only:
+                # Duckietown's lane-distance alternative does not retain
+                # MetaDrive's current-lane progress/speed terms or this
+                # environment's lane/low-speed shaping on ordinary steps.
+                self._target_lane_costs[vehicle_id] = 0.0
+                self._low_speed_penalties[vehicle_id] = 0.0
+                reward = self._update_target_lane_progress(vehicle_id, state)
+                low_speed_cost = 0.0
+            else:
+                lane_cost = self._target_lane_cost(vehicle_id, state)
+                low_speed_cost = self._low_speed_penalty(vehicle_id)
+                self._target_lane_costs[vehicle_id] = lane_cost
+                self._low_speed_penalties[vehicle_id] = low_speed_cost
+                self._clear_target_lane_progress_telemetry(vehicle_id)
+                reward -= lane_cost
+                reward -= low_speed_cost
         else:
             # Reset calls reward_function to build info but does not create an
             # environment transition or an episode reward.  In particular, do
             # not reinterpret a reset-time arrival/failure probe as a custom
             # terminal transition or alter the upstream scalar reward.
             self._target_lane_costs[vehicle_id] = 0.0
+            self._low_speed_penalties[vehicle_id] = 0.0
+            self._timeout_penalties[vehicle_id] = 0.0
+            if progress_only:
+                self._initialize_target_lane_progress_tracking(vehicle_id, state)
+            else:
+                self._clear_target_lane_progress_telemetry(vehicle_id)
             step_info.update(self._target_lane_info(vehicle_id, state))
             return reward, step_info
 
         vehicle = self.agents[vehicle_id]
         upstream_failure = self._has_upstream_terminal_failure(vehicle)
         strict_departure = self._strict_departure(vehicle_id)
+        arrive_destination = self._is_arrive_destination(vehicle)
         wrong_lane_arrival = self._wrong_lane_arrival(
-            arrive_destination=self._is_arrive_destination(vehicle),
+            arrive_destination=arrive_destination,
             state=state,
         )
         if upstream_failure:
@@ -520,16 +815,45 @@ class StartLaneMetaDriveEnv(MetaDriveEnv):
                 # MetaDrive has no dedicated building/human crash reward.  Do
                 # not map it to an arbitrary penalty, but never retain a
                 # simultaneous +success_reward for an upstream failure.
-                reward = min(float(reward), 0.0)
+                reward = min(
+                    upstream_step_reward if progress_only else reward + low_speed_cost,
+                    0.0,
+                )
+            self._low_speed_penalties[vehicle_id] = 0.0
+            self._clear_target_lane_progress_telemetry(vehicle_id)
         elif strict_departure:
             self._start_lane_departures[vehicle_id] = True
             # Strict departure outranks a simultaneous wrong-lane arrival.
             reward = -float(self.config["start_lane_terminal_penalty"])
+            self._low_speed_penalties[vehicle_id] = 0.0
+            self._clear_target_lane_progress_telemetry(vehicle_id)
         elif wrong_lane_arrival:
             self._wrong_lane_arrivals[vehicle_id] = True
             # MetaDrive replaces dense reward with +success_reward at arrival;
             # undo that escape route for an off-target finish.
             reward = -float(self.config["start_lane_terminal_penalty"])
+            self._low_speed_penalties[vehicle_id] = 0.0
+            self._clear_target_lane_progress_telemetry(vehicle_id)
+        elif arrive_destination:
+            # A valid target-lane arrival retains the existing target-lane
+            # shaping, but the upstream success scalar takes priority over the
+            # independent low-speed shaping term.
+            if progress_only:
+                reward = upstream_step_reward
+                self._clear_target_lane_progress_telemetry(vehicle_id)
+            else:
+                reward += low_speed_cost
+            self._low_speed_penalties[vehicle_id] = 0.0
+        elif self._is_pure_max_step(
+            vehicle_id,
+            arrive_destination=arrive_destination,
+            upstream_failure=upstream_failure,
+            strict_departure=strict_departure,
+            wrong_lane_arrival=wrong_lane_arrival,
+        ):
+            timeout_cost = float(self.config["timeout_penalty"])
+            reward -= timeout_cost
+            self._timeout_penalties[vehicle_id] = timeout_cost
 
         step_info.update(self._target_lane_info(vehicle_id, state))
         return reward, step_info

@@ -62,6 +62,13 @@ python3 -m venv .venv
 - `configs/official.toml`: MetaDrive公式の Stable-Baselines3 サンプル相当の例です。
 - `configs/generalization.toml`: 手続き生成道路で学習し、別の scenario 範囲で評価する設定です。
 - `configs/example_experiment.toml`: 新しい実験を作るためのテンプレートです。
+- `configs/official_start_lane_return.toml`: reset 時の開始レーンを維持して到着することを目指す baseline です。
+- `configs/01_official_start_lane_return_idle_penalty.toml`: 低速 penalty の一要因実験です。
+- `configs/02_official_start_lane_return_progress_balance.toml`: 開始レーン中心 cost の係数を下げる一要因実験です。
+- `configs/03_official_start_lane_return_timeout_penalty.toml`: 純粋な時間切れ penalty の一要因実験です。
+- `configs/04_official_start_lane_return_duckietown_progress.toml`: 開始レーン内の前進距離だけを報酬化する Duckietown 方式の実験です。
+
+開始レーン維持実験の実行順、設定差、評価結果、成果物、再現方法は [実験記録](docs/official_start_lane_return_experiments.md) を参照してください。
 
 テンプレートをコピーして値を編集し、学習と評価に同じファイルを渡します。
 

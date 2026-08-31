@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -25,8 +26,10 @@ from start_lane_env import (
     StartLaneMetaDriveEnv,
     TargetLaneState,
     huber_loss,
+    low_speed_penalty,
     resolve_target_lane_state,
     target_lane_cost,
+    target_lane_forward_distance,
 )
 
 
@@ -37,6 +40,31 @@ _RETURN_ENV_CONFIG = _RETURN_SELECTION.profile.evaluation_env_config
 _OFFICIAL_ENV_CONFIG = select_experiment(
     profile_name="official"
 ).profile.evaluation_env_config
+_ABLATION_CONFIG_CASES = (
+    (
+        "01_official_start_lane_return_idle_penalty.toml",
+        "official_start_lane_return_idle_penalty",
+        {
+            "low_speed_threshold_km_h": 10.0,
+            "low_speed_penalty_rate": 0.5,
+        },
+    ),
+    (
+        "02_official_start_lane_return_progress_balance.toml",
+        "official_start_lane_return_progress_balance",
+        {"start_lane_center_coef": 0.10},
+    ),
+    (
+        "03_official_start_lane_return_timeout_penalty.toml",
+        "official_start_lane_return_timeout_penalty",
+        {"timeout_penalty": 25.0},
+    ),
+    (
+        "04_official_start_lane_return_duckietown_progress.toml",
+        "official_start_lane_return_duckietown_progress",
+        {"target_lane_progress_only": True},
+    ),
+)
 
 _ACTION_CONFIG = {
     "discrete_action": True,
@@ -76,12 +104,17 @@ def _fake_vehicle(
     *,
     target_lane: _FakeLane,
     current_ordinal: int = 1,
+    travelled_length: float = 0.0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        navigation=SimpleNamespace(current_ref_lanes=[target_lane]),
+        navigation=SimpleNamespace(
+            current_ref_lanes=[target_lane],
+            travelled_length=travelled_length,
+        ),
         lane_index=("current_start", "current_end", current_ordinal),
         position=(0.0, 0.0),
         max_speed_km_h=72.0,
+        speed_km_h=0.0,
         crash_vehicle=False,
         crash_object=False,
         crash_building=False,
@@ -106,8 +139,13 @@ def _bare_start_lane_env(
         "start_lane_tolerance_ratio": 0.05,
         "start_lane_violation_hold_steps": 2,
         "start_lane_terminal_penalty": 50.0,
+        "low_speed_threshold_km_h": 10.0,
+        "low_speed_penalty_rate": 0.0,
+        "timeout_penalty": 0.0,
+        "target_lane_progress_only": False,
         "physics_world_step_size": 0.02,
         "decision_repeat": 5,
+        "horizon": 500,
         "driving_reward": 1.0,
         "speed_reward": 0.1,
         "out_of_road_penalty": 5.0,
@@ -133,6 +171,12 @@ def _bare_start_lane_env(
     env._wrong_lane_arrivals = defaultdict(bool)
     env._start_lane_departures = defaultdict(bool)
     env._target_lane_costs = defaultdict(float)
+    env._low_speed_penalties = defaultdict(float)
+    env._timeout_penalties = defaultdict(float)
+    env._target_lane_previous_travelled_lengths = {}
+    env._target_lane_previous_in_target_lane = {}
+    env._target_lane_forward_distances = defaultdict(float)
+    env._target_lane_progress_rewards = defaultdict(float)
     return env
 
 
@@ -155,6 +199,58 @@ def test_return_config_uses_project_local_objective_without_broken_line_done() -
         # supplies its unmodified defaults at runtime.
         assert "driving_reward" not in config
         assert "speed_reward" not in config
+
+
+@pytest.mark.parametrize(
+    ("config_filename", "profile_name", "environment_overrides"),
+    _ABLATION_CONFIG_CASES,
+)
+def test_numbered_start_lane_ablation_configs_keep_unnumbered_artifact_names(
+    config_filename: str,
+    profile_name: str,
+    environment_overrides: dict[str, float | bool],
+) -> None:
+    """Each numbered config preserves its unnumbered artifact identity."""
+
+    assert config_filename != f"{profile_name}.toml"
+    selection = load_experiment_config(PROJECT_ROOT / "configs" / config_filename)
+    assert selection.source_path.name == config_filename
+    assert selection.name == profile_name
+    assert selection.profile.default_model_name == profile_name
+    assert selection.profile.training_config["model_name"] == profile_name
+    assert selection.profile.evaluation_defaults["model_path"] == (
+        f"models/{profile_name}.zip"
+    )
+    assert selection.profile.evaluation_defaults["output_prefix"] == profile_name
+    assert selection.profile.evaluation_defaults["record_gif"] is True
+
+    expected_training = {
+        **_RETURN_SELECTION.profile.training_config,
+        "model_name": profile_name,
+    }
+    assert selection.profile.training_config == expected_training
+    expected_evaluation = {
+        **_RETURN_SELECTION.profile.evaluation_defaults,
+        "model_path": f"models/{profile_name}.zip",
+        "output_prefix": profile_name,
+    }
+    assert selection.profile.evaluation_defaults == expected_evaluation
+
+    for environment in (
+        selection.profile.train_env_config,
+        selection.profile.evaluation_env_config,
+    ):
+        expected_environment = {
+            **_RETURN_ENV_CONFIG,
+            **environment_overrides,
+        }
+        if environment is selection.profile.train_env_config:
+            expected_environment = {
+                **expected_environment,
+                "start_seed": 5,
+                "num_scenarios": 1,
+            }
+        assert environment == expected_environment
 
 
 def test_factory_keeps_official_raw_and_selects_start_lane_subclass() -> None:
@@ -181,6 +277,68 @@ def test_factory_accepts_an_explicit_off_start_lane_objective() -> None:
         assert env.config["start_lane_objective"] == "off"
     finally:
         env.close()
+
+
+def test_off_objective_keeps_the_upstream_reward_and_info_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``off`` remains completely neutral despite the new defaults."""
+
+    expected_info = {"route_completion": 0.25, "upstream_only": True}
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (1.25, expected_info),
+    )
+    env = _bare_start_lane_env(
+        _fake_vehicle(target_lane=_FakeLane(("segment", "next", 0))),
+        objective="off",
+        episode_length=1,
+    )
+
+    reward, info = env.reward_function("ego")
+
+    assert reward == 1.25
+    assert info is expected_info
+    assert "low_speed_penalty" not in info
+    assert "timeout_penalty" not in info
+
+
+def test_neutral_penalty_defaults_leave_a_regular_return_reward_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default zero rates preserve the existing return-objective scalar."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (1.25, {"route_completion": 0.25}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+    env = _bare_start_lane_env(
+        _fake_vehicle(
+            target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+            current_ordinal=0,
+        ),
+        episode_length=1,
+    )
+
+    reward, info = env.reward_function("ego")
+
+    assert reward == 1.25
+    assert info["low_speed_penalty"] == 0.0
+    assert info["timeout_penalty"] == 0.0
+    assert info["target_lane_forward_distance_m"] == 0.0
+    assert info["target_lane_progress_reward"] == 0.0
 
 
 def test_start_lane_state_resolves_ordinal_across_segments_and_clips_longitude() -> None:
@@ -248,6 +406,321 @@ def test_target_lane_cost_is_huber_shaped_and_normalized_to_control_reward() -> 
     assert cost == pytest.approx(0.9975)
 
 
+@pytest.mark.parametrize(
+    ("speed_km_h", "expected_penalty"),
+    [(0.0, 0.05), (5.0, 0.025), (10.0, 0.0), (20.0, 0.0)],
+)
+def test_low_speed_penalty_is_duration_normalized(
+    speed_km_h: float,
+    expected_penalty: float,
+) -> None:
+    assert low_speed_penalty(
+        speed_km_h=speed_km_h,
+        threshold_km_h=10.0,
+        penalty_rate=0.5,
+        action_duration_seconds=0.1,
+    ) == pytest.approx(expected_penalty)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"threshold_km_h": 0.0},
+        {"threshold_km_h": float("inf")},
+        {"penalty_rate": -0.1},
+        {"penalty_rate": float("nan")},
+        {"action_duration_seconds": 0.0},
+        {"action_duration_seconds": float("inf")},
+    ],
+)
+def test_low_speed_penalty_rejects_invalid_rate_threshold_and_duration(
+    kwargs: dict[str, float],
+) -> None:
+    inputs = {
+        "speed_km_h": 0.0,
+        "threshold_km_h": 10.0,
+        "penalty_rate": 0.5,
+        "action_duration_seconds": 0.1,
+    }
+    inputs.update(kwargs)
+    with pytest.raises(ValueError):
+        low_speed_penalty(**inputs)
+
+
+def test_target_lane_forward_distance_uses_cumulative_progress_and_gates_it() -> None:
+    """Segment boundaries use cumulative route length, never lane-local s."""
+
+    in_target = TargetLaneState(
+        valid=True,
+        target_ordinal=0,
+        current_ordinal=0,
+        target_lane_offset_m=0.0,
+        lane_width_m=3.5,
+        normalized_error=0.0,
+        in_target_lane=True,
+        departed=False,
+    )
+    outside_target = TargetLaneState(
+        valid=True,
+        target_ordinal=0,
+        current_ordinal=1,
+        target_lane_offset_m=3.5,
+        lane_width_m=3.5,
+        normalized_error=2.0,
+        in_target_lane=False,
+        departed=True,
+    )
+    invalid_target = TargetLaneState(
+        valid=False,
+        target_ordinal=0,
+        current_ordinal=1,
+        target_lane_offset_m=None,
+        lane_width_m=None,
+        normalized_error=None,
+        in_target_lane=None,
+        departed=False,
+    )
+
+    # At a segment boundary the local lane coordinate can reset, while the
+    # navigation total continues from 9.648 m to 10.188 m.
+    assert target_lane_forward_distance(
+        previous_travelled_length_m=9.648,
+        travelled_length_m=10.188,
+        previous_in_target_lane=True,
+        state=in_target,
+    ) == pytest.approx(0.54)
+    assert target_lane_forward_distance(
+        previous_travelled_length_m=6.0,
+        travelled_length_m=5.0,
+        previous_in_target_lane=True,
+        state=in_target,
+    ) == 0.0
+    assert target_lane_forward_distance(
+        previous_travelled_length_m=5.0,
+        travelled_length_m=6.0,
+        previous_in_target_lane=False,
+        state=in_target,
+    ) == 0.0
+    assert target_lane_forward_distance(
+        previous_travelled_length_m=5.0,
+        travelled_length_m=6.0,
+        previous_in_target_lane=True,
+        state=outside_target,
+    ) == 0.0
+    assert target_lane_forward_distance(
+        previous_travelled_length_m=5.0,
+        travelled_length_m=6.0,
+        previous_in_target_lane=True,
+        state=invalid_target,
+    ) == 0.0
+    assert target_lane_forward_distance(
+        previous_travelled_length_m=None,
+        travelled_length_m=6.0,
+        previous_in_target_lane=True,
+        state=in_target,
+    ) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("previous_length", "current_length"),
+    [
+        (float("nan"), 1.0),
+        (1.0, float("inf")),
+    ],
+)
+def test_target_lane_forward_distance_rejects_non_finite_navigation_values(
+    previous_length: float,
+    current_length: float,
+) -> None:
+    state = TargetLaneState(
+        valid=True,
+        target_ordinal=0,
+        current_ordinal=0,
+        target_lane_offset_m=0.0,
+        lane_width_m=3.5,
+        normalized_error=0.0,
+        in_target_lane=True,
+        departed=False,
+    )
+
+    with pytest.raises(ValueError, match="travelled_length"):
+        target_lane_forward_distance(
+            previous_travelled_length_m=previous_length,
+            travelled_length_m=current_length,
+            previous_in_target_lane=True,
+            state=state,
+        )
+
+
+def test_target_lane_progress_only_requires_a_real_boolean_config_value() -> None:
+    vehicle = _fake_vehicle(target_lane=_FakeLane(("segment", "next", 0)))
+    env = _bare_start_lane_env(vehicle)
+    env.config["target_lane_progress_only"] = 1
+
+    with pytest.raises(TypeError, match="target_lane_progress_only must be a bool"):
+        StartLaneMetaDriveEnv._validate_start_lane_config(env.config)
+
+
+def test_progress_only_reset_probe_initializes_progress_without_reward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reset pseudo-step becomes the first interval endpoint, not reward."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (1.25, {"route_completion": 0.0}),
+    )
+    vehicle = _fake_vehicle(
+        target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+        current_ordinal=0,
+        travelled_length=7.5,
+    )
+    env = _bare_start_lane_env(vehicle, episode_length=0)
+    env.config["target_lane_progress_only"] = True
+
+    reward, info = env.reward_function("ego")
+
+    assert reward == 1.25
+    assert env._target_lane_previous_travelled_lengths["ego"] == pytest.approx(7.5)
+    assert env._target_lane_previous_in_target_lane["ego"] is True
+    assert info["target_lane_forward_distance_m"] == 0.0
+    assert info["target_lane_progress_reward"] == 0.0
+
+
+def test_progress_only_replaces_dense_reward_and_does_not_backfill_reentry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only continuously in-target positive intervals earn progress reward."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (9.75, {"route_completion": 0.1}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+    target_lane = _FakeLane(("segment", "next", 0), lateral=0.0)
+    vehicle = _fake_vehicle(
+        target_lane=target_lane,
+        current_ordinal=0,
+        travelled_length=10.0,
+    )
+    env = _bare_start_lane_env(vehicle, episode_length=1)
+    env.config["target_lane_progress_only"] = True
+    env.config["low_speed_penalty_rate"] = 0.5
+    env._target_lane_previous_travelled_lengths["ego"] = 9.0
+    env._target_lane_previous_in_target_lane["ego"] = True
+
+    forward_reward, forward_info = env.reward_function("ego")
+    assert forward_reward == pytest.approx(1.0)
+    assert forward_info["target_lane_forward_distance_m"] == pytest.approx(1.0)
+    assert forward_info["target_lane_progress_reward"] == pytest.approx(1.0)
+    assert forward_info["target_lane_cost"] == 0.0
+    assert forward_info["low_speed_penalty"] == 0.0
+
+    target_lane.lateral = 3.5
+    vehicle.navigation.travelled_length = 14.0
+    env.episode_lengths["ego"] = 2
+    outside_reward, outside_info = env.reward_function("ego")
+    assert outside_reward == 0.0
+    assert outside_info["target_lane_forward_distance_m"] == 0.0
+    assert outside_info["target_lane_progress_reward"] == 0.0
+
+    target_lane.lateral = 0.0
+    vehicle.navigation.travelled_length = 20.0
+    env.episode_lengths["ego"] = 3
+    reentry_reward, reentry_info = env.reward_function("ego")
+    assert reentry_reward == 0.0
+    assert reentry_info["target_lane_forward_distance_m"] == 0.0
+    assert reentry_info["target_lane_progress_reward"] == 0.0
+
+    vehicle.navigation.travelled_length = 21.0
+    env.episode_lengths["ego"] = 4
+    resumed_reward, resumed_info = env.reward_function("ego")
+    assert resumed_reward == pytest.approx(1.0)
+    assert resumed_info["target_lane_forward_distance_m"] == pytest.approx(1.0)
+    assert resumed_info["target_lane_progress_reward"] == pytest.approx(1.0)
+
+
+def test_progress_only_invalid_geometry_updates_progress_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing target lane is zero-reward and cannot be counted on re-entry."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (7.0, {"route_completion": 0.1}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+    target_lane = _FakeLane(("segment", "next", 0), lateral=0.0)
+    vehicle = _fake_vehicle(
+        target_lane=target_lane,
+        current_ordinal=0,
+        travelled_length=3.0,
+    )
+    env = _bare_start_lane_env(vehicle, episode_length=1)
+    env.config["target_lane_progress_only"] = True
+    env._target_lane_previous_travelled_lengths["ego"] = 2.0
+    env._target_lane_previous_in_target_lane["ego"] = True
+
+    vehicle.navigation.current_ref_lanes = [_FakeLane(("segment", "next", 1))]
+    invalid_reward, invalid_info = env.reward_function("ego")
+    assert invalid_reward == 0.0
+    assert invalid_info["target_lane_valid"] is False
+    assert invalid_info["target_lane_progress_reward"] == 0.0
+    assert env._target_lane_previous_travelled_lengths["ego"] == pytest.approx(3.0)
+    assert env._target_lane_previous_in_target_lane["ego"] is False
+
+    vehicle.navigation.current_ref_lanes = [target_lane]
+    vehicle.navigation.travelled_length = 8.0
+    env.episode_lengths["ego"] = 2
+    reentry_reward, reentry_info = env.reward_function("ego")
+    assert reentry_reward == 0.0
+    assert reentry_info["target_lane_progress_reward"] == 0.0
+
+
+def test_progress_only_fails_fast_for_nonzero_target_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reference-lane-zero progress must not be misreported for lane one."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (1.0, {"route_completion": 0.1}),
+    )
+    vehicle = _fake_vehicle(
+        target_lane=_FakeLane(("segment", "next", 1), lateral=0.0),
+        current_ordinal=1,
+        travelled_length=1.0,
+    )
+    env = _bare_start_lane_env(vehicle, episode_length=1)
+    env.config["target_lane_progress_only"] = True
+    env._target_lane_ordinals["ego"] = 1
+
+    with pytest.raises(NotImplementedError, match="only reset target lane ordinal 0"):
+        env.reward_function("ego")
+
+
 def test_reset_probe_does_not_count_as_departure_or_strict_hold_step() -> None:
     """BaseEnv's reset-time reward/done probes must not mutate episode counters."""
 
@@ -283,6 +756,8 @@ def test_reset_probe_does_not_count_as_departure_or_strict_hold_step() -> None:
     assert env._off_target_seconds["ego"] == 0.0
     assert env._violation_steps["ego"] == 0
     assert env._strict_departure("ego") is False
+    assert env._target_lane_info("ego", departed)["low_speed_penalty"] == 0.0
+    assert env._target_lane_info("ego", departed)["timeout_penalty"] == 0.0
 
     env.episode_lengths["ego"] = 1
     env._update_target_lane_tracking("ego", departed)
@@ -344,6 +819,8 @@ def test_reset_pseudo_step_preserves_upstream_success_and_never_sets_custom_term
     assert reward == 10.0
     assert reward_info["target_lane_valid"] is False
     assert reward_info["target_lane_cost"] == 0.0
+    assert reward_info["target_lane_forward_distance_m"] == 0.0
+    assert reward_info["target_lane_progress_reward"] == 0.0
     assert reward_info["wrong_lane_arrival"] is False
     assert reward_info["start_lane_departure"] is False
     assert done is True
@@ -351,6 +828,351 @@ def test_reset_pseudo_step_preserves_upstream_success_and_never_sets_custom_term
     assert done_info["target_lane_valid"] is False
     assert done_info["wrong_lane_arrival"] is False
     assert done_info["start_lane_departure"] is False
+
+
+def test_timeout_penalty_applies_only_to_the_pure_horizon_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first horizon step costs 25, while the preceding one costs zero."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (2.0, {"route_completion": 0.5}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+
+    target_lane = _FakeLane(("segment", "next", 0), lateral=0.0)
+    before_horizon = _bare_start_lane_env(
+        _fake_vehicle(target_lane=target_lane, current_ordinal=0),
+        episode_length=499,
+    )
+    before_horizon.config["timeout_penalty"] = 25.0
+    before_reward, before_info = before_horizon.reward_function("ego")
+    assert before_reward == 2.0
+    assert before_info["timeout_penalty"] == 0.0
+
+    at_horizon = _bare_start_lane_env(
+        _fake_vehicle(target_lane=target_lane, current_ordinal=0),
+        episode_length=500,
+    )
+    at_horizon.config["timeout_penalty"] = 25.0
+    timeout_reward, timeout_info = at_horizon.reward_function("ego")
+    assert timeout_reward == -23.0
+    assert timeout_info["timeout_penalty"] == 25.0
+
+
+def test_timeout_penalty_does_not_replace_other_terminal_scalars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arrival, upstream failure, strict, and wrong-lane terminals own step 500."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (10.0, {"route_completion": 1.0}),
+    )
+
+    success_env = _bare_start_lane_env(
+        _fake_vehicle(
+            target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+            current_ordinal=0,
+        ),
+        episode_length=500,
+    )
+    success_env.config["timeout_penalty"] = 25.0
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: True),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+    success_reward, success_info = success_env.reward_function("ego")
+    assert success_reward == 10.0
+    assert success_info["timeout_penalty"] == 0.0
+
+    failure_env = _bare_start_lane_env(
+        _fake_vehicle(
+            target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+            current_ordinal=0,
+        ),
+        episode_length=500,
+    )
+    failure_env.config["timeout_penalty"] = 25.0
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: True,
+    )
+    failure_reward, failure_info = failure_env.reward_function("ego")
+    assert failure_reward == -5.0
+    assert failure_info["timeout_penalty"] == 0.0
+
+    strict_env = _bare_start_lane_env(
+        _fake_vehicle(target_lane=_FakeLane(("segment", "next", 0), lateral=3.5)),
+        objective="strict",
+        episode_length=500,
+    )
+    strict_env.config["timeout_penalty"] = 25.0
+    strict_env._violation_steps["ego"] = 1
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+    strict_reward, strict_info = strict_env.reward_function("ego")
+    assert strict_reward == -50.0
+    assert strict_info["timeout_penalty"] == 0.0
+
+    wrong_lane_env = _bare_start_lane_env(
+        _fake_vehicle(target_lane=_FakeLane(("segment", "next", 0), lateral=3.5)),
+        episode_length=500,
+    )
+    wrong_lane_env.config["timeout_penalty"] = 25.0
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: True),
+    )
+    wrong_lane_reward, wrong_lane_info = wrong_lane_env.reward_function("ego")
+    assert wrong_lane_reward == -50.0
+    assert wrong_lane_info["timeout_penalty"] == 0.0
+
+
+def test_progress_only_terminal_replacements_clear_progress_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Success and upstream failure retain their own scalars, not progress."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (10.0, {"route_completion": 1.0}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+
+    success_vehicle = _fake_vehicle(
+        target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+        current_ordinal=0,
+        travelled_length=4.0,
+    )
+    success_env = _bare_start_lane_env(success_vehicle, episode_length=1)
+    success_env.config["target_lane_progress_only"] = True
+    success_env._target_lane_previous_travelled_lengths["ego"] = 3.0
+    success_env._target_lane_previous_in_target_lane["ego"] = True
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: True),
+    )
+
+    success_reward, success_info = success_env.reward_function("ego")
+    assert success_reward == 10.0
+    assert success_info["target_lane_forward_distance_m"] == 0.0
+    assert success_info["target_lane_progress_reward"] == 0.0
+
+    failure_vehicle = _fake_vehicle(
+        target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+        current_ordinal=0,
+        travelled_length=4.0,
+    )
+    failure_env = _bare_start_lane_env(failure_vehicle, episode_length=1)
+    failure_env.config["target_lane_progress_only"] = True
+    failure_env._target_lane_previous_travelled_lengths["ego"] = 3.0
+    failure_env._target_lane_previous_in_target_lane["ego"] = True
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: True,
+    )
+
+    failure_reward, failure_info = failure_env.reward_function("ego")
+    assert failure_reward == -5.0
+    assert failure_info["target_lane_forward_distance_m"] == 0.0
+    assert failure_info["target_lane_progress_reward"] == 0.0
+
+
+def test_progress_only_pure_timeout_keeps_its_progress_scalar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pure horizon handling subtracts timeout after the retained progress."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (8.0, {"route_completion": 0.5}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+    vehicle = _fake_vehicle(
+        target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+        current_ordinal=0,
+        travelled_length=4.0,
+    )
+    env = _bare_start_lane_env(vehicle, episode_length=500)
+    env.config["target_lane_progress_only"] = True
+    env.config["timeout_penalty"] = 25.0
+    env._target_lane_previous_travelled_lengths["ego"] = 3.0
+    env._target_lane_previous_in_target_lane["ego"] = True
+
+    reward, info = env.reward_function("ego")
+
+    assert reward == pytest.approx(-24.0)
+    assert info["target_lane_forward_distance_m"] == pytest.approx(1.0)
+    assert info["target_lane_progress_reward"] == pytest.approx(1.0)
+    assert info["timeout_penalty"] == pytest.approx(25.0)
+
+
+def test_low_speed_telemetry_records_only_the_scalar_penalty_that_survives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal replacement must not report a cost absent from its reward."""
+
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (1.0, {"route_completion": 0.25}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    target_lane = _FakeLane(("segment", "next", 0), lateral=0.0)
+
+    regular_env = _bare_start_lane_env(
+        _fake_vehicle(target_lane=target_lane, current_ordinal=0),
+        episode_length=1,
+    )
+    regular_env.config["low_speed_penalty_rate"] = 0.5
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+    regular_reward, regular_info = regular_env.reward_function("ego")
+    assert regular_reward == pytest.approx(0.95)
+    assert regular_info["low_speed_penalty"] == pytest.approx(0.05)
+
+    terminal_env = _bare_start_lane_env(
+        _fake_vehicle(target_lane=target_lane, current_ordinal=0),
+        episode_length=1,
+    )
+    terminal_env.config["low_speed_penalty_rate"] = 0.5
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: True,
+    )
+    terminal_reward, terminal_info = terminal_env.reward_function("ego")
+    assert terminal_reward == -5.0
+    assert terminal_info["low_speed_penalty"] == 0.0
+
+
+@pytest.mark.parametrize("crash_attribute", ["crash_building", "crash_human"])
+def test_low_speed_penalty_is_removed_from_building_and_human_terminal_scalars(
+    monkeypatch: pytest.MonkeyPatch,
+    crash_attribute: str,
+) -> None:
+    """Terminal clamping must not retain an unreported low-speed cost."""
+
+    vehicle = _fake_vehicle(
+        target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+        current_ordinal=0,
+    )
+    setattr(vehicle, crash_attribute, True)
+    env = _bare_start_lane_env(vehicle, episode_length=1)
+    env.config["low_speed_penalty_rate"] = 0.5
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (-1.0, {"route_completion": 0.25}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: False),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+
+    reward, info = env.reward_function("ego")
+
+    assert reward == -1.0
+    assert info["low_speed_penalty"] == 0.0
+
+
+def test_low_speed_penalty_does_not_shape_a_valid_target_lane_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid success retains its upstream scalar even if it is stationary."""
+
+    env = _bare_start_lane_env(
+        _fake_vehicle(
+            target_lane=_FakeLane(("segment", "next", 0), lateral=0.0),
+            current_ordinal=0,
+        ),
+        episode_length=1,
+    )
+    env.config["low_speed_penalty_rate"] = 0.5
+    monkeypatch.setattr(
+        MetaDriveEnv,
+        "reward_function",
+        lambda _env, _vehicle_id: (10.0, {"route_completion": 1.0}),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_arrive_destination",
+        staticmethod(lambda _vehicle: True),
+    )
+    monkeypatch.setattr(
+        StartLaneMetaDriveEnv,
+        "_is_out_of_road",
+        lambda _env, _vehicle: False,
+    )
+
+    reward, info = env.reward_function("ego")
+
+    assert reward == 10.0
+    assert info["low_speed_penalty"] == 0.0
 
 
 def test_wrong_lane_arrival_and_strict_departure_replace_success(
@@ -846,6 +1668,10 @@ def test_target_telemetry_schema_and_termination_priority() -> None:
             "off_target_duration_seconds": 0.1,
             "time_in_target_lane_ratio": 0.5,
             "target_lane_cost": 0.9975,
+            "low_speed_penalty": 0.05,
+            "timeout_penalty": 25.0,
+            "target_lane_forward_distance_m": 0.75,
+            "target_lane_progress_reward": 0.75,
             "wrong_lane_arrival": False,
             "start_lane_departure": True,
         },
@@ -863,6 +1689,10 @@ def test_target_telemetry_schema_and_termination_priority() -> None:
     assert telemetry["current_lane_ordinal"] == 1
     assert telemetry["target_lane_offset_m"] == pytest.approx(3.5)
     assert telemetry["target_lane_cost"] == pytest.approx(0.9975)
+    assert telemetry["low_speed_penalty"] == pytest.approx(0.05)
+    assert telemetry["timeout_penalty"] == pytest.approx(25.0)
+    assert telemetry["target_lane_forward_distance_m"] == pytest.approx(0.75)
+    assert telemetry["target_lane_progress_reward"] == pytest.approx(0.75)
     assert telemetry["status"] == "START_LANE_DEPARTURE"
     assert _termination_reason(
         terminated=True,
@@ -903,6 +1733,10 @@ def test_start_lane_return_environment_reset_and_one_step() -> None:
         assert reset_info["off_target_duration_seconds"] == 0.0
         assert reset_info["time_in_target_lane_ratio"] == 1.0
         assert reset_info["target_lane_cost"] == 0.0
+        assert reset_info["low_speed_penalty"] == 0.0
+        assert reset_info["timeout_penalty"] == 0.0
+        assert reset_info["target_lane_forward_distance_m"] == 0.0
+        assert reset_info["target_lane_progress_reward"] == 0.0
 
         next_observation, reward, terminated, truncated, step_info = env.step(7)
         assert env.observation_space.contains(next_observation)
@@ -912,6 +1746,42 @@ def test_start_lane_return_environment_reset_and_one_step() -> None:
         assert step_info["target_lane_valid"] is True
         assert step_info["lane_departure_count"] == 0
         assert step_info["off_target_duration_seconds"] == 0.0
+        assert step_info["low_speed_penalty"] == 0.0
+        assert step_info["timeout_penalty"] == 0.0
+        assert step_info["target_lane_forward_distance_m"] == 0.0
+        assert step_info["target_lane_progress_reward"] == 0.0
+    finally:
+        env.close()
+
+
+def test_duckietown_progress_environment_reset_and_one_step() -> None:
+    """The narrow fallback exposes its lane-distance scalar at runtime."""
+
+    selection = load_experiment_config(
+        PROJECT_ROOT / "configs/04_official_start_lane_return_duckietown_progress.toml"
+    )
+    env = make_env(selection.profile.evaluation_env_config)
+    try:
+        observation, reset_info = env.reset(seed=5)
+        assert isinstance(env, StartLaneMetaDriveEnv)
+        assert env.config["target_lane_progress_only"] is True
+        assert env.observation_space.contains(observation)
+        assert reset_info["target_lane_ordinal"] == 0
+        assert reset_info["target_lane_forward_distance_m"] == 0.0
+        assert reset_info["target_lane_progress_reward"] == 0.0
+
+        next_observation, reward, _terminated, _truncated, step_info = env.step(7)
+        assert env.observation_space.contains(next_observation)
+        assert step_info["target_lane_cost"] == 0.0
+        assert step_info["low_speed_penalty"] == 0.0
+        assert math.isfinite(step_info["target_lane_forward_distance_m"])
+        assert math.isfinite(step_info["target_lane_progress_reward"])
+        assert step_info["target_lane_forward_distance_m"] >= 0.0
+        assert step_info["target_lane_progress_reward"] == pytest.approx(
+            float(env.config["driving_reward"])
+            * step_info["target_lane_forward_distance_m"]
+        )
+        assert reward == pytest.approx(step_info["target_lane_progress_reward"])
     finally:
         env.close()
 

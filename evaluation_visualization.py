@@ -58,6 +58,10 @@ STEP_TELEMETRY_FIELDS: tuple[str, ...] = (
     "off_target_duration_seconds",
     "time_in_target_lane_ratio",
     "target_lane_cost",
+    "low_speed_penalty",
+    "timeout_penalty",
+    "target_lane_forward_distance_m",
+    "target_lane_progress_reward",
     "route_completion",
     "step_reward",
     "cumulative_reward",
@@ -439,6 +443,14 @@ def make_step_telemetry(
             info.get("time_in_target_lane_ratio")
         ),
         "target_lane_cost": _optional_float(info.get("target_lane_cost")),
+        "low_speed_penalty": _optional_float(info.get("low_speed_penalty")),
+        "timeout_penalty": _optional_float(info.get("timeout_penalty")),
+        "target_lane_forward_distance_m": _optional_float(
+            info.get("target_lane_forward_distance_m")
+        ),
+        "target_lane_progress_reward": _optional_float(
+            info.get("target_lane_progress_reward")
+        ),
         "route_completion": _optional_float(info.get("route_completion")),
         "step_reward": float(reward),
         "cumulative_reward": float(cumulative_reward),
