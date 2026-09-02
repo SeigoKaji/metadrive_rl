@@ -1,0 +1,117 @@
+# Template only: the three custom fields are intentionally unresolved.
+# Normal analysis refuses this file until every placeholder is documented.
+schema_version = 1
+name = "custom_262_template"
+observation_dim = 262
+
+[[blocks]]
+name = "ego_state"
+start = 0
+kind = "state"
+group = "ego_state"
+feature_names = [
+  "distance_to_left_road_boundary",
+  "distance_to_right_road_boundary",
+  "heading_difference_to_reference_lane",
+  "normalized_speed",
+  "current_steering",
+  "previous_steering_action",
+  "previous_throttle_brake_action",
+  "yaw_rate",
+  "lateral_position_in_current_lane",
+]
+
+[[blocks]]
+name = "navigation"
+start = 9
+kind = "navigation"
+group = "navigation"
+feature_names = [
+  "checkpoint_1_forward_projection",
+  "checkpoint_1_right_projection",
+  "checkpoint_1_curve_radius",
+  "checkpoint_1_curve_direction",
+  "checkpoint_1_curve_angle",
+  "checkpoint_2_forward_projection",
+  "checkpoint_2_right_projection",
+  "checkpoint_2_curve_radius",
+  "checkpoint_2_curve_direction",
+  "checkpoint_2_curve_angle",
+]
+
+[[ranges]]
+name = "lidar"
+start = 19
+count = 240
+feature_name_template = "lidar_{offset:03d}"
+kind = "lidar"
+group = "lidar_all"
+angle_start_deg = 0.0
+angle_step_deg = 1.5
+angle_direction = "clockwise"
+
+# Default assumption shown here is *end append*: indices 259--261.
+# Do not retain these names or resolved=false once their real source meaning is known.
+[[blocks]]
+name = "custom_unresolved"
+start = 259
+kind = "custom"
+group = "custom_features"
+resolved = false
+description = "Replace names, start, description, group, and resolved status after verifying the custom environment source."
+feature_names = [
+  "UNRESOLVED_custom_0",
+  "UNRESOLVED_custom_1",
+  "UNRESOLVED_custom_2",
+]
+
+[[groups]]
+name = "road_boundaries"
+members = [
+  "feature:distance_to_left_road_boundary",
+  "feature:distance_to_right_road_boundary",
+]
+
+[[groups]]
+name = "heading"
+members = ["feature:heading_difference_to_reference_lane"]
+
+[[groups]]
+name = "speed"
+members = ["feature:normalized_speed"]
+
+[[groups]]
+name = "steering_and_action_history"
+members = [
+  "feature:current_steering",
+  "feature:previous_steering_action",
+  "feature:previous_throttle_brake_action",
+]
+
+[[groups]]
+name = "yaw_rate"
+members = ["feature:yaw_rate"]
+
+[[groups]]
+name = "current_lane_lateral_position"
+members = ["feature:lateral_position_in_current_lane"]
+
+[[groups]]
+name = "checkpoint_1"
+members = [
+  "feature:checkpoint_1_forward_projection",
+  "feature:checkpoint_1_right_projection",
+  "feature:checkpoint_1_curve_radius",
+  "feature:checkpoint_1_curve_direction",
+  "feature:checkpoint_1_curve_angle",
+]
+
+[[groups]]
+name = "checkpoint_2"
+members = [
+  "feature:checkpoint_2_forward_projection",
+  "feature:checkpoint_2_right_projection",
+  "feature:checkpoint_2_curve_radius",
+  "feature:checkpoint_2_curve_direction",
+  "feature:checkpoint_2_curve_angle",
+]

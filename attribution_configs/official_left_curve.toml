@@ -1,0 +1,38 @@
+# Attribution settings are deliberately separate from the strict experiment TOML.
+schema_version = 1
+name = "official_left_curve"
+
+[run]
+deterministic = true
+device = "cpu"
+record_visualization = false
+
+[collection]
+save_observations = true
+
+[baseline]
+strategy = "episode_start"
+count = 1
+seed = 0
+
+[perturbation]
+enabled = true
+analyze_features = true
+analyze_groups = true
+batch_size = 1024
+lidar_sector_degrees = 15
+
+[integrated_gradients]
+enabled = true
+targets = ["selected_log_probability", "critic_value"]
+steps = 64
+batch_size = 128
+
+[aggregation]
+progress_bins = 3
+
+[closed_loop]
+enabled = true
+top_k_features = 10
+top_k_groups = 5
+replacement_strategy = "episode_start_constant"

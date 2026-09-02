@@ -1,0 +1,113 @@
+# MetaDrive 0.4.3 / local source commit 85e5dadc default vector observation.
+# See observation_schemas/README.md for the exact applicability contract.
+schema_version = 1
+name = "metadrive_default_259"
+observation_dim = 259
+
+[[blocks]]
+name = "ego_state"
+start = 0
+kind = "state"
+group = "ego_state"
+description = "StateObservation fields before navigation and LiDAR."
+feature_names = [
+  "distance_to_left_road_boundary",
+  "distance_to_right_road_boundary",
+  "heading_difference_to_reference_lane",
+  "normalized_speed",
+  "current_steering",
+  "previous_steering_action",
+  "previous_throttle_brake_action",
+  "yaw_rate",
+  "lateral_position_in_current_lane",
+]
+
+[[blocks]]
+name = "navigation"
+start = 9
+kind = "navigation"
+group = "navigation"
+description = "Two NodeNetworkNavigation checkpoints, each forward/right projection, curve radius, curve direction, and curve angle."
+feature_names = [
+  "checkpoint_1_forward_projection",
+  "checkpoint_1_right_projection",
+  "checkpoint_1_curve_radius",
+  "checkpoint_1_curve_direction",
+  "checkpoint_1_curve_angle",
+  "checkpoint_2_forward_projection",
+  "checkpoint_2_right_projection",
+  "checkpoint_2_curve_radius",
+  "checkpoint_2_curve_direction",
+  "checkpoint_2_curve_angle",
+]
+
+[[ranges]]
+name = "lidar"
+start = 19
+count = 240
+feature_name_template = "lidar_{offset:03d}"
+kind = "lidar"
+group = "lidar_all"
+description = "CloudPoint detector distance in the schema-declared clockwise scan direction."
+angle_start_deg = 0.0
+angle_step_deg = 1.5
+angle_direction = "clockwise"
+
+[[groups]]
+name = "road_boundaries"
+description = "Distances to the left and right road boundaries."
+members = [
+  "feature:distance_to_left_road_boundary",
+  "feature:distance_to_right_road_boundary",
+]
+
+[[groups]]
+name = "heading"
+description = "Heading difference to the reference lane, normalized to [0, 1]."
+members = ["feature:heading_difference_to_reference_lane"]
+
+[[groups]]
+name = "speed"
+description = "Normalized vehicle speed."
+members = ["feature:normalized_speed"]
+
+[[groups]]
+name = "steering_and_action_history"
+description = "Current steering and the two previous-action observation fields."
+members = [
+  "feature:current_steering",
+  "feature:previous_steering_action",
+  "feature:previous_throttle_brake_action",
+]
+
+[[groups]]
+name = "yaw_rate"
+description = "Unsigned yaw-rate state field emitted by the official StateObservation implementation."
+members = ["feature:yaw_rate"]
+
+[[groups]]
+name = "current_lane_lateral_position"
+description = "Lateral position in the current lane."
+members = ["feature:lateral_position_in_current_lane"]
+
+[[groups]]
+name = "checkpoint_1"
+description = "First NodeNetworkNavigation checkpoint's five fields."
+members = [
+  "feature:checkpoint_1_forward_projection",
+  "feature:checkpoint_1_right_projection",
+  "feature:checkpoint_1_curve_radius",
+  "feature:checkpoint_1_curve_direction",
+  "feature:checkpoint_1_curve_angle",
+]
+
+[[groups]]
+name = "checkpoint_2"
+description = "Second NodeNetworkNavigation checkpoint's five fields."
+members = [
+  "feature:checkpoint_2_forward_projection",
+  "feature:checkpoint_2_right_projection",
+  "feature:checkpoint_2_curve_radius",
+  "feature:checkpoint_2_curve_direction",
+  "feature:checkpoint_2_curve_angle",
+]
