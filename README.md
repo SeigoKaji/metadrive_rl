@@ -57,7 +57,7 @@ python3 -m venv .venv
 
 ## 入力寄与・入力依存度解析
 
-固定済み PPO `MlpPolicy` の vector observation に対して、baseline 置換による摂動依存度と Integrated Gradients (IG) を解析できます。学習、`evaluate.py`、MetaDrive 本体は変更しません。標準の公式 259 次元 schema は、対応する MetaDrive の observation 設定が満たされる場合だけ使います。詳細な条件と 262 次元環境への移植方法は [入力寄与解析ガイド](docs/input_attribution.md) と [観測スキーマの説明](observation_schemas/README.md) を確認してください。
+固定済み PPO `MlpPolicy` の vector observation に対して、baseline 置換による摂動依存度と Integrated Gradients (IG) を解析できます。学習、`evaluate.py`、MetaDrive 本体は変更しません。実験の目的・数式・設定変更箇所は [入力寄与解析ガイド](docs/input_attribution.md)、出力の絞り方と解釈例は [結果の読み方](docs/input_attribution_results.md)、259 次元 schema の成立条件は [観測スキーマの説明](observation_schemas/README.md)、262 次元環境への変更は [移植手順](docs/input_attribution_porting.md) を確認してください。
 
 ```bash
 .venv/bin/python analyze_input_attribution.py run \

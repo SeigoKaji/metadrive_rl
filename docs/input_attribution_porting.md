@@ -2,6 +2,8 @@
 
 この手順は MetaDrive 本体を patch せず、GitHub Copilot に大きな移植を任せずに済むよう、変更箇所を schema と path に限定します。
 
+実験の方法と設定項目は [入力寄与解析ガイド](input_attribution.md)、出力の確認方法は [結果の読み方](input_attribution_results.md)、schema の成立条件は [観測スキーマ](../observation_schemas/README.md) を参照してください。この文書では移植時に固有の変更だけを扱います。
+
 ## コピーするもの
 
 コピー先プロジェクトへ、次をそのままコピーします。
@@ -11,6 +13,7 @@
 - `attribution_configs/`
 - `observation_schemas/`
 - `docs/input_attribution.md`
+- `docs/input_attribution_results.md`
 - `docs/input_attribution_porting.md`
 - `tests/test_attribution_*.py` と `tests/test_analyze_input_attribution_cli.py`
 
@@ -46,6 +49,6 @@
 
 ## 出力の確認順
 
-まず `analysis_metadata.json` と `rollout_metadata.json` で model/config/schema hash、dim、seed、baseline、device を確認します。次に `feature_schema_expanded.csv` で index と意味が 262 次元環境の確認結果と一致するかを確認します。その後 `perturbation_*` と `ig_*` を**別の表**として読み、`ig_completeness.csv` の residual も確認します。最後に `closed_loop_*` は同じ scenario seed の paired baseline との差として読みます。
+確認順、CSV の絞り方、各指標の符号は [入力寄与解析結果の読み方](input_attribution_results.md) に集約しています。移植後は、特に `analysis_metadata.json` の dimension と hash、および `feature_schema_expanded.csv` の 262 行が確認済みの index・意味と一致することを先に確認してください。
 
 `custom_262.toml` の unresolved placeholder を残したままの実行や、追加 3 入力に推測した仮名を付けた結果の解釈は行いません。移植先で変えるべきファイルは原則として experiment TOML の path、`custom_262.toml`、必要なら analysis TOML の run / baseline / closed-loop key だけです。
