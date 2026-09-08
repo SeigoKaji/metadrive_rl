@@ -1,0 +1,3 @@
+# Optional Captum backend.  The built-in autograd Integrated Gradients path
+# remains available without installing this file.
+captum>=0.7,<1

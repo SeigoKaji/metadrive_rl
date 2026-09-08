@@ -1,0 +1,31 @@
+input_attribution portable package
+=================================
+
+COPY (input_attribution 追加パッケージだけ)
+--------------------------------
+* input_attribution/*.py
+* input_attribution/adapters/*.py
+* input_attribution/configs/*（解析用259設定、262未確定テンプレート）
+* input_attribution/docs/*.md
+* input_attribution/docs/implementation_baseline.json
+* input_attribution/schemas/*
+* input_attribution/tests/*（fake契約テスト。実験結果は含めない）
+* input_attribution/requirements-ig.txt（Captum等の任意依存）
+* input_attribution/PORTABLE_FILES.txt
+
+EXCLUDE (ZIPへ入れない)
+-----------------------
+* 学習済みモデル（models/、*.zip、*.pt、*.pth）
+* 実験出力・保存観測・結果（outputs/、logs/、run/、results/、*.jsonl、*.npz、*.npy）
+* report.html/report.md/summary.csv と動画・画像・GIF
+* .git/、venv/.venv、__pycache__、pytest/mypy/ruff cache
+* pip/wheel/site-packages、第三者 MetaDrive checkout
+* フォント（*.ttf、*.otf、*.woff、*.woff2）、node_modules、build/dist
+
+作成:
+
+```bash
+python -m input_attribution.pack --source-root . --output /tmp/input_attribution_portable.zip
+```
+
+ZIP は `input_attribution/` 配下だけを固定 timestamp・辞書順 entry で収録します。repo-root の docs、requirements、PORTABLE_FILES、学習用 configs は収録しません。同じ source bytes から再現できることを確認し、学習環境・モデル・実験結果は移植先の既存環境から別途指定してください。

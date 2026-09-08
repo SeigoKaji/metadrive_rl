@@ -1,0 +1,71 @@
+{
+  "schema_id": "custom_262_template",
+  "version": "1",
+  "dimension": 262,
+  "status": "UNRESOLVED",
+  "preprocessing": {
+    "external_normalization": "UNSET",
+    "observation_order": "UNSET"
+  },
+  "inputs": [
+    {
+      "index": null,
+      "id": "target_lane_offset",
+      "name_ja": "開始時目標レーン中心からの符号付き横ずれ",
+      "group": "custom_lane_features_unresolved",
+      "description": "移植先の観測生成 source で index、符号、単位、normalization、invalid 値を確認する。",
+      "physical_quantity": "UNSET",
+      "unit": "UNSET",
+      "normalization": null,
+      "neutral": null,
+      "invalid_value": "UNSET",
+      "replacement": {"kind": "unresolved", "value_method": "source_verification_required"},
+      "independently_replaceable": false,
+      "ig_interpolation_allowed": false,
+      "coupled_indices": null,
+      "source": "UNSET"
+    },
+    {
+      "index": null,
+      "id": "target_lane_heading_error",
+      "name_ja": "開始時目標レーンとの向き誤差",
+      "group": "custom_lane_features_unresolved",
+      "description": "移植先の観測生成 source で index、角度表現、符号、normalization、invalid 値を確認する。",
+      "physical_quantity": "UNSET",
+      "unit": "UNSET",
+      "normalization": null,
+      "neutral": null,
+      "invalid_value": "UNSET",
+      "replacement": {"kind": "unresolved", "value_method": "source_verification_required"},
+      "independently_replaceable": false,
+      "ig_interpolation_allowed": false,
+      "coupled_indices": null,
+      "source": "UNSET"
+    },
+    {
+      "index": null,
+      "id": "target_lane_valid",
+      "name_ja": "目標レーン参照の有効フラグ",
+      "group": "custom_lane_features_unresolved",
+      "description": "移植先の観測生成 source で index、bool 表現、invalid 組、関連値を確認する。",
+      "physical_quantity": "UNSET",
+      "unit": "UNSET",
+      "normalization": null,
+      "neutral": null,
+      "invalid_value": "UNSET",
+      "replacement": {"kind": "unresolved", "value_method": "source_verification_required"},
+      "independently_replaceable": false,
+      "ig_interpolation_allowed": false,
+      "coupled_indices": null,
+      "source": "UNSET"
+    }
+  ],
+  "resolution": {
+    "index": "UNSET",
+    "neutral": null,
+    "normalization": null,
+    "invalid_value": "UNSET",
+    "road_segment_update": "UNSET",
+    "note": "This file is metadata only and must fail schema validation until port source evidence fills every index."
+  }
+}

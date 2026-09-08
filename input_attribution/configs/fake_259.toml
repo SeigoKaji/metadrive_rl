@@ -1,0 +1,68 @@
+# MetaDrive-free contract test bundle.  It uses the source-verified schema with
+# a deterministic linear fake policy and never loads models or starts an engine.
+
+[analysis]
+name = "fake_259"
+experiment = "fake_259"
+description = "fake adapter coverage for the official 259 schema"
+deterministic = true
+individual_inputs = false
+reference_id = "episode-0:0"
+
+[model]
+name = "fake_policy_259"
+format = "synthetic_linear"
+device = "cpu"
+deterministic = true
+
+[adapter]
+module = "input_attribution.adapters.fake"
+factory = "input_attribution.adapters.fake.create_adapter"
+
+[schema]
+path = "../schemas/official_259.json"
+name = "metadrive_default_259"
+dimension = 259
+template = false
+
+[environment]
+settings = {}
+
+[scenario]
+seed = 5
+scenario_seed = 5
+rl_seed = 0
+horizon = 4
+episodes = 1
+
+[seeds]
+scenario_seed = 5
+rl_seed = 0
+intervention = 0
+
+[preprocess]
+name = "fake_vector_box_identity"
+external_normalization = false
+
+[output]
+root = "../../outputs/input_attribution"
+experiment = "fake_259"
+model = "fake_policy_259"
+
+[closed_loop]
+enabled = true
+patterns = ["P00"]
+episodes = 1
+max_steps = 4
+
+[video]
+enabled = false
+
+[ig]
+enabled = false
+
+[[patterns]]
+id = "P00"
+description = "unchanged reference observation"
+indices = []
+method = "identity"

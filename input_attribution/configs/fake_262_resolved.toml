@@ -1,0 +1,101 @@
+# MetaDrive-free synthetic 262 contract bundle.  The three custom IDs and
+# non-tail indices are deliberately synthetic; this is not evidence for a
+# real port.  It exists to test independent and grouped interventions.
+
+[analysis]
+name = "fake_262_resolved"
+experiment = "fake_262_resolved"
+description = "synthetic non-tail 262 schema and fake adapter"
+deterministic = true
+individual_inputs = true
+reference_id = "episode-0:0"
+
+[model]
+name = "fake_policy_262"
+format = "synthetic_linear"
+device = "cpu"
+deterministic = true
+
+[adapter]
+module = "input_attribution.adapters.fake"
+factory = "input_attribution.adapters.fake.create_adapter"
+
+[schema]
+path = "../schemas/fake_262_resolved.json"
+name = "fake_262_resolved_synthetic"
+dimension = 262
+template = false
+
+[environment]
+settings = { categorical_indices = [260] }
+
+[scenario]
+seed = 5
+scenario_seed = 5
+rl_seed = 0
+horizon = 4
+episodes = 1
+
+[seeds]
+scenario_seed = 5
+rl_seed = 0
+intervention = 0
+
+[preprocess]
+name = "fake_vector_box_identity"
+external_normalization = false
+
+[output]
+root = "../../outputs/input_attribution"
+experiment = "fake_262_resolved"
+model = "fake_policy_262"
+
+[closed_loop]
+enabled = true
+patterns = ["P00", "P01_offset", "P02_heading", "P03_offset_heading", "P04_lane_triplet"]
+episodes = 1
+max_steps = 4
+
+[video]
+enabled = false
+
+[ig]
+enabled = false
+
+[[patterns]]
+id = "P00"
+description = "unchanged reference observation"
+indices = []
+method = "identity"
+
+[[patterns]]
+id = "P01_offset"
+description = "synthetic target-lane offset to its explicit neutral 0.5"
+indices = [7]
+method = "fixed"
+values = { target_lane_offset_synthetic = 0.5 }
+replacement_kind = "synthetic_neutral"
+
+[[patterns]]
+id = "P02_heading"
+description = "synthetic target-lane heading error to its explicit aligned 0.5"
+indices = [145]
+method = "fixed"
+values = { target_lane_heading_error_synthetic = 0.5 }
+replacement_kind = "synthetic_aligned"
+
+[[patterns]]
+id = "P03_offset_heading"
+description = "synthetic offset and heading pair, changed together"
+indices = [7, 145]
+method = "fixed"
+values = { target_lane_offset_synthetic = 0.5, target_lane_heading_error_synthetic = 0.5 }
+replacement_kind = "synthetic_pair"
+
+[[patterns]]
+id = "P04_lane_triplet"
+description = "synthetic offset, heading, and valid flag as one explicit triplet"
+indices = [7, 145, 260]
+method = "fixed"
+values = { target_lane_offset_synthetic = 0.5, target_lane_heading_error_synthetic = 0.5, target_lane_valid_synthetic = 1.0 }
+replacement_kind = "synthetic_triplet"

@@ -1,0 +1,17 @@
+{
+  "base_commit": "0184eb26509eb33997229d0aa99c0b8939ec6a1e",
+  "initial_head": "0184eb26509eb33997229d0aa99c0b8939ec6a1e",
+  "initial_branch": "input_attribution",
+  "initial_tracked_and_untracked_changes": false,
+  "scope": "Only additional input_attribution package and generated outputs; existing tracked files must remain unchanged.",
+  "verified_official_training_config_sha256": "385bfe6cf30c94e74ec90368d020e41857bf738c604688131a6220033eee909b",
+  "existing_environment_versions": {
+    "python": "3.12.3",
+    "numpy": "2.5.2",
+    "torch": "2.13.0",
+    "stable_baselines3": "2.9.0",
+    "metadrive": "0.4.3",
+    "captum": "not installed"
+  },
+  "reference_model_sha256": "254b19aea772480133e19eb5db68b0fb5e1bdadfa221890a68494c8eb5d513e6"
+}

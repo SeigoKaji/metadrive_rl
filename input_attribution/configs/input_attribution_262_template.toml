@@ -1,0 +1,112 @@
+# Portable unresolved template for a 262-dimensional port.
+# The three known semantic names below intentionally remain UNSET until the
+# target repository's observation-producing source is verified.  Do not infer
+# indices, neutral values, normalization, validity flags, or replacements from
+# the dimension or from the official 259 ordering.
+#
+# target_lane_offset: index=UNSET, neutral=UNSET, normalization=UNSET,
+#                    invalid_value=UNSET
+# target_lane_heading_error: index=UNSET, neutral=UNSET, normalization=UNSET,
+#                            invalid_value=UNSET
+# target_lane_valid: index=UNSET, neutral=UNSET, normalization=UNSET,
+#                    invalid_value=UNSET
+
+[analysis]
+name = "input_attribution_262_template"
+experiment = "custom_262_template"
+description = "Unresolved 262-dimensional schema template"
+deterministic = true
+individual_inputs = false
+
+[model]
+path = "../../models/custom_262_model.zip"
+name = "custom_262_model"
+format = "stable_baselines3_ppo_zip"
+device = "cpu"
+deterministic = true
+
+[adapter]
+module = "input_attribution.adapters.port_template"
+factory = "input_attribution.adapters.port_template.create_adapter"
+
+[schema]
+path = "../schemas/custom_262_template.json"
+name = "custom_262_template"
+dimension = 262
+template = true
+
+[environment]
+path = "../../configs/official.toml"
+
+[scenario]
+map = "C"
+seed = 5
+scenario_seed = 5
+rl_seed = 0
+horizon = 500
+traffic_density = 0
+episodes = 1
+
+[seeds]
+scenario_seed = 5
+rl_seed = 0
+intervention = 0
+
+[preprocess]
+name = "source_verification_required"
+# 学習時の外部正規化の有無を確認して、true または false に変更する。
+external_normalization = "UNSET"
+
+[output]
+root = "../../outputs/input_attribution"
+experiment = "custom_262_template"
+model = "custom_262_model"
+
+[closed_loop]
+enabled = false
+patterns = ["P00", "P01_offset", "P02_heading", "P03_offset_heading", "P04_lane_triplet"]
+episodes = 1
+
+[video]
+enabled = false
+
+[ig]
+enabled = false
+
+[[patterns]]
+id = "P00"
+description = "unchanged reference observation"
+indices = []
+method = "identity"
+
+# The target IDs below are semantic placeholders.  Keep indices empty until
+# the port source proves the real locations; values are intentionally omitted
+# so this template cannot invent a neutral or invalid representation.
+[[patterns]]
+id = "P01_offset"
+description = "target_lane_offset: fill source-verified integer index and replacement"
+indices = []
+method = "fixed"
+metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_offset"], skip_reason = "unresolved 262 schema" }
+
+[[patterns]]
+id = "P02_heading"
+description = "target_lane_heading_error: fill source-verified integer index and replacement"
+indices = []
+method = "fixed"
+metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_heading_error"], skip_reason = "unresolved 262 schema" }
+
+[[patterns]]
+id = "P03_offset_heading"
+description = "target_lane_offset + target_lane_heading_error: fill source-verified indices and replacements"
+indices = []
+method = "fixed"
+metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_offset", "target_lane_heading_error"], skip_reason = "unresolved 262 schema" }
+
+[[patterns]]
+id = "P04_lane_triplet"
+description = "target-lane offset, heading, valid flag from one compatible reference observation"
+indices = []
+method = "reference"
+reference_id = "episode-0:0"
+metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_offset", "target_lane_heading_error", "target_lane_valid"], skip_reason = "unresolved 262 schema" }

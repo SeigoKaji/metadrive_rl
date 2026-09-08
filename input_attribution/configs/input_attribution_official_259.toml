@@ -1,0 +1,147 @@
+# Portable analysis bundle for the source-verified MetaDrive 0.4.3 vector.
+# Put the matching PPO archive at the repository's models/official_baseline.zip or override
+# model.path in the caller's resolved configuration.  No VecNormalize or
+# VecFrameStack statistics are expected for this official model.
+
+[analysis]
+name = "input_attribution_official_259"
+experiment = "official_baseline_259"
+description = "MetaDrive official 259-dimensional vector attribution"
+deterministic = true
+
+[model]
+path = "../../models/official_baseline.zip"
+name = "official_baseline"
+format = "stable_baselines3_ppo_zip"
+device = "cpu"
+deterministic = true
+
+[adapter]
+module = "input_attribution.adapters.metadrive"
+factory = "input_attribution.adapters.metadrive.create_adapter"
+
+[schema]
+path = "../schemas/official_259.json"
+name = "metadrive_default_259"
+dimension = 259
+template = false
+
+[environment]
+path = "../../configs/official.toml"
+
+[scenario]
+map = "C"
+seed = 5
+scenario_seed = 5
+rl_seed = 0
+horizon = 500
+traffic_density = 0
+episodes = 1
+
+[seeds]
+scenario_seed = 5
+rl_seed = 0
+intervention = 0
+
+[preprocess]
+name = "sb3_vector_box_identity"
+external_normalization = false
+
+[output]
+root = "../../outputs/input_attribution"
+experiment = "official_baseline_259"
+model = "official_baseline"
+
+[closed_loop]
+enabled = true
+patterns = ["P00", "P02_heading_reference", "P04_current_lane_lateral_reference", "P05_navigation_reference", "P06_lidar_all_no_detection"]
+episodes = 1
+max_steps = 500
+
+[video]
+enabled = false
+
+[ig]
+enabled = false
+steps = 64
+baseline = "reference_observation"
+method = "riemann_trapezoid"
+
+[[patterns]]
+id = "P00"
+description = "unchanged reference observation"
+indices = []
+method = "identity"
+[[patterns]]
+id = "P01_road_boundaries_reference"
+description = "road-boundary pair from one saved reference observation"
+indices = [0, 1]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+
+[[patterns]]
+id = "P02_heading_reference"
+description = "reference replacement of index 2 heading-diff input"
+indices = [2]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+
+[[patterns]]
+id = "P03_speed_history_reference"
+description = "speed, current steering, previous steering/throttle and yaw-rate reference group"
+indices = [3, 4, 5, 6, 7]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+
+[[patterns]]
+id = "P04_current_lane_lateral_reference"
+description = "reference replacement of current-lane lateral position"
+indices = [8]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+
+[[patterns]]
+id = "P05_navigation_reference"
+description = "ten checkpoint/navigation inputs from one saved reference observation"
+indices = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+metadata = { coherent_curvature_groups = [[11, 12, 13], [16, 17, 18]] }
+[[patterns]]
+id = "P06_lidar_all_no_detection"
+description = "all 240 LiDAR values to the source-verified no-detection default 1.0"
+indices = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258]
+method = "fixed"
+replacement_kind = "verified_no_detection_default"
+[[patterns]]
+id = "P07_lidar_clockwise_0_90deg"
+description = "LiDAR indices 19..78, local clockwise angles 0..90 degrees"
+indices = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78]
+method = "fixed"
+replacement_kind = "verified_no_detection_default"
+
+[[patterns]]
+id = "P08_lidar_clockwise_90_180deg"
+description = "LiDAR indices 79..138, local clockwise angles 90..180 degrees"
+indices = [79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138]
+method = "fixed"
+replacement_kind = "verified_no_detection_default"
+
+[[patterns]]
+id = "P09_lidar_clockwise_180_270deg"
+description = "LiDAR indices 139..198, local clockwise angles 180..270 degrees"
+indices = [139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198]
+method = "fixed"
+replacement_kind = "verified_no_detection_default"
+
+[[patterns]]
+id = "P10_lidar_clockwise_270_360deg"
+description = "LiDAR indices 199..258, local clockwise angles 270..360 degrees"
+indices = [199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258]
+method = "fixed"
+replacement_kind = "verified_no_detection_default"
