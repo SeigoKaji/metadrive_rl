@@ -28,9 +28,6 @@ targets = ["selected_log_probability", "critic_value"]
 steps = 64
 batch_size = 128
 
-[aggregation]
-progress_bins = 3
-
 [closed_loop]
 enabled = true
 top_k_features = 10

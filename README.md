@@ -57,7 +57,7 @@ python3 -m venv .venv
 
 ## 入力寄与・入力依存度解析
 
-固定済み PPO `MlpPolicy` の vector observation に対して、baseline 置換による摂動依存度と Integrated Gradients (IG) を解析できます。学習、`evaluate.py`、MetaDrive 本体は変更しません。実験の目的・数式・設定変更箇所は [入力寄与解析ガイド](docs/input_attribution.md)、出力の絞り方と解釈例は [結果の読み方](docs/input_attribution_results.md)、259 次元 schema の成立条件は [観測スキーマの説明](observation_schemas/README.md)、262 次元環境への変更は [移植手順](docs/input_attribution_porting.md) を確認してください。
+固定済み PPO `MlpPolicy` の vector observation に対して、入力の一部を開始時の値へ差し替える解析ができます。まず [入力寄与解析の概要](docs/input_attribution_overview.md) で、MetaDrive の入力が何か、どう差し替え、3つの実験が何を判断するかを確認してください。実行後は root `report.md` の実験対応表と、実験03の通常走行・入力固定走行の4列（走らせ方、総報酬、完走、道路外への逸脱）を読むだけで結果を確認できます。詳しい指標・設定は [入力寄与解析ガイド](docs/input_attribution.md) と [結果の読み方](docs/input_attribution_results.md)、schema の成立条件は [観測スキーマの説明](observation_schemas/README.md)、別の観測次元への変更は [移植手順](docs/input_attribution_porting.md) を参照してください。
 
 ```bash
 .venv/bin/python analyze_input_attribution.py run \
@@ -65,10 +65,16 @@ python3 -m venv .venv
   --model models/official_baseline.zip \
   --schema observation_schemas/metadrive_default_259.toml \
   --analysis-config attribution_configs/official_left_curve.toml \
-  --output-prefix official_left_curve
+  --output-prefix official_left_curve_numbered
 ```
 
-成功した解析結果は `outputs/official/attribution/official_left_curve/` に、rollout、数値表、plot、`report.md` として保存されます。`analyze` は保存済み rollout の再解析だけを行うため MetaDrive を再起動しません。custom 262 次元版では `custom_262_template.toml` の unresolved placeholder を、確認済みの index・意味・group に置き換えた後に `validate-schema` を実行してください。
+compact の解析結果は `outputs/official/attribution/official_left_curve_numbered/` に、root `report.md`、実験01/02/03の各 `report.md` + `details.zip`、`shared/details.zip` として保存されます。ZIPを確認するときは4つすべてを同じ新しいrun rootへ展開します。個別の rollout、数値表、plot が必要な場合だけ `--output-mode full` を明示してください。`analyze` は保存済み rollout の再解析だけを行うため MetaDrive を再起動しません。custom 262 次元版では `custom_262_template.toml` の unresolved placeholder を、確認済みの index・意味・group に置き換えた後に `validate-schema` を実行してください。
+
+| 所属 | 目的 | 保存先 |
+| --- | --- | --- |
+| 実験01 入力置換（オフライン摂動） | JSDで入力置換による判断変化を測定し、実験03の候補を選ぶ | `experiment_01_perturbation/` |
+| 実験02 Integrated Gradients | 指定出力の変化を入力へ割り当てる。候補選択には使わない | `experiment_02_integrated_gradients/` |
+| 実験03 入力固定での走行比較 | 総報酬・完走・道路外への逸脱を通常走行と比較する | `experiment_03_closed_loop/` |
 
 ## configファイル
 

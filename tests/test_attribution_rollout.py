@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from input_attribution.rollout import collect_rollout, load_rollout, save_rollout
+from input_attribution.compact import finalize_result_directory
 
 
 class _Space:
@@ -92,3 +93,23 @@ def test_collector_saves_pre_action_copies_and_loads_standard_artifacts(tmp_path
     assert np.array_equal(loaded.log_probabilities, rollout.log_probabilities)
     assert np.array_equal(loaded.dones, rollout.dones)
     assert len(loaded.step_records) == 2
+
+
+def test_loader_resolves_numbered_shared_rollout_artifacts(tmp_path: Path) -> None:
+    rollout = collect_rollout(
+        env=_Env(),
+        adapter=_MutatingAdapter(),
+        model=None,
+        schema={"observation_dim": 2},
+        scenario_start=5,
+        scenario_count=1,
+        deterministic=True,
+        rl_seed=0,
+    )
+    save_rollout(tmp_path, rollout)
+    (tmp_path / "feature_schema_expanded.csv").write_text("index,name\n0,speed\n", encoding="utf-8")
+    finalize_result_directory(tmp_path, output_mode="full", result_kind="collect")
+
+    loaded = load_rollout(tmp_path)
+    assert np.array_equal(loaded.observations, rollout.observations)
+    assert (tmp_path / "shared" / "rollout_arrays.npz").is_file()

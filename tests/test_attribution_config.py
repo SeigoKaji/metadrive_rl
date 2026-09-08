@@ -20,7 +20,6 @@ def test_official_analysis_config_loads_with_expected_defaults() -> None:
     assert config.baseline.strategy == "episode_start"
     assert config.perturbation.lidar_sector_degrees == 15.0
     assert config.integrated_gradients.steps == 64
-    assert config.aggregation.progress_bins == 3
     assert config.closed_loop.enabled is True
     assert config.source_sha256 is not None
 

@@ -27,6 +27,7 @@ from evaluation_visualization import (
     read_runtime_road_metrics,
 )
 
+from .artifact_layout import ArtifactLayoutError, resolve_artifact
 from .results import (
     ArtifactError,
     atomic_write_json,
@@ -651,9 +652,12 @@ def load_rollout(run_directory: Path) -> RolloutData:
 
     if run_directory.is_symlink() or not run_directory.is_dir():
         raise RolloutError(f"rollout directory must be a regular directory: {run_directory}")
-    arrays_path = run_directory / "rollout_arrays.npz"
-    steps_path = run_directory / "rollout_steps.jsonl"
-    metadata_path = run_directory / "rollout_metadata.json"
+    try:
+        arrays_path = resolve_artifact(run_directory, "rollout_arrays.npz")
+        steps_path = resolve_artifact(run_directory, "rollout_steps.jsonl")
+        metadata_path = resolve_artifact(run_directory, "rollout_metadata.json")
+    except ArtifactLayoutError as error:
+        raise RolloutError(str(error)) from error
     for path in (arrays_path, steps_path, metadata_path):
         if path.is_symlink() or not path.is_file():
             raise RolloutError(f"rollout artifact is missing or unsafe: {path}")

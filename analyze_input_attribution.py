@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import is_dataclass
 from datetime import datetime, timezone
 import importlib
 import importlib.metadata
@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from configs.experiment_config import ExperimentConfigError, select_experiment
+from input_attribution.artifact_layout import ArtifactLayoutError, resolve_artifact
 from input_attribution.closed_loop import (
     ClosedLoopResult,
     ClosedLoopTarget,
@@ -30,6 +31,11 @@ from input_attribution.closed_loop import (
     run_paired_closed_loop,
     save_closed_loop,
     schema_targets,
+)
+from input_attribution.compact import (
+    CompactError,
+    compact_existing_result,
+    finalize_result_directory,
 )
 from input_attribution.results import (
     ArtifactError,
@@ -99,6 +105,7 @@ def _add_runtime_arguments(
     *,
     require_analysis_config: bool,
     require_output_prefix: bool,
+    include_output_mode: bool = False,
 ) -> None:
     parser.add_argument(
         "--config",
@@ -132,6 +139,13 @@ def _add_runtime_arguments(
             required=True,
             help="safe basename below outputs/<experiment>/attribution",
         )
+    if include_output_mode:
+        parser.add_argument(
+            "--output-mode",
+            choices=("full", "compact"),
+            default="compact",
+            help="output layout: compact (default) publishes report.md + details.zip; full keeps individual artifacts",
+        )
     parser.add_argument(
         "--device",
         default=None,
@@ -157,7 +171,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = subcommands.add_parser(
         "run", help="collect, analyze, plot, and optionally validate closed loop", allow_abbrev=False
     )
-    _add_runtime_arguments(run, require_analysis_config=True, require_output_prefix=True)
+    _add_runtime_arguments(
+        run,
+        require_analysis_config=True,
+        require_output_prefix=True,
+        include_output_mode=True,
+    )
     run.add_argument(
         "--closed-loop",
         action=argparse.BooleanOptionalAction,
@@ -173,7 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
     analyze = subcommands.add_parser(
         "analyze", help="analyze a saved rollout without starting MetaDrive", allow_abbrev=False
     )
-    _add_runtime_arguments(analyze, require_analysis_config=True, require_output_prefix=True)
+    _add_runtime_arguments(
+        analyze,
+        require_analysis_config=True,
+        require_output_prefix=True,
+        include_output_mode=True,
+    )
     analyze.add_argument(
         "--rollout",
         type=Path,
@@ -190,7 +214,12 @@ def build_parser() -> argparse.ArgumentParser:
     closed_loop = subcommands.add_parser(
         "closed-loop", help="run explicitly selected paired interventions", allow_abbrev=False
     )
-    _add_runtime_arguments(closed_loop, require_analysis_config=True, require_output_prefix=True)
+    _add_runtime_arguments(
+        closed_loop,
+        require_analysis_config=True,
+        require_output_prefix=True,
+        include_output_mode=True,
+    )
     closed_loop.add_argument(
         "--feature",
         action="append",
@@ -208,6 +237,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="optional saved rollout, required by dataset_median_constant",
+    )
+
+    compact = subcommands.add_parser(
+        "compact",
+        help="package an existing full result as report.md + details.zip",
+        allow_abbrev=False,
+    )
+    compact.add_argument(
+        "--results",
+        type=Path,
+        required=True,
+        help="full result directory (not an already compact result)",
+    )
+    compact.add_argument(
+        "--output-prefix",
+        type=_output_prefix,
+        required=True,
+        help="new safe sibling directory name next to --results",
     )
 
     validate = subcommands.add_parser(
@@ -316,6 +363,8 @@ def _metadata(
     baseline_metadata: Mapping[str, Any] | None = None,
     closed_loop_targets: Sequence[str] = (),
     closed_loop_provenance: Mapping[str, Any] | None = None,
+    perturbation_executed: bool | None = None,
+    integrated_gradients_executed: bool | None = None,
 ) -> dict[str, Any]:
     experiment = runtime["experiment"]
     schema = runtime["schema"]
@@ -374,16 +423,19 @@ def _metadata(
         result.update(
             {
                 "integrated_gradients": {
+                    "enabled": bool(analysis.integrated_gradients.enabled),
+                    "executed": integrated_gradients_executed,
                     "targets": list(analysis.integrated_gradients.targets),
                     "steps": analysis.integrated_gradients.steps,
                     "batch_size": analysis.integrated_gradients.batch_size,
                 },
                 "perturbation": {
+                    "enabled": bool(analysis.perturbation.enabled),
+                    "executed": perturbation_executed,
                     "batch_size": analysis.perturbation.batch_size,
                     "lidar_sector_degrees": analysis.perturbation.lidar_sector_degrees,
                     "definition": "baseline replacement; JS divergence is the primary actor metric",
                 },
-                "phases": [json_value(asdict(phase)) for phase in analysis.phases],
             }
         )
     return result
@@ -551,10 +603,15 @@ def _assert_offline_rollout_provenance(
 def _source_rollout_record(path: Path, rollout: RolloutData) -> dict[str, Any]:
     """Record the exact saved rollout metadata used as a closed-loop reference."""
 
-    metadata_path = path / "rollout_metadata.json"
+    try:
+        metadata_path = resolve_artifact(path, "rollout_metadata.json")
+    except ArtifactLayoutError as error:
+        raise AttributionCLIError(str(error)) from error
+    root = path.expanduser().resolve()
     return {
         "path": str(path),
         "metadata_path": str(metadata_path),
+        "metadata_relative_path": str(metadata_path.relative_to(root)),
         "metadata_sha256": sha256_file(metadata_path),
         "metadata": json_value(dict(rollout.metadata)),
         "row_count": rollout.row_count,
@@ -664,11 +721,19 @@ def _run_in_staging(
     runtime: Mapping[str, Any],
     prefix: str,
     callback: Callable[[Path], Any],
+    *,
+    output_mode: str = "compact",
+    result_kind: str = "analysis",
 ) -> tuple[Path, Any]:
     target = _run_directory(runtime["experiment"].name, prefix)
     holder = StagedRunDirectory(target)
     with holder as staging:
         result = callback(staging)
+        finalize_result_directory(
+            staging,
+            output_mode=output_mode,
+            result_kind=result_kind,
+        )
         published = holder.publish()
     return published, result
 
@@ -865,9 +930,6 @@ def _ig_rows_for_target(
 def _write_perturbation_artifacts(
     directory: Path,
     result: Any | None,
-    *,
-    rollout: RolloutData,
-    analysis: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], np.ndarray | None]:
     steps_path = safe_child(directory, "perturbation_feature_steps.npz")
     feature_path = safe_child(directory, "perturbation_feature_summary.csv")
@@ -892,10 +954,6 @@ def _write_perturbation_artifacts(
 
     summary = summarize_perturbation(
         result,
-        episode_ids=rollout.episode_ids,
-        steps=rollout.steps,
-        progress_bins=analysis.aggregation.progress_bins,
-        phases=analysis.phases,
         include_baseline_rows=False,
     )
     feature_rows = _table_rows(perturbation_feature_summary(summary))
@@ -922,7 +980,6 @@ def _write_ig_artifacts(
     result: Any | None,
     schema: Any,
     *,
-    rollout: RolloutData,
     analysis: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], np.ndarray | None]:
     archive_path = safe_child(directory, "ig_attributions.npz")
@@ -947,10 +1004,6 @@ def _write_ig_artifacts(
     summaries = summarize_integrated_gradients(
         result,
         schema,
-        episode_ids=rollout.episode_ids,
-        steps=rollout.steps,
-        progress_bins=analysis.aggregation.progress_bins,
-        phases=analysis.phases,
         include_baseline_rows=False,
         lidar_sector_degrees=analysis.perturbation.lidar_sector_degrees,
     )
@@ -1551,14 +1604,11 @@ def _analyze_rollout(
     perturbation_features, perturbation_groups, perturbation_matrix = _write_perturbation_artifacts(
         directory,
         perturbation_result,
-        rollout=rollout,
-        analysis=analysis,
     )
     ig_features, ig_groups, completeness, ig_matrix = _write_ig_artifacts(
         directory,
         ig_result,
         schema,
-        rollout=rollout,
         analysis=analysis,
     )
 
@@ -1697,11 +1747,19 @@ def _collect_command(args: argparse.Namespace) -> Path:
                 started_at=started_at,
                 finished_at=utc_now_iso(),
                 runtime_contract=rollout.metadata.get("runtime_contract", {}),
+                perturbation_executed=False,
+                integrated_gradients_executed=False,
             ),
         )
         write_expanded_schema_csv(safe_child(directory, "feature_schema_expanded.csv"), runtime["schema"])
 
-    published, _result = _run_in_staging(runtime, args.output_prefix, build)
+    published, _result = _run_in_staging(
+        runtime,
+        args.output_prefix,
+        build,
+        output_mode="full",
+        result_kind="collect",
+    )
     return published
 
 
@@ -1758,6 +1816,8 @@ def _run_command(args: argparse.Namespace) -> Path:
                 else [row["target_name"] for row in artifacts["closed_loop"].summary_rows]
             ),
             closed_loop_provenance=artifacts["closed_loop_provenance"],
+            perturbation_executed=artifacts["perturbation"] is not None,
+            integrated_gradients_executed=artifacts["ig"] is not None,
         )
         atomic_write_json(safe_child(directory, "analysis_metadata.json"), metadata)
         # Re-write rollout metadata with run provenance after all analysis
@@ -1775,8 +1835,12 @@ def _run_command(args: argparse.Namespace) -> Path:
                 closed_loop=artifacts["closed_loop"],
             ),
         )
-
-    published, _result = _run_in_staging(runtime, args.output_prefix, build)
+    published, _result = _run_in_staging(
+        runtime,
+        args.output_prefix,
+        build,
+        output_mode=getattr(args, "output_mode", "compact"),
+    )
     return published
 
 
@@ -1808,6 +1872,8 @@ def _analyze_command(args: argparse.Namespace) -> Path:
             finished_at=utc_now_iso(),
             runtime_contract=rollout.metadata.get("runtime_contract", {}),
             baseline_metadata=artifacts["baselines"].metadata,
+            perturbation_executed=artifacts["perturbation"] is not None,
+            integrated_gradients_executed=artifacts["ig"] is not None,
         )
         metadata["offline_source_rollout"] = str(rollout_directory)
         metadata["offline_source_rollout_metadata"] = json_value(dict(rollout.metadata))
@@ -1825,8 +1891,12 @@ def _analyze_command(args: argparse.Namespace) -> Path:
                 closed_loop=None,
             ),
         )
-
-    published, _result = _run_in_staging(runtime, args.output_prefix, build)
+    published, _result = _run_in_staging(
+        runtime,
+        args.output_prefix,
+        build,
+        output_mode=getattr(args, "output_mode", "compact"),
+    )
     return published
 
 
@@ -1933,6 +2003,8 @@ def _closed_loop_command(args: argparse.Namespace) -> Path:
             baseline_metadata=replacement_provenance,
             closed_loop_targets=[target.name for target in targets],
             closed_loop_provenance=replacement_provenance,
+            perturbation_executed=False,
+            integrated_gradients_executed=False,
         )
         atomic_write_json(safe_child(directory, "analysis_metadata.json"), metadata)
         write_report(
@@ -1947,8 +2019,39 @@ def _closed_loop_command(args: argparse.Namespace) -> Path:
                 closed_loop=result,
             ),
         )
+    published, _result = _run_in_staging(
+        runtime,
+        args.output_prefix,
+        build,
+        output_mode=getattr(args, "output_mode", "compact"),
+    )
+    return published
 
-    published, _result = _run_in_staging(runtime, args.output_prefix, build)
+
+def _compact_command(args: argparse.Namespace) -> Path:
+    """Create a compact sibling from a full result without runtime loading."""
+
+    source = _resolve_project_path(args.results)
+    if (source / "details.zip").exists():
+        raise CompactError(
+            "compact input already contains details.zip; extract the full result archive "
+            "into a new directory and retry"
+        )
+    source_resolved = source.expanduser().resolve()
+    target = source_resolved.parent / args.output_prefix
+    target_resolved = target.expanduser().resolve()
+    if (
+        source_resolved == target_resolved
+        or source_resolved in target_resolved.parents
+        or target_resolved in source_resolved.parents
+    ):
+        raise CompactError(
+            "compact source and destination must be separate paths; choose a new output prefix"
+        )
+    holder = StagedRunDirectory(target)
+    with holder as staging:
+        compact_existing_result(source, staging)
+        published = holder.publish()
     return published
 
 
@@ -1995,6 +2098,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "schema-template":
             print(_schema_template_command(args))
             return 0
+        if args.command == "compact":
+            print(_compact_command(args))
+            return 0
         if args.command == "validate-schema":
             return _validate_schema_command(args)
         if args.command == "collect":
@@ -2010,7 +2116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(_closed_loop_command(args))
             return 0
         raise AssertionError(f"unhandled command: {args.command}")
-    except (AttributionCLIError, ArtifactError, RolloutError, OSError, ValueError) as error:
+    except (AttributionCLIError, ArtifactError, CompactError, RolloutError, OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

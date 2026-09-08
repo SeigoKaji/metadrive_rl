@@ -15,14 +15,12 @@ import torch
 
 import analyze_input_attribution as cli
 from input_attribution.config import (
-    AggregationConfig,
     AnalysisConfig,
     BaselineConfig,
     ClosedLoopConfig,
     CollectionConfig,
     IntegratedGradientsConfig,
     PerturbationConfig,
-    PhaseConfig,
     RunConfig,
 )
 from input_attribution.closed_loop import ClosedLoopResult
@@ -168,14 +166,12 @@ def _toy_analysis_config() -> AnalysisConfig:
             steps=2,
             batch_size=8,
         ),
-        aggregation=AggregationConfig(progress_bins=2),
         closed_loop=ClosedLoopConfig(
             enabled=False,
             top_k_features=0,
             top_k_groups=0,
             replacement_strategy="episode_start_constant",
         ),
-        phases=(PhaseConfig("later", start_step=2, end_step=3),),
     )
 
 
@@ -260,13 +256,6 @@ def test_closed_loop_top_k_uses_perturbation_js_and_preserves_lidar_sector_indic
             "target_id": "feature:high_js_feature",
             "mean_js_divergence": 0.9,
             "mean_absolute_ig": 0.0,
-        },
-        {
-            "scope": "episode",
-            "baseline_scope": "mean_over_baselines",
-            "target_kind": "feature",
-            "target_id": "feature:low_js_feature",
-            "mean_js_divergence": 100.0,
         },
     )
     group_rows = (
@@ -757,7 +746,7 @@ def test_report_lists_the_scalar_function_for_each_configured_ig_target() -> Non
     assert "F(z) = V(z)" in report
 
 
-def test_offline_analysis_writes_temporal_aggregation_and_standard_artifacts(
+def test_offline_analysis_writes_global_aggregation_and_standard_artifacts(
     tmp_path: Path,
 ) -> None:
     os.environ["MPLCONFIGDIR"] = str(tmp_path / "mpl")
@@ -783,8 +772,8 @@ def test_offline_analysis_writes_temporal_aggregation_and_standard_artifacts(
     )
 
     scopes = {row["scope"] for row in artifacts["ig_features"]}
-    assert {"full_episode", "episode", "progress_bin", "phase"}.issubset(scopes)
-    assert {row["scope"] for row in artifacts["perturbation_features"]} >= scopes
+    assert scopes == {"full_episode"}
+    assert {row["scope"] for row in artifacts["perturbation_features"]} == scopes
     assert artifacts["overview_ig_target"] == "selected_log_probability"
     assert {
         row["target"] for row in artifacts["overview_ig_features"]

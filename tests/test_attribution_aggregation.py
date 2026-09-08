@@ -1,4 +1,4 @@
-"""DataFrame aggregation tests for temporal perturbation and IG summaries."""
+"""DataFrame aggregation tests for global perturbation and IG summaries."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from input_attribution.aggregation import (
     summarize_integrated_gradients,
     summarize_perturbation,
 )
-from input_attribution.config import PhaseConfig
 from input_attribution.integrated_gradients import IntegratedGradientsResult
 from input_attribution.perturbation import PerturbationResult, PerturbationTarget
 from input_attribution.schema import Feature, ObservationSchema
@@ -114,18 +113,14 @@ def _lidar_ig_result() -> IntegratedGradientsResult:
     )
 
 
-def test_perturbation_summary_includes_full_episode_progress_and_phase_statistics() -> None:
+def test_perturbation_summary_aggregates_all_rollout_samples() -> None:
     summary = summarize_perturbation(
         _perturbation_result(),
-        episode_ids=np.array([0, 0, 1, 1]),
-        steps=np.array([0, 1, 0, 1]),
-        progress_bins=2,
-        phases=(PhaseConfig("second_step", start_step=1, end_step=2),),
     )
 
-    assert {"full_episode", "episode", "progress_bin", "phase"}.issubset(
-        set(summary["scope"])
-    )
+    assert set(summary["scope"]) == {"full_episode"}
+    assert set(summary["slice_name"]) == {"all"}
+    assert len(summary) == 2
     full_feature = summary.loc[
         (summary["scope"] == "full_episode")
         & (summary["target_name"] == "a")
@@ -137,31 +132,11 @@ def test_perturbation_summary_includes_full_episode_progress_and_phase_statistic
     assert "mean_absolute_value_delta" in summary.columns
 
 
-def test_normalized_progress_phase_ending_at_one_includes_final_decision() -> None:
-    summary = summarize_perturbation(
-        _perturbation_result(),
-        episode_ids=np.array([0, 0, 1, 1]),
-        steps=np.array([0, 1, 0, 1]),
-        progress_bins=2,
-        phases=(PhaseConfig("whole", start_progress=0.0, end_progress=1.0),),
-    )
-
-    whole_feature = summary.loc[
-        (summary["scope"] == "phase")
-        & (summary["phase"] == "whole")
-        & (summary["target_name"] == "a")
-    ].iloc[0]
-    assert whole_feature["count"] == 4
-
-
 def test_ig_feature_and_group_signed_sum_are_distinct_from_absolute_mass() -> None:
     result = _ig_result()
     summaries = summarize_integrated_gradients(
         result,
         _schema(),
-        episode_ids=np.array([0, 0]),
-        steps=np.array([0, 1]),
-        progress_bins=2,
     )
     features = summaries.feature_summary
     groups = summaries.group_summary

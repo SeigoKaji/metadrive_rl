@@ -7,7 +7,7 @@ without changing the training/evaluation configuration parser.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import io
@@ -97,13 +97,6 @@ class IntegratedGradientsConfig:
     batch_size: int
 
 
-@dataclass(frozen=True, slots=True)
-class AggregationConfig:
-    """Settings for temporal/result aggregation."""
-
-    progress_bins: int
-
-
 FeatureSelector: TypeAlias = str | int
 
 
@@ -120,23 +113,6 @@ class ClosedLoopConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class PhaseConfig:
-    """A named interval expressed in steps or normalized episode progress."""
-
-    name: str
-    start_step: int | None = None
-    end_step: int | None = None
-    start_progress: float | None = None
-    end_progress: float | None = None
-
-    @property
-    def uses_steps(self) -> bool:
-        """Whether this phase is defined using decision-step numbers."""
-
-        return self.start_step is not None
-
-
-@dataclass(frozen=True, slots=True)
 class AnalysisConfig:
     """Fully validated attribution configuration with source provenance."""
 
@@ -147,9 +123,7 @@ class AnalysisConfig:
     baseline: BaselineConfig
     perturbation: PerturbationConfig
     integrated_gradients: IntegratedGradientsConfig
-    aggregation: AggregationConfig
     closed_loop: ClosedLoopConfig
-    phases: tuple[PhaseConfig, ...] = ()
     source_path: Path | None = None
     source_sha256: str | None = None
 
@@ -163,9 +137,7 @@ _ROOT_KEYS: Final[frozenset[str]] = frozenset(
         "baseline",
         "perturbation",
         "integrated_gradients",
-        "aggregation",
         "closed_loop",
-        "phases",
     }
 )
 _RUN_KEYS: Final[frozenset[str]] = frozenset(
@@ -197,7 +169,6 @@ _PERTURBATION_KEYS: Final[frozenset[str]] = frozenset(
 _IG_KEYS: Final[frozenset[str]] = frozenset(
     {"enabled", "targets", "steps", "batch_size"}
 )
-_AGGREGATION_KEYS: Final[frozenset[str]] = frozenset({"progress_bins"})
 _CLOSED_LOOP_KEYS: Final[frozenset[str]] = frozenset(
     {
         "enabled",
@@ -210,17 +181,6 @@ _CLOSED_LOOP_KEYS: Final[frozenset[str]] = frozenset(
         # same unambiguous canonical fields above.
         "features",
         "groups",
-    }
-)
-_PHASE_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "name",
-        "start_step",
-        "end_step",
-        "start_progress",
-        "end_progress",
-        "start_normalized_progress",
-        "end_normalized_progress",
     }
 )
 _BASELINE_STRATEGIES: Final[frozenset[str]] = frozenset(
@@ -520,17 +480,6 @@ def _parse_ig(table: Mapping[str, object]) -> IntegratedGradientsConfig:
     )
 
 
-def _parse_aggregation(table: Mapping[str, object]) -> AggregationConfig:
-    _reject_unknown(table, _AGGREGATION_KEYS, "aggregation")
-    return AggregationConfig(
-        progress_bins=_require_int(
-            _require_key(table, "progress_bins", "aggregation"),
-            "aggregation.progress_bins",
-            minimum=1,
-        )
-    )
-
-
 def _parse_feature_selectors(value: object, location: str) -> tuple[FeatureSelector, ...]:
     selectors: list[FeatureSelector] = []
     for index, item in enumerate(_require_list(value, location)):
@@ -583,55 +532,6 @@ def _parse_closed_loop(table: Mapping[str, object]) -> ClosedLoopConfig:
     )
 
 
-def _one_of(table: Mapping[str, object], first: str, second: str, location: str) -> object:
-    if first in table and second in table:
-        raise _error(location, f"{first}と{second}を同時に指定できません")
-    if first in table:
-        return table[first]
-    if second in table:
-        return table[second]
-    raise _error(location, f"{first}/{second}のいずれかを指定してください")
-
-
-def _parse_phases(value: object) -> tuple[PhaseConfig, ...]:
-    phases: list[PhaseConfig] = []
-    for index, item in enumerate(_require_list(value, "phases")):
-        location = f"phases[{index}]"
-        phase = _table(item, location)
-        _reject_unknown(phase, _PHASE_KEYS, location)
-        name = _require_string(_require_key(phase, "name", location), f"{location}.name")
-        step_keys = {"start_step", "end_step"}.intersection(phase)
-        progress_keys = {
-            "start_progress",
-            "end_progress",
-            "start_normalized_progress",
-            "end_normalized_progress",
-        }.intersection(phase)
-        if step_keys and progress_keys:
-            raise _error(location, "step指定とnormalized progress指定を混在できません")
-        if step_keys:
-            if step_keys != {"start_step", "end_step"}:
-                raise _error(location, "start_stepとend_stepを両方指定してください")
-            start_step = _require_int(phase["start_step"], f"{location}.start_step", minimum=0)
-            end_step = _require_int(phase["end_step"], f"{location}.end_step", minimum=0)
-            if end_step <= start_step:
-                raise _error(location, "end_stepはstart_stepより大きくしてください")
-            phases.append(PhaseConfig(name=name, start_step=start_step, end_step=end_step))
-            continue
-        start_progress = _one_of(
-            phase, "start_progress", "start_normalized_progress", location
-        )
-        end_progress = _one_of(phase, "end_progress", "end_normalized_progress", location)
-        start = _require_real(start_progress, f"{location}.start_progress", minimum=0.0, maximum=1.0)
-        end = _require_real(end_progress, f"{location}.end_progress", minimum=0.0, maximum=1.0)
-        if end <= start:
-            raise _error(location, "end_progressはstart_progressより大きくしてください")
-        phases.append(PhaseConfig(name=name, start_progress=start, end_progress=end))
-    if len({phase.name for phase in phases}) != len(phases):
-        raise _error("phases", "phase名を重複指定できません")
-    return tuple(phases)
-
-
 def load_analysis_config(path: str | Path) -> AnalysisConfig:
     """Load a strict, self-contained attribution analysis TOML.
 
@@ -659,7 +559,6 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
     if schema_version != 1:
         raise _error("schema_version", "現在対応しているversionは1です")
     name = _require_string(_require_key(root, "name", "root"), "name")
-    phases = _parse_phases(root["phases"]) if "phases" in root else ()
     return AnalysisConfig(
         schema_version=schema_version,
         name=name,
@@ -668,9 +567,7 @@ def load_analysis_config(path: str | Path) -> AnalysisConfig:
         baseline=_parse_baseline(_required_table(root, "baseline"), source_path),
         perturbation=_parse_perturbation(_required_table(root, "perturbation")),
         integrated_gradients=_parse_ig(_required_table(root, "integrated_gradients")),
-        aggregation=_parse_aggregation(_required_table(root, "aggregation")),
         closed_loop=_parse_closed_loop(_required_table(root, "closed_loop")),
-        phases=phases,
         source_path=source_path,
         source_sha256=hashlib.sha256(source).hexdigest(),
     )

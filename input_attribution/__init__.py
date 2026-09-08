@@ -15,7 +15,6 @@ from .aggregation import (
 )
 from .baselines import BaselineError, BaselineProvider, ResolvedBaselines
 from .config import (
-    AggregationConfig,
     AnalysisConfig,
     AnalysisConfigError,
     BaselineConfig,
@@ -24,7 +23,6 @@ from .config import (
     CollectionConfig,
     IntegratedGradientsConfig,
     PerturbationConfig,
-    PhaseConfig,
     RunConfig,
     load_analysis_config,
 )
@@ -70,7 +68,6 @@ from .schema import (
 
 
 __all__ = [
-    "AggregationConfig",
     "AggregationError",
     "AnalysisConfig",
     "AnalysisConfigError",
@@ -92,7 +89,6 @@ __all__ = [
     "PerturbationError",
     "PerturbationResult",
     "PerturbationTarget",
-    "PhaseConfig",
     "PolicyAdapter",
     "PolicyAdapterError",
     "PolicyEvaluation",
