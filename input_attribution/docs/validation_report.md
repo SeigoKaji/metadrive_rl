@@ -1,159 +1,140 @@
-# 実装・検証記録
+# 検証レポート（revision 実走行証拠）
 
-この文書は実際に実行した検証と、移植先で残る確認を分けて記録します。合成方策・fake環境の結果をMetaDrive車両の性能として扱いません。
+この文書は、revision 後の合成検証と実 MetaDrive 259 走行の証拠を分けて記録します。A reuse 子 run、子 run の fresh B 再走行、新旧 report の生成と成果物・保護監査は完了しました。移植用 zip は所定の出力先へ生成するコマンドを記録し、実 262、Windows、Captum、動画 frame の実環境確認は未確認として残します。1 episode の値を全場面の一般的な性能や入力重要度へ拡張しません。
 
-## 変更境界
+実行の成立境界も分けます。モデル・adapter・環境の作成、run 全体の reset、要求 seed の適用と readback など、全 pattern に共通する初期化が失敗した場合は run 全体を無効とします。共通初期化が成立した後の pattern 内で intervention、policy inference、Action decode、`env.step()`、または pattern 固有 telemetry に失敗した場合は、その pattern に `aborted` と理由・途中件数を保存し、他 pattern の実行と run の診断を継続します。pattern の abort を run 全体の success や失敗隠しに変換しません。
 
-開始時HEADは `0184eb26509eb33997229d0aa99c0b8939ec6a1e`、ブランチは `input_attribution`、開始時作業ツリーに変更はありませんでした。追加フォルダは `input_attribution/` です。既存の学習・評価・環境生成・設定・requirements・テストを編集せず、MetaDrive本体とインストール済みライブラリを編集していません。モデルを複製・再学習していません。
+## 実行対象と固定モデル
 
-## 実行環境とモデル
+- 対象ブランチ: `input_attribution`
+- 実走行用 Python: `/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3`
+- 報告対象モデル: `/home/seigo/workspace/metadrive_rl/metadrive-rl-input-attribution/models/official_baseline.zip`
+- 報告対象モデル SHA256: `0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`
+- 新 259 設定: `input_attribution/configs/input_attribution_official_259_variants.toml`
+- 旧条件を凍結した設定: `input_attribution/configs/input_attribution_official_259_legacy_freeze.toml`
+- 新 full run: `outputs/input_attribution/official_baseline_259_typed_variants/official_baseline/20260908T220014Z-e7425ea0`
+- 実走行 evidence: `outputs/input_attribution_revision_validation/new_real_evidence.json`
+- 実走行 manifest model SHA256: `0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`
+- 実走行 manifest schema semantics SHA256: `b32e08e797f7c7d5a7d4a3fc989e955e820936130c69e6b6e732f270a30a172b`
+- 実走行 manifest preprocess SHA256: `5486d5d3c281145521c358bf42b439fc3fe29997b6bb2a95a333242469b27dff`
+- A reuse child: `outputs/input_attribution/official_baseline_259_typed_variants/official_baseline/20260908T224736Z-75bdb5bb`
+- A reuse analysis: `01_offline/20260908T224736Z-374ab9b9`（success / 286 patterns）
+- A reuse child fresh B stage: `02_closed_loop/20260908T225123Z-1de748bb`（success / 15 patterns）
+- A reuse log: `outputs/input_attribution_revision_validation/saved_reference_reuse.log`
+- 新 report output: `outputs/input_attribution_revision_validation/reused_run_report`（exit 0、成果物監査 PASS）
+- 旧 report output: `outputs/input_attribution_revision_validation/legacy_report_final`（exit 0、成果物・保護監査 PASS）
+- report audit: `outputs/input_attribution_revision_validation/artifact_checks.json` / `artifact_checks.log`
 
-- Python 3.12.3、NumPy 2.5.2、PyTorch 2.13.0、Stable-Baselines3 2.9.0、MetaDrive 0.4.3、Gymnasium 1.3.0。
-- 使用した既存Python: `../metadrive_rl-main/.venv/bin/python3`。
-- 既存モデル: `../metadrive_rl-main/models/official_baseline.zip`。
-- モデルSHA256: `254b19aea772480133e19eb5db68b0fb5e1bdadfa221890a68494c8eb5d513e6`。
-- 学習記録と現在の `configs/official.toml` のSHA256が一致: `385bfe6cf30c94e74ec90368d020e41857bf738c604688131a6220033eee909b`。
-- 実観測259次元float32、単一Discrete(9)、学習時のBox観測前処理、外部VecNormalizeなしを確認。
-- 公式接続では観測・行動に関係するMetaDriveの6ソースのbyte hashと、全259 indexの意味対応を照合します。導入版が異なる場合に次元数だけで受け入れません。
+モデル、保存済み通常観測、前処理統計、adapter source の hash は run の manifest に保存し、再利用時に照合します。report の `--output-dir` は旧 run の status、manifest、生データを変更せず、指定先にだけ report を書き出します。`offline --run-dir PARENT --config NEW` は親の sealed reference をコピーした新しい A 専用子 run を作り、親の条件と入力意味・順序・前処理が一致しない場合は子 run を作らず拒否します。
 
-## 任意IGの依存
+## 実走行で確認した項目
 
-通常のPython環境にはCaptumを追加していません。通常環境で主工程を実行し、Captumがない場合のIG失敗が主結果を破損しないことをテストしています。
-
-Captum 0.9.0は依存を更新せず一時wheelとして取得し、そのwheelだけを一時的な `PYTHONPATH` で参照して検証しました。wheel SHA256は `cda38e1d42c37591d71560bb2f5813ac4cae8d8543afac45279c7efd5945997e` です。線形の既知IG、非線形の既知積分、経路途中のargmax変化でも説明対象actionが固定されること、カテゴリの固定、completeness、重み不変・直接API契約の8テストを実行しました。
-
-## 262次元の検証範囲
-
-実機262次元のモデル・観測生成実装は手元にありません。実機262次元で検証済みとはしていません。fake262では追加3特徴をindex `7, 145, 260` に明示的に置き、別フォルダへコピーしたパッケージからcheck・収集・全入力①-A・指定①-B・レポートまで実行するテストを用意しています。
-
-移植先では解析TOML、`adapters/port_template.py` を基にした接続、入力スキーマを編集します。追加3特徴のindex、符号、正規化、無効値、参照更新規則と、残りの全入力の順序を既存ソースで確認してください。外部正規化の有無も未設定から明示します。未解決テンプレートは実行前に停止します。
-
-## 再実行
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tests input_attribution/tests -q -p no:cacheprovider
-python3 -m input_attribution check --config outputs/input_attribution_validation/official_validated_config.json --probe --probe-steps 3
-python3 -m input_attribution run --config outputs/input_attribution_validation/official_validated_config.json
-python3 -m input_attribution.pack --source-root . --output outputs/input_attribution_portable.zip
-```
-
-`official_validated_config.json` はこのPCの既存モデル・学習時設定を絶対パスで参照する実測用設定です。移植ZIPには実験出力とモデルを含めず、汎用の解析設定を `input_attribution/configs/` に同梱します。
-
-## 新規ファイル一覧と責務
-
-CLI/事前チェック: `cli.py`, `config.py`, `checks.py`。入力意味と置換: `schema.py`, `interventions.py`, `schemas/`, `configs/`。保存・比較: `artifacts.py`, `collection.py`, `offline.py`, `closed_loop.py`, `trajectory_metrics.py`, `metrics.py`, `policy.py`。任意IG: `integrated_gradients.py`, `requirements-ig.txt`。環境接続: `adapters/`。表示・移植: `reporting.py`, `pack.py`, `PORTABLE_FILES.txt`, `docs/`。検証: `tests/`。
+親担当が実行した新 full run は以下の状態で完了しています。
 
 ```text
-input_attribution/PORTABLE_FILES.txt
-input_attribution/__init__.py
-input_attribution/__main__.py
-input_attribution/adapters/__init__.py
-input_attribution/adapters/fake.py
-input_attribution/adapters/fixtures.py
-input_attribution/adapters/metadrive.py
-input_attribution/adapters/port_template.py
-input_attribution/artifacts.py
-input_attribution/checks.py
-input_attribution/cli.py
-input_attribution/closed_loop.py
-input_attribution/collection.py
-input_attribution/config.py
-input_attribution/configs/fake_259.toml
-input_attribution/configs/fake_262_resolved.toml
-input_attribution/configs/input_attribution_262_template.toml
-input_attribution/configs/input_attribution_official_259.toml
-input_attribution/docs/acceptance_matrix.md
-input_attribution/docs/copilot_porting_prompt.md
-input_attribution/docs/experiment_design.md
-input_attribution/docs/implementation_baseline.json
-input_attribution/docs/porting.md
-input_attribution/docs/usage.md
-input_attribution/docs/validation_report.md
-input_attribution/integrated_gradients.py
-input_attribution/interventions.py
-input_attribution/metrics.py
-input_attribution/offline.py
-input_attribution/pack.py
-input_attribution/policy.py
-input_attribution/reporting.py
-input_attribution/requirements-ig.txt
-input_attribution/schema.py
-input_attribution/schemas/README.md
-input_attribution/schemas/__init__.py
-input_attribution/schemas/custom_262_template.json
-input_attribution/schemas/fake_262_resolved.json
-input_attribution/schemas/official_259.json
-input_attribution/tests/test_adapters.py
-input_attribution/tests/test_cli.py
-input_attribution/tests/test_core.py
-input_attribution/tests/test_ig.py
-input_attribution/tests/test_reporting.py
-input_attribution/tests/test_runtime.py
-input_attribution/trajectory_metrics.py
+run: 20260908T220014Z-e7425ea0
+collect: success / 1 episode / 127 records
+offline: success / 286 patterns / saved probabilities reproduced / policy unchanged
+closed-loop: success / 15 patterns
+IG: skipped（明示的な ig コマンド未実行）
+3-step probe: old/new とも status OK（`outputs/input_attribution_revision_validation/initial_real_probe.log`、`new_real_probe.log`）
+full run command: exit 0（`outputs/input_attribution_revision_validation/new_full_run.log`）
+A reuse child: exit 0 / 286 patterns / saved probabilities reproduced / policy unchanged
+fresh B on A child: exit 0 / 15 patterns / `summary.policy_unchanged=true`（stage `02_closed_loop/20260908T225123Z-1de748bb`）
 ```
 
-## 最終テスト結果
+通常観測は旧正常観測の `observations.npy` と bytes 一致しています。A は25個の明示 pattern（P00 + 非control 24）に259個の individual patternと2個の group展開を加え、合計286 patternを保存しました。A の非control明示 pattern数は24、Bの非control P00 pair verified 数は14です。A/B の `target = applied + skipped` と `applied = changed + noop` は evidence の全行で成立しています。
 
-2026-09-08の最終コードで `python3 -m pytest tests input_attribution/tests -q -p no:cacheprovider` を実行し、**253 passed, 2 skipped (31.76秒)**。既存171テストを含みます。2 skipは通常環境にCaptumがないためです。一時wheelを参照する任意IGテストは別途 **8 passed**。ログは `outputs/input_attribution_validation/release_pytest.log` と `delivery_captum_pytest.log` です。
+`closed_loop.max_steps=500` は planned 上限であり、自然終了した episode の実 step 数・実測 duration とは別です。今回の B は pattern ごとに実測 step 数が異なり、P00 は127、heading neutral は128、heading reflection は114、heading low は85でした。実測可能な時間がない場合の duration は明示的な `None`、既知 interval だけを合計できる場合は known partial sum と partial status とし、欠測を0や planned 500 step の時間で補完しません。pair の状態が unknown の episode は P00 差の集約から除外します。
 
-別ディレクトリへpackageのみをコピーする259/262 CLIテスト、環境を起動しないoffline、MetaDrive/SB3/PyTorch/Captum importを禁止したreport再生成、IG依存失敗時の主結果保持、再解析ID分離、モデル/schema/パターン/前処理/コード/観測hash不一致の拒否を含みます。
+A reuse child は親の sealed reference を再利用して environment を作成せずに A を実行しました。child の `observations.npy` SHA256 は親と同じ `b6ab07bfcb712a1d7d09f70ff3cf3b11e15379b07a71f32bbbd90863bd4fdc57` です。child manifest には親 model SHA256 `0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`、親 input semantics SHA256 `b32e08e797f7c7d5a7d4a3fc989e955e820936130c69e6b6e732f270a30a172b`、source `input_schema.json`、preprocess SHA256 `5486d5d3c281145521c358bf42b439fc3fe29997b6bb2a95a333242469b27dff`、parent collection provenance SHA256 `57db2ebd5fa1b53556452d0393ef1e58e5911cb057219d7716a5846cf60f38a0`、parent data ID `cda9f497f3c78f1374e279b4fd9f9bedea3e1e73a941aed2e5453448f54fd10c` を保存しています。collect は saved reference reused として skipped でした。child の fresh B は `02_closed_loop/20260908T225123Z-1de748bb` で exit 0、全15 pattern が success、`summary.policy_unchanged=true` です。
 
-## 実MetaDrive 259次元の最終実験
+child の保存配列監査は `outputs/input_attribution_revision_validation/final_child.json` に保存されています。親参照は同一で、A は286 patternについて float32配列、非対象 index、exact mask/count、各不変条件がすべて一致し、individual LiDAR 240 pattern は全件 no-op でした。B は15 episodeで float32配列の非対象 indexが不変、`action == forwarded == argmax(modified probabilities)` の不一致0・欠測0でした。child fingerprint の介入前後は `64bd78c1c476b2c0ab44b139cdf2867abfcdd4d290f1bad1cbb5a57645145dfd` で一致し、verified P00 pair は14、missingは0、telemetryは15件すべて complete（lane/clock/progress/speed の欠測0）でした。この配列監査は fresh B child の証拠であり、親 full run の fresh collect 証拠とは分けて記録します。
 
-納品用run: `outputs/input_attribution/official_baseline_259/official_baseline/20260908T105108Z-cbc5448f`。通常走行127 stepを保存し、①-Aの272パターン（全259入力の行、P00・設定group・整合groupの13行）、①-Bの明示した6パターン、主HTML/MD/CSVを生成しました。IGを実行する前に主工程とレポートが成功しています。
+新 report の生成は exit 0 で完了し、`report.md`/`report.html` の主表は最大8列、主表から参照するローカル href/src は全件解決しました。主表には P00 の物理基準を A 表より先に置き、個別 LiDAR 240入力の全 no-op 集約、動画無効15件の理由、重複件数の説明、IG未実行1行を保存しています。A は286 pattern、B は15 run、検証済み B pair は14、P00 は127 applied/127 noopです。A 主表（P00除外）の分類は changed 29、noop 250、partial 17、all-skip 6（重複分類を含む）、B は changed 11、noop 3、partial 4、all-skip 0です。A CSV は source records 72,644 行ですが `(pattern, episode, step)` の unique 行は36,322で、2つの source representation を `source`/`source_priority` とともに保存した結果であり、観測数の水増しではありません。B CSV は1,852行、通常観測は127 unique step・1 episodeです。変更なしの主表列は N/A とし、raw JS は詳細に0を保存しています。
 
-解析用設定は `outputs/input_attribution_validation/official_validated_config.json`。既存学習時設定のmap C、scenario seed 5、RL seed 0、交通量0、horizon 500を維持しています。参照置換は保存実観測 `episode-0:60` を使い、同一道路区間・開始時目標レーンordinalの一致を要求します。通常127観測のうち40観測で適用可能、残り87観測は理由付きskipです。各reference patternは39件を実変更、1件がno-opでした。
+旧 report の生成も exit 0 で完了し、`legacy_report_final` は同じ成果物監査に合格しました。旧条件では A は272 pattern、B は5 run、検証済み B pair は4、P00 は127 applied/127 noopでした。旧主表（P00除外）の分類は A が changed 11、noop 254、partial 20、all-skip 6（重複分類を含む）、B が changed 2、noop 2、partial 3です。旧 `P02` A の JS は `9.638e-16`、平均絶対確率差は `1.144e-6 pp` で、微小値として意味のある依存とは判定していません。旧 report も P00 を A 表より前に置き、raw JS 0 と主表 N/A、video の実際の理由を保存しています。
 
-P00再走行は初期状態と全127 stepの参照traceが一致し、mismatch 0。収集時の確率と保存観測からの再計算が一致し、方策fingerprint・モデルSHA256は不変です。float32の一括推論と単観測推論の計算順序差を避けるため、確率評価は収集と同じ1観測単位で行います。
+新旧 report の保護監査では、変更なし42件、旧 run 588件、旧 inventory 全件が一致しました。HEAD は `6584bd9f5a5786c1374cbf7d3536a5dbd5ea50f11`、branch は `input_attribution` のままで、tracked の変更・追加31件は `input_attribution/` 配下だけです。両 report の `audit_artifacts.py` は exit 0 でした。
 
-| パターン | step数 | 横ずれRMS m | 最大絶対値 m | 進行度 m | 平均速度 m/s | 到達 | 終了理由 |
-|---|---:|---:|---:|---:|---:|---|---|
-| P00 | 127 | 1.929347 | 3.017748 | 156.038969 | 12.284736 | はい | arrive_dest |
-| P01_road_boundaries_reference | 91 | 2.216884 | 7.096743 | 97.795399 | 10.788536 | いいえ | out_of_road |
-| P02_heading_reference | 127 | 1.601734 | 3.017748 | 156.407465 | 12.309249 | はい | arrive_dest |
-| P04_current_lane_lateral_reference | 127 | 2.139771 | 3.437311 | 155.675600 | 12.260185 | はい | arrive_dest |
-| P05_navigation_reference | 96 | 1.352124 | 3.017748 | 102.034829 | 10.531974 | いいえ | out_of_road |
-| P06_lidar_all_no_detection | 127 | 1.929347 | 3.017748 | 156.038969 | 12.284736 | はい | arrive_dest |
+主な A 実測値は次のとおりです。確率差は実変更時の平均絶対 pp で、母数を併記しています。
 
-横ずれは全走行で未加工の目標レーンテレメトリから取得し、有効率100%。P00は到達したものの目標レーン逸脱1回・6.0秒、最初の逸脱時刻6.8秒です。P01とP05は道路外で早期終了しました。P05の小さいRMSを性能改善と結論せず、到達・進行度・速度・時間を同じ表に表示します。対象は1シナリオであり、一般化した成功率や因果的重要度を主張しません。
+| pattern | A 実測 |
+| --- | --- |
+| `P02_heading_neutral` | 127対象、120 exact、7 no-op、meaningful 73（tolerance `1e-7`）、行動変更 5/120、平均絶対選択確率差 2.48307654 pp |
+| `P02_heading_reflection` | 120 exact、行動変更 12/120、平均絶対選択確率差 5.0375491 pp |
+| `P04_lateral_neutral` | 71 exact、56 no-op |
+| `P06_lidar_no_detection` | 127適用、127 no-op、assessment は `no_exact_input_change` |
+| `P06_lidar_virtual_detection` | 127 exact、0 no-op |
 
-①-AのP01は適用可能40観測で行動変更40%、元の選択行動確率の変化は **−15.5232879917 pp**。LiDAR全体と方向groupは全127観測がno-opであり、今回の条件では影響を評価できません。全272行の確率差と6走行の物理指標について、CSVとcanonical JSONの一致を追加検査しました。
+主な B 実測値は次のとおりです。全15 pattern が完了し、P00以外の14 patternは `matched=true` でした。P00 の reference trace は127 records、mismatch 0です。unexpected な full-episode abort はありませんでした。
 
-HTMLのlocal link 14件は欠落0、外部CDN/resourceなし。CSVはUTF-8 BOM。通常走行と①-Bの計7 GIFは600×600で、全frameにpattern/episode/step/post時刻を表示し、frame mapとの件数が一致します。生成した図はグループ/個別入力比較、横ずれ・操舵・速度時系列、世界座標軌跡です。日本語フォントがないSVG環境では英語labelと日本語対応表を使います。実測の大きい保存JSONからのレポート生成は約1～2分かかります。検査の詳細は `outputs/input_attribution_validation/release_artifact_checks.json` に保存しました。
+| pattern | B 実測 |
+| --- | --- |
+| `P00` | arrival=true、target-lane RMS `2.762390679 m`、逸脱1回・6 s、progress `155.682517 m`、duration `12.7 s`、crash=false |
+| `P02_heading_neutral` | 128 steps、121 exact、7 no-op、arrival=true、road-out=false |
+| `P02_heading_reflection` | 114 steps、107 exact、road-out=true、arrival=false |
+| `P02_heading_low` | 85 steps、85 exact、road-out=true、arrival=false |
+| `P04_lateral_neutral` | target-lane RMS `2.346670696 m`、逸脱1回・6 s、arrival=true。ただし逸脱が残るため改善またはレーン維持成功とは判定しない |
+| `P06_lidar_no_detection` | 127 steps、127 no-op、P00 と同じ control-baseline 指標 |
+| `P06_lidar_virtual_detection` | 127 steps、127 exact、arrival=true、road-out=false |
 
-## 実モデルの任意IG
+全 B pattern で lane、speed、progress、clock の coverage は100%でした。`wrong_lane_arrival` と `start_lane_departure` は `None` で、取得できていないため成功・失敗の0へ置換していません。動画は `video.enabled=false` のため全 patternで disabled です。
 
-基準は保存済み `episode-0:70`、対象はstep 75・80。道路区間、開始時目標レーン、現在所属レーンとカテゴリ値が同じであることを確認しました。説明対象actionは各時刻の元argmaxで固定し、今回は両時刻ともaction 8です。Captum gausslegendre 64点、許容絶対残差1e-4、再計算0回で収束し、重み不変です。
+report と保護の確認済み工程:
 
-| step | sum(IG) | F(x)-F(baseline) | 絶対completeness残差 |
-|---:|---:|---:|---:|
-| 75 | -0.325488496572 | -0.325488209724 | 2.86847352982e-07 |
-| 80 | -0.954959951341 | -0.954959750175 | 2.01165676117e-07 |
+- 旧 run に対する `report --run-dir OLD --output-dir NEW_REPORT_DIR` は exit 0、出力先は `legacy_report_final` です。
+- A 子 run の実コマンド `python3 -m input_attribution closed-loop --run-dir CHILD`（config の全15 patternを実行）は stage `02_closed_loop/20260908T225123Z-1de748bb`、exit 0 です。
+- 新旧 report の CSV / HTML / SVG / media link、P00 基準、N/A 表示、重複説明、親全ファイル hash を監査済みです。
 
-生結果: `outputs/input_attribution/official_baseline_259/official_baseline/20260908T105108Z-cbc5448f/03_ig/20260908T105422Z-4e54f9c2/result.json`。IGは主順位へ合算せず補足に表示します。基準と同じ入力のIG=0を「未使用」と解釈しません。
+新 report は `outputs/input_attribution_revision_validation/reused_run_report`、旧 report は `outputs/input_attribution_revision_validation/legacy_report_final` に生成され、主表・詳細表・ローカルリンク・media reason・P00 基準・N/A 表示の監査に合格しました。A reuse child 上の fresh B 全15 pattern も完了しています。
 
-## fake262と未検証事項
+## 合成・保存 package で確認した項目
 
-最終fake262 run: `outputs/input_attribution/fake_262_resolved/fake_policy_262/20260908T105202Z-17bf2917`。check・収集・全入力①-A・指定①-B・主レポートが成功しています。非末尾index 7/145/260を持つ合成例であり、実262モデルの車両性能は未検証です。実機262、Windowsでの実行、他シナリオ・他MetaDrive版・外部正規化を持つ移植先は、移植先の既存ソースとモデルでcheck/probeを行う必要があります。長い学習・再学習は行っていません。
+ここには全体 pytest、pack 検査、保存結果の再解析の実行結果を記録します。これらは MetaDrive 車両の挙動を検証しません。
 
-## 変更境界の最終確認
+```text
+統合 full pytest コマンド:
+PYTHONDONTWRITEBYTECODE=1 MPLCONFIGDIR=/tmp/input-attribution-revision-mpl XDG_CACHE_HOME=/tmp/input-attribution-revision-cache TORCH_HOME=/tmp/input-attribution-revision-torch python3 -m pytest tests input_attribution/tests -q -p no:cacheprovider
+結果: 309 passed, 2 skipped in 70.92s
+ログ: outputs/input_attribution_revision_validation/final_pytest.log
+補足: Captum 未導入による skip 2件。主工程の失敗ではない。
 
-`git diff HEAD --name-only` は空、`git status --short` は新規 `input_attribution/` のみ。既存ファイル・学習済みモデル・学習時設定を変更していません。実験結果は既存のignore対象 `outputs/` に別IDで保存しています。途中で停止した実験や表示修正前のrunも削除せず保持し、納品用runは上記IDで区別しています。
-
-## 納品成果物の場所
-
-- 主レポート: `outputs/input_attribution/official_baseline_259/official_baseline/20260908T105108Z-cbc5448f/report.html`（同じ場所にMD/CSV）。
-- IG補足版: `outputs/input_attribution/official_baseline_259/official_baseline/20260908T105108Z-cbc5448f/reports/report-20260908T105438Z/report.html`。対象step・固定action・実観測baseline・F値・IG合計・出力差・残差・積分点数を評価ごとに表示します。異なる時刻のIGを一つの評価として合算しません。
-- 初版のHTML/MD/CSVをハッシュで照合し、補足版生成後も不変であることを確認済みです。
-- 移植ZIP: `outputs/input_attribution_portable.zip`。コード・文書・設定・スキーマ・テストの46ファイルのみを収録。モデル・実験結果・venv・cache・font・第三者repositoryは除外します。
-- ZIP全entryのSHA256一覧: `outputs/input_attribution_validation/portable_manifest.json`。ZIPは2回生成してbyte SHA256の一致を確認します。
-
-このPCの保存結果にIGを追加するコマンド（Captumが利用できる既存/一時環境で実行）:
-
-```bash
-python3 -m input_attribution ig \
-  --run-dir outputs/input_attribution/official_baseline_259/official_baseline/20260908T105108Z-cbc5448f \
-  --episode 0 --steps 75,80 --baseline episode-0:70
-python3 -m input_attribution report \
-  --run-dir outputs/input_attribution/official_baseline_259/official_baseline/20260908T105108Z-cbc5448f
+portable package の所定コマンドと出力先:
+python3 -m input_attribution.pack --source-root . --output outputs/input_attribution_revision_validation/input_attribution_portable.zip
+package verification: outputs/input_attribution_revision_validation/portable_package_checks.json に記録
 ```
+
+新 report 成果物監査:
+
+```text
+report command: exit 0
+output: outputs/input_attribution_revision_validation/reused_run_report
+main report: 最大8列、ローカル href/src 全件解決、IG未実行1行、video_disabled 15件の理由表示
+保存件数: A 72,644 source rows / 36,322 unique (pattern, episode, step)、B 1,852 rows
+分類: A(P00除外) changed 29 / noop 250 / partial 17 / all-skip 6、B changed 11 / noop 3 / partial 4 / all-skip 0
+P00: 127 applied / 127 noop、verified B pair 14、通常観測 127 unique step / 1 episode
+監査: final_child.json PASS、raw JS 0 保存、変更なしの主表値は N/A
+```
+
+確認対象:
+
+- variant の追加・推奨 replacement の変更は意味 hash の例外として許可し、入力順、encoding、normalization、coupling、validity、invalid sentinel の変更は拒否する。
+- legacy manifest に意味 hash がなくても、親の `input_schema.json` snapshot を正規化して hash を復元し、根拠 path と hash を子 manifest に保存する。
+- 親の `resolved_config.json`、snapshot files、reference seal、前処理統計、adapter source、model hash の改変を子 run 作成前に拒否する。
+- offline reuse は environment を作成せず、親の observation/action mapping を継承し、A のみを成功、B を未実行として明示する。
+- `01_offline/patterns.json` / `patterns.csv` と子 run の pattern snapshot は、型付き variant の `variant_id`、evidence、classification、resolved value、reflection expression を保存し、report の主表・詳細表へ引き継ぐ。
+- `video.patterns` の config 検証と closed-loop の pattern 別動画選択は合成テストで確認済み。実 MetaDrive の frame、frame 数、動画 metadata は実走行欄へ記録する。
+- `report --output-dir` は旧 run のファイルを変更せず、pack は `input_attribution/` 追加 package だけを収録して外部 model、MetaDrive、262 観測生成器を上書きしない。
+
+## 過去履歴（現 revision の証拠ではない）
+
+旧文書にあった 2026-09-08 の 259/262 実行記録、旧 run ID、旧テスト件数は revision 前の履歴です。親として使用する旧 run の manifest は確認済みで、`20260908T191831Z-400a7dd2` は今回の報告対象モデルと同じ SHA256（`0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`）を記録しています。ただし revision 前の run なので、現 revision の実走行証拠と混ぜず、親 integrity と provenance を確認したうえで report 再生成または A reuse の入力として扱います。旧文書に残るさらに古いモデル SHA256 や存在しない環境パスは別の過去記録であり、今回の旧 run と同一視しません。
+
+旧 run 例: `outputs/input_attribution/official_baseline_259/official_baseline/20260908T191831Z-400a7dd2`。この run は変更せず、report 再生成または reuse の親として使う場合も全 hash と provenance を先に検証します。
+
+## 実環境で未確認の項目
+
+- 262 check は `unresolved_262_check.log` で expected exit 2（`SchemaError: input index must be an integer`）でした。未解決の262 schemaを成功扱いにせず、実 262 モデル・観測生成器も本 repository には提供されていません。
+- Windows 実行、実 262 adapter/モデル、Captum を導入した IG、動画 frame と media metadata は今回の証拠では未確認です。Captum 未導入の skip は主工程の成功へ置き換えず、status と理由を保存します。
+- 動画対象は `[video].patterns = ["P00", "<重点pattern>"]` で選択します。`closed-loop --patterns P00,<重点pattern>` は走行対象の選択で、動画選択とは別です。未指定は走行対象全件です。全件無効は `video.enabled = false` で指定します。今回の full run は video disabled なので frame 成果物はありません。

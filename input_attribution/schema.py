@@ -97,6 +97,166 @@ _UNRESOLVED_MARKERS = (
 )
 
 
+_VARIANT_OPERATIONS = frozenset(
+    {
+        "identity",
+        "neutral",
+        "reflection",
+        "fixed_level",
+        "fixed",
+        "reference",
+    }
+)
+
+
+def _variant_operation(value: Mapping[str, Any], location: str) -> str:
+    operation = value.get("operation", value.get("method", value.get("kind")))
+    if not isinstance(operation, str) or not operation.strip():
+        raise SchemaError(f"{location} must declare operation/method")
+    operation = operation.strip().casefold().replace("-", "_")
+    if operation not in _VARIANT_OPERATIONS:
+        allowed = ", ".join(sorted(_VARIANT_OPERATIONS))
+        raise SchemaError(f"{location}.operation={operation!r} is unsupported; use {allowed}")
+    return operation
+
+
+def _variant_id(value: Mapping[str, Any], location: str) -> str:
+    identifier = value.get("id", value.get("variant_id", value.get("name")))
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise SchemaError(f"{location} must declare a non-empty id")
+    return identifier.strip()
+
+
+def _variant_scalar_values(value: Any) -> tuple[Any, ...]:
+    """Flatten scalar values carried by a variant value/center mapping."""
+
+    if isinstance(value, Mapping):
+        result: list[Any] = []
+        for nested in value.values():
+            result.extend(_variant_scalar_values(nested))
+        return tuple(result)
+    if isinstance(value, (list, tuple, np.ndarray)):
+        result = []
+        for nested in value:
+            result.extend(_variant_scalar_values(nested))
+        return tuple(result)
+    return (value,)
+
+
+def _validate_variant_domain(
+    value: Any,
+    bounds: tuple[Any, Any],
+    location: str,
+) -> None:
+    """Require declared values and centers to lie in a variant's range.
+
+    A variant ``range`` describes the values that this variant is allowed to
+    generate.  It is narrower than or equal to the owning input's range; it is
+    not a comment that can be ignored after checking only the input schema.
+    """
+
+    minimum, maximum = bounds
+    for scalar in _variant_scalar_values(value):
+        if scalar is None:
+            continue
+        number = float(scalar) if isinstance(scalar, (bool, np.bool_)) else _finite_number(scalar, location)
+        if minimum is not None and number < float(minimum):
+            raise SchemaError(
+                f"{location}={number} is below the variant range minimum {minimum}"
+            )
+        if maximum is not None and number > float(maximum):
+            raise SchemaError(
+                f"{location}={number} exceeds the variant range maximum {maximum}"
+            )
+
+
+def _validate_variant_mapping(
+    value: Mapping[str, Any],
+    location: str,
+    *,
+    require_confirmation_details: bool = True,
+) -> dict[str, Any]:
+    """Validate a portable typed intervention variant record.
+
+    The record remains a JSON mapping so adapters can carry it across machines.
+    This check intentionally does not infer a value, center, category, or
+    validity sentinel from an input's index or dimension.
+    """
+
+    if not isinstance(value, Mapping):
+        raise SchemaError(f"{location} must be a mapping")
+    result = {str(key): _json_value(item) for key, item in value.items()}
+    identifier = _variant_id(result, location)
+    operation = _variant_operation(result, location)
+    result.setdefault("id", identifier)
+    result.setdefault("operation", operation)
+    if "confirmed" in result and type(result["confirmed"]) is not bool:
+        raise SchemaError(f"{location}.confirmed must be a boolean")
+    confirmed = result.get("confirmed", False)
+    if confirmed and require_confirmation_details:
+        # A boolean is not provenance.  Require a semantic statement and an
+        # evidence/source pointer before a variant can be used by execution.
+        meaning = result.get("meaning", result.get("description"))
+        evidence = result.get(
+            "evidence",
+            result.get("source", result.get("reference", result.get("provenance"))),
+        )
+        if not isinstance(meaning, str) or not meaning.strip():
+            raise SchemaError(f"{location} confirmed=true requires meaning/description")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise SchemaError(f"{location} confirmed=true requires evidence/source provenance")
+        if operation in {"neutral", "fixed_level", "fixed"}:
+            has_value = any(key in result for key in ("value", "values", "level", "levels"))
+            if not has_value:
+                raise SchemaError(f"{location} {operation} variant requires value/level")
+        elif operation == "reflection" and not any(key in result for key in ("center", "centers")):
+            raise SchemaError(f"{location} reflection variant requires center")
+    for key in ("range", "value_range"):
+        if key in result:
+            raw_range = result[key]
+            if isinstance(raw_range, (str, bytes)):
+                raise SchemaError(f"{location}.{key} must be a two-element sequence")
+            try:
+                pair = tuple(raw_range)
+            except TypeError as exc:
+                raise SchemaError(f"{location}.{key} must be a two-element sequence") from exc
+            if len(pair) != 2:
+                raise SchemaError(f"{location}.{key} must be a two-element sequence")
+            for bound in pair:
+                if bound is not None:
+                    _finite_number(bound, f"{location}.{key}")
+            if pair[0] is not None and pair[1] is not None and float(pair[0]) > float(pair[1]):
+                raise SchemaError(f"{location}.{key} minimum cannot exceed maximum")
+            result["range"] = list(pair)
+            break
+    if "range" in result:
+        bounds = (result["range"][0], result["range"][1])
+        for key in ("value", "values", "level", "levels", "center", "centers"):
+            if key in result and result[key] is not None:
+                _validate_variant_domain(result[key], bounds, f"{location}.{key}")
+    for key in ("coupled_indices", "related_valid_flags"):
+        if key in result:
+            raw = result[key]
+            if isinstance(raw, (str, bytes)):
+                raise SchemaError(f"{location}.{key} must be an array of indices")
+            result[key] = list(_as_tuple_ints(raw, f"{location}.{key}"))
+    for key in ("allowed_indices",):
+        if key in result:
+            raw = result[key]
+            if isinstance(raw, (str, bytes)):
+                raise SchemaError(f"{location}.{key} must be an array of indices")
+            result[key] = list(_as_tuple_ints(raw, f"{location}.{key}"))
+    for key in ("allowed_ids", "allowed_groups", "semantic_ids"):
+        if key in result:
+            raw = result[key]
+            if isinstance(raw, (str, bytes)):
+                raise SchemaError(f"{location}.{key} must be an array of strings")
+            if not isinstance(raw, Sequence) or any(not isinstance(item, str) or not item.strip() for item in raw):
+                raise SchemaError(f"{location}.{key} must be an array of non-empty strings")
+            result[key] = [item.strip() for item in raw]
+    return result
+
+
 def _unresolved_paths(value: Any, path: str = "schema") -> list[str]:
     """Find unresolved provenance markers at any nesting depth.
 
@@ -158,6 +318,10 @@ class InputSpec:
     independently_replaceable: bool = True
     ig_interpolation_allowed: bool = True
     source: str = ""
+    # New typed intervention variants.  Mappings are retained verbatim (after
+    # JSON-safe normalization) so portable bundles do not depend on Python
+    # classes or adapter code.
+    variants: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.index, bool) or not isinstance(self.index, int):
@@ -197,6 +361,21 @@ class InputSpec:
         )
         if self.replacement is not None and not isinstance(self.replacement, Mapping):
             raise SchemaError("replacement must be a JSON-compatible mapping")
+        if isinstance(self.variants, (str, bytes)):
+            raise SchemaError("variants must be an array of mappings")
+        normalized_variants: list[Mapping[str, Any]] = []
+        seen_variant_ids: set[str] = set()
+        for variant_index, variant in enumerate(self.variants):
+            normalized = _validate_variant_mapping(
+                variant,
+                f"input {self.index}.variants[{variant_index}]",
+            )
+            identifier = str(normalized["id"])
+            if identifier in seen_variant_ids:
+                raise SchemaError(f"input {self.index} has duplicate variant id {identifier!r}")
+            seen_variant_ids.add(identifier)
+            normalized_variants.append(normalized)
+        object.__setattr__(self, "variants", tuple(normalized_variants))
         if not isinstance(self.independently_replaceable, bool):
             raise SchemaError("independently_replaceable must be boolean")
         if not isinstance(self.ig_interpolation_allowed, bool):
@@ -237,6 +416,7 @@ class InputSpec:
             "independently_replaceable": self.independently_replaceable,
             "ig_interpolation_allowed": self.ig_interpolation_allowed,
             "source": self.source,
+            "variants": [_json_value(item) for item in self.variants],
         }
 
     @classmethod
@@ -292,6 +472,9 @@ class InputSpec:
                 value, "ig_interpolation_allowed", default=True
             ),
             source=str(value.get("source", "")),
+            variants=tuple(
+                value.get("variants", value.get("intervention_variants", ())) or ()
+            ),
         )
 
     def validate_value(self, value: Any, *, location: str | None = None) -> None:
@@ -311,6 +494,8 @@ class InputSpec:
                 raise SchemaError(f"{where} expects a categorical value")
             elif not isinstance(value, (int, np.integer, float, np.floating, str)):
                 raise SchemaError(f"{where} expects a scalar categorical value")
+            elif isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
+                raise SchemaError(f"{where} must be a finite categorical value")
         else:
             _finite_number(value, where)
         if self.value_range is not None and isinstance(value, (int, float, np.integer, np.floating)):
@@ -331,11 +516,32 @@ class InputSchema:
     schema_id: str = ""
     version: str = "1"
     preprocessing: Mapping[str, Any] = field(default_factory=dict)
+    # Variants that apply to a declared group of inputs (for example the
+    # source-verified LiDAR no-detection default) can live once at schema
+    # level.  Per-input variants remain on ``InputSpec.variants``.
+    intervention_variants: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if isinstance(self.dimension, bool) or not isinstance(self.dimension, int) or self.dimension <= 0:
             raise SchemaError("dimension must be a positive integer")
         object.__setattr__(self, "inputs", tuple(self.inputs))
+        if not isinstance(self.intervention_variants, Mapping):
+            raise SchemaError("intervention_variants must be a mapping")
+        normalized_variants: dict[str, Mapping[str, Any]] = {}
+        for key, value in self.intervention_variants.items():
+            if not isinstance(key, str) or not key.strip():
+                raise SchemaError("intervention_variants keys must be non-empty strings")
+            normalized = _validate_variant_mapping(
+                value,
+                f"intervention_variants[{key!r}]",
+            )
+            declared_id = str(normalized["id"])
+            if declared_id != key:
+                raise SchemaError(
+                    f"intervention_variants key {key!r} does not match variant id {declared_id!r}"
+                )
+            normalized_variants[key] = normalized
+        object.__setattr__(self, "intervention_variants", normalized_variants)
         self.validate()
 
     @property
@@ -355,6 +561,25 @@ class InputSchema:
     @property
     def by_id(self) -> dict[str, InputSpec]:
         return {item.id: item for item in self.inputs}
+
+    def variant(self, index_or_id: int | str, variant_id: str) -> Mapping[str, Any]:
+        """Resolve an input-local or schema-level typed variant.
+
+        Input-local records take precedence, which permits the same variant id
+        to have input-specific centers or values.  A schema-level record is
+        useful for a group whose semantics and replacement value are shared.
+        """
+
+        spec = self.spec(index_or_id)
+        for value in spec.variants:
+            if value.get("id") == variant_id:
+                return value
+        try:
+            return self.intervention_variants[variant_id]
+        except KeyError as exc:
+            raise SchemaError(
+                f"unknown intervention variant {variant_id!r} for input {spec.id!r}"
+            ) from exc
 
     def validate(self, *, require_provenance: bool = False) -> None:
         if len(self.inputs) != self.dimension:
@@ -376,6 +601,44 @@ class InputSchema:
             for related in (*item.related_valid_flags, *item.coupled_indices):
                 if related not in expected:
                     raise SchemaError(f"input {item.index} references unknown index {related}")
+            for variant_index, variant in enumerate(item.variants):
+                self._validate_variant_contract(
+                    variant,
+                    f"input {item.index}.variants[{variant_index}]",
+                    item=item,
+                    expected=expected,
+                )
+        for identifier, variant in self.intervention_variants.items():
+            self._validate_variant_contract(
+                variant,
+                f"intervention_variants[{identifier!r}]",
+                item=None,
+                expected=expected,
+            )
+            if (
+                variant.get("confirmed") is True
+                and _variant_operation(variant, f"intervention_variants[{identifier!r}]")
+                == "reflection"
+            ):
+                allowed_indices = set(variant.get("allowed_indices", ()))
+                allowed_ids = set(variant.get("allowed_ids", variant.get("semantic_ids", ())))
+                allowed_groups = set(variant.get("allowed_groups", ()))
+                candidates = [
+                    item
+                    for item in self.inputs
+                    if (
+                        not allowed_indices
+                        and not allowed_ids
+                        and not allowed_groups
+                    )
+                    or item.index in allowed_indices
+                    or item.id in allowed_ids
+                    or item.group in allowed_groups
+                ]
+                if any(item.is_discrete for item in candidates):
+                    raise SchemaError(
+                        f"intervention_variants[{identifier!r}] reflection cannot target discrete inputs"
+                    )
         for item in self.inputs:
             if item.index in item.coupled_indices:
                 continue
@@ -412,6 +675,74 @@ class InputSchema:
                         raise SchemaError(
                             f"input {item.index} ({item.id}) has unresolved replacement metadata"
                         )
+
+    @staticmethod
+    def _validate_variant_contract(
+        variant: Mapping[str, Any],
+        location: str,
+        *,
+        item: InputSpec | None,
+        expected: set[int],
+    ) -> None:
+        """Validate variant range/type/category/coupling declarations."""
+
+        operation = _variant_operation(variant, location)
+        for key in ("coupled_indices", "related_valid_flags"):
+            for related in variant.get(key, ()):
+                if related not in expected:
+                    raise SchemaError(f"{location}.{key} references unknown index {related}")
+        for related in variant.get("allowed_indices", ()):
+            if related not in expected:
+                raise SchemaError(f"{location}.allowed_indices references unknown index {related}")
+        if item is not None:
+            declared_type = variant.get("value_type", variant.get("dtype"))
+            if declared_type is not None:
+                if not isinstance(declared_type, str):
+                    raise SchemaError(f"{location}.value_type must be a string")
+                normalized_type = declared_type.casefold()
+                if normalized_type in {"boolean", "bool"}:
+                    normalized_type = "bool"
+                if normalized_type in {"category", "categorical"}:
+                    normalized_type = "categorical"
+                if normalized_type != item.value_type:
+                    item_type = "categorical" if item.value_type in {"category", "categorical"} else item.value_type
+                    raise SchemaError(
+                        f"{location}.value_type={declared_type!r} conflicts with input {item.index} type {item_type!r}"
+                    )
+            variant_range = variant.get("range", variant.get("value_range"))
+            if variant_range is not None:
+                pair = tuple(variant_range)
+                minimum, maximum = pair
+                if item.value_range is not None:
+                    item_min, item_max = item.value_range
+                    if item_min is not None and minimum is not None and float(minimum) < float(item_min):
+                        raise SchemaError(f"{location} range extends below input {item.index} range")
+                    if item_max is not None and maximum is not None and float(maximum) > float(item_max):
+                        raise SchemaError(f"{location} range extends above input {item.index} range")
+            categories = variant.get("categories", variant.get("category_values"))
+            if categories is not None:
+                if not isinstance(categories, Sequence) or isinstance(categories, (str, bytes)):
+                    raise SchemaError(f"{location}.categories must be an array")
+                if not item.is_discrete:
+                    raise SchemaError(f"{location}.categories requires a discrete input")
+        confirmed = variant.get("confirmed", False)
+        if confirmed is True and operation == "reflection" and item is not None and item.is_discrete:
+            raise SchemaError(f"{location} reflection is not valid for discrete input {item.index}")
+        if confirmed is True and operation == "reflection" and item is None:
+            # A schema-level variant may target a group, so the concrete
+            # InputSpec is checked again at execution.  Reject an explicitly
+            # discrete group declaration here instead of allowing it to pass
+            # solely because this validation has no ``item`` argument.
+            declared_type = variant.get("value_type", variant.get("dtype"))
+            if isinstance(declared_type, str) and declared_type.casefold() in {
+                "bool",
+                "boolean",
+                "category",
+                "categorical",
+            }:
+                raise SchemaError(
+                    f"{location} reflection requires a continuous group variant"
+                )
 
     def validate_for_execution(self) -> None:
         """Fail closed on unresolved source/order metadata before an experiment."""
@@ -471,6 +802,7 @@ class InputSchema:
             "version": self.version,
             "dimension": self.dimension,
             "preprocessing": _json_value(self.preprocessing),
+            "intervention_variants": _json_value(self.intervention_variants),
             "inputs": [item.to_dict() for item in sorted(self.inputs, key=lambda x: x.index)],
         }
 
@@ -498,6 +830,9 @@ class InputSchema:
             schema_id=schema_id,
             version=version,
             preprocessing=preprocessing,
+            intervention_variants=value.get(
+                "intervention_variants", value.get("variants", {})
+            ) or {},
         )
 
     @classmethod

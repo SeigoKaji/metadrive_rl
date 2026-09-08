@@ -113,7 +113,6 @@ def _progress_m(telemetry: Mapping[str, Any]) -> float | None:
             (
                 "route_progress_m",
                 "progress_m",
-                "route_progress",
                 "distance_travelled_m",
                 "distance_traveled_m",
             ),
@@ -212,6 +211,106 @@ def _step_durations(
     return result
 
 
+def _measurement_info(
+    values: Sequence[Any],
+    times: Sequence[float | None],
+) -> dict[str, Any]:
+    """Describe a telemetry series without converting missing samples to zero."""
+
+    expected = len(values)
+    known_steps = [index for index, value in enumerate(values) if value is not None]
+    known_times = [
+        float(times[index])
+        for index in known_steps
+        if index < len(times) and times[index] is not None
+    ]
+    missing_steps = [index for index, value in enumerate(values) if value is None]
+    missing_ranges: list[dict[str, Any]] = []
+    if missing_steps:
+        start = previous = missing_steps[0]
+        for index in missing_steps[1:]:
+            if index == previous + 1:
+                previous = index
+                continue
+            missing_ranges.append(
+                {
+                    "first_step": start,
+                    "last_step": previous,
+                    "count": previous - start + 1,
+                    "first_time_s": times[start] if start < len(times) else None,
+                    "last_time_s": times[previous] if previous < len(times) else None,
+                }
+            )
+            start = previous = index
+        missing_ranges.append(
+            {
+                "first_step": start,
+                "last_step": previous,
+                "count": previous - start + 1,
+                "first_time_s": times[start] if start < len(times) else None,
+                "last_time_s": times[previous] if previous < len(times) else None,
+            }
+        )
+    return {
+        "measured_count": len(known_steps),
+        "expected_count": expected,
+        "missing_count": max(0, expected - len(known_steps)),
+        "coverage_rate": (len(known_steps) / expected) if expected else None,
+        "first_step": known_steps[0] if known_steps else None,
+        "last_step": known_steps[-1] if known_steps else None,
+        "first_time_s": known_times[0] if known_times else None,
+        "last_time_s": known_times[-1] if known_times else None,
+        "missing_ranges": missing_ranges,
+        "missing_spans": missing_ranges,
+    }
+
+
+def _event_duration_measurement(
+    event_indices: Sequence[int],
+    deltas: Sequence[float | None],
+) -> dict[str, Any]:
+    """Report duration coverage for the intervals belonging to one event type.
+
+    Summing only known intervals can make a partially measured event look
+    complete.  Keep that partial sum for diagnostics, while callers use the
+    status/coverage fields to decide whether the public duration is valid.
+    """
+
+    indices = [int(index) for index in event_indices]
+    measured_indices = [index for index in indices if index < len(deltas) and deltas[index] is not None]
+    missing_indices = [index for index in indices if index >= len(deltas) or deltas[index] is None]
+    measured_duration = (
+        float(sum(float(deltas[index]) for index in measured_indices))
+        if measured_indices
+        else None
+    )
+    expected_count = len(indices)
+    measured_count = len(measured_indices)
+    if expected_count == 0:
+        status = "not_applicable"
+        reason = "no_events"
+    elif measured_count == expected_count:
+        status = "complete"
+        reason = None
+    elif measured_count == 0:
+        status = "unavailable"
+        reason = "missing_event_interval"
+    else:
+        status = "partial"
+        reason = "missing_event_interval"
+    return {
+        "status": status,
+        "measured_duration_s": measured_duration,
+        "measured_count": measured_count,
+        "expected_count": expected_count,
+        "missing_count": len(missing_indices),
+        "coverage_rate": (measured_count / expected_count) if expected_count else None,
+        "measured_event_indices": measured_indices,
+        "missing_event_indices": missing_indices,
+        "reason": reason,
+    }
+
+
 def summarize_trajectory(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -271,14 +370,17 @@ def summarize_trajectory(
     poststep_count = len(rows)
     known_deltas = [delta for delta in deltas if delta is not None]
     verified_time_interval_count = len(known_deltas)
-    total_duration = sum(known_deltas) if known_deltas else None
+    measured_duration = float(sum(known_deltas)) if known_deltas else None
+    interval_expected = len(rows)
+    duration_complete = bool(interval_expected) and verified_time_interval_count == interval_expected
+    total_duration = measured_duration if duration_complete else None
     valid_durations = [
         delta for delta, valid in zip(deltas, valid_mask, strict=False)
         if valid and delta is not None
     ]
     valid_time = (
         sum(valid_durations)
-        if known_deltas and (valid_durations or valid_count == 0)
+        if duration_complete and known_deltas and (valid_durations or valid_count == 0)
         else None
     )
     sample_valid_rate = (
@@ -292,6 +394,70 @@ def summarize_trajectory(
         else None
     )
 
+    lane_error_values = [_lane_error(telemetry) for telemetry in telemetry_rows]
+    lane_valid_values = [_lane_valid(telemetry) for telemetry in telemetry_rows]
+    speed_values = [_speed_m_s(telemetry) for telemetry in telemetry_rows]
+    progress_values = [_progress_m(telemetry) for telemetry in telemetry_rows]
+    # Each closed-loop record represents one pre→post simulator interval when
+    # explicit pre/post clocks are present.  A collector without a first
+    # pre-time may leave only the first interval unknown, but its denominator
+    # remains the number of attempted steps.
+    interval_coverage = (
+        verified_time_interval_count / interval_expected
+        if interval_expected
+        else None
+    )
+    interval_measurement = _measurement_info(deltas, times)
+    duration_measurement = {
+        "status": (
+            "unavailable"
+            if interval_expected == 0 or verified_time_interval_count == 0
+            else "partial"
+            if verified_time_interval_count < interval_expected
+            else "complete"
+        ),
+        "measured_count": verified_time_interval_count,
+        "expected_count": interval_expected,
+        "missing_count": max(0, interval_expected - verified_time_interval_count),
+        "coverage_rate": interval_coverage,
+        "measured_duration_s": measured_duration,
+        "missing_ranges": interval_measurement["missing_ranges"],
+        "reason": (
+            "no_records"
+            if interval_expected == 0
+            else "missing_pre_or_post_time"
+            if verified_time_interval_count < interval_expected
+            else None
+        ),
+    }
+    known_times = [value for value in times if value is not None]
+    measurement_range = {
+        "first_time_s": float(known_times[0]) if known_times else None,
+        "last_time_s": float(known_times[-1]) if known_times else None,
+        "span_s": (
+            float(known_times[-1] - known_times[0])
+            if len(known_times) >= 2
+            else None
+        ),
+        "timestamp_count": len(known_times),
+        "expected_timestamp_count": len(rows),
+        "missing_timestamp_count": max(0, len(rows) - len(known_times)),
+        "interval_count": verified_time_interval_count,
+        "expected_interval_count": interval_expected,
+        "interval_coverage_rate": interval_coverage,
+        "missing_interval_count": duration_measurement["missing_count"],
+        "missing_interval_ranges": duration_measurement["missing_ranges"],
+        "measured_duration_s": duration_measurement["measured_duration_s"],
+        "duration_measurement_reason": duration_measurement["reason"],
+    }
+    telemetry_coverage = {
+        "lane_error": _measurement_info(lane_error_values, times),
+        "lane_valid": _measurement_info(lane_valid_values, times),
+        "speed_m_s": _measurement_info(speed_values, times),
+        "progress_m": _measurement_info(progress_values, times),
+        "clock": _measurement_info(times, times),
+    }
+
     departure_events: list[int] = []
     consecutive = max(1, int(departure_consecutive_steps))
     index = 0
@@ -304,14 +470,17 @@ def summarize_trajectory(
             index += 1
         if index - start >= consecutive:
             departure_events.append(start)
-    departure_durations = [
-        delta for delta, value in zip(deltas, departures, strict=False)
-        if value is True and delta is not None
-    ]
-    departure_observations = [value for value in departures if value is True]
+    departure_event_indices = [index for index, value in enumerate(departures) if value is True]
+    departure_duration_measurement = _event_duration_measurement(
+        departure_event_indices,
+        deltas,
+    )
+    departure_observations = departure_event_indices
     departure_time = (
-        (sum(departure_durations) if departure_durations else None)
-        if departure_observations and known_deltas
+        departure_duration_measurement["measured_duration_s"]
+        if departure_observations and departure_duration_measurement["status"] == "complete"
+        else None
+        if departure_observations
         else 0.0
         if known_deltas
         else None
@@ -327,13 +496,20 @@ def summarize_trajectory(
         speed for speed in speeds_for_low
         if speed is not None and speed < float(low_speed_m_s)
     ]
-    low_speed_durations = [
-        delta for delta, speed in zip(deltas, speeds_for_low, strict=False)
-        if speed is not None and speed < float(low_speed_m_s) and delta is not None
+    low_speed_event_indices = [
+        index
+        for index, speed in enumerate(speeds_for_low)
+        if speed is not None and speed < float(low_speed_m_s)
     ]
+    low_speed_duration_measurement = _event_duration_measurement(
+        low_speed_event_indices,
+        deltas,
+    )
     low_speed_duration = (
-        (sum(low_speed_durations) if low_speed_durations else None)
-        if low_speed_observations and known_deltas
+        low_speed_duration_measurement["measured_duration_s"]
+        if low_speed_observations and low_speed_duration_measurement["status"] == "complete"
+        else None
+        if low_speed_observations
         else 0.0
         if known_deltas
         else None
@@ -379,10 +555,44 @@ def summarize_trajectory(
     progress_value = progress[-1] if progress else None
     result: dict[str, Any] = {
         "status": metric_status,
+        "telemetry_status": (
+            "unavailable"
+            if not known_times and not any(value is not None for value in lane_error_values)
+            else "partial"
+            if any(
+                item["missing_count"] > 0
+                for item in telemetry_coverage.values()
+                if isinstance(item, Mapping)
+            )
+            else "complete"
+        ),
         "poststep_count": poststep_count,
         "valid_count": valid_count,
         "valid_poststep_count": valid_count,
         "verified_time_interval_count": verified_time_interval_count,
+        "duration_measurement": duration_measurement,
+        "departure_duration_measurement": departure_duration_measurement,
+        "low_speed_duration_measurement": low_speed_duration_measurement,
+        "measurement_range": measurement_range,
+        "telemetry_measurement_range": measurement_range,
+        "measured_time_span_s": measurement_range["span_s"],
+        "measured_first_time_s": measurement_range["first_time_s"],
+        "measured_last_time_s": measurement_range["last_time_s"],
+        "telemetry_coverage": telemetry_coverage,
+        "partial_telemetry": bool(
+            any(
+                item["missing_count"] > 0
+                for item in telemetry_coverage.values()
+                if isinstance(item, Mapping)
+            )
+        ),
+        "measured_step_count": {
+            "poststep": poststep_count,
+            "lane_error": int(sum(value is not None for value in lane_error_values)),
+            "speed_m_s": int(sum(value is not None for value in speed_values)),
+            "progress_m": int(sum(value is not None for value in progress_values)),
+            "clock": len(known_times),
+        },
         "valid_time_s": valid_time if lane_reference_known else None,
         "valid_time_seconds": valid_time if lane_reference_known else None,
         "valid_time": valid_time if lane_reference_known else None,

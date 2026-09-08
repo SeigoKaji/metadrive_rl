@@ -11,11 +11,17 @@ unzip -l /tmp/input_attribution_portable.zip
 
 ZIP は `input_attribution/` 配下だけを entry 順、DOS timestamp、ファイル mode 固定で収録し、同じ source bytes から同じ archive bytes を作れるようにしています。実験結果の `.jsonl`/`.npz`/動画、model archive、cache、font は除外されます。除外対象を一つでも必要とする場合は、ZIPへ混ぜずに移植先の実行環境から別途指定します。
 
+このZIPは `input_attribution/` 追加パッケージだけを収録し、移植先の既存
+`models/`、262次元観測生成器、学習用設定、MetaDrive checkout を上書きしません。
+262次元の意味が未確認なら `schemas/custom_262_template.json` と
+`adapters/port_template.py` のまま停止し、既存の観測ソースを確認した後に専用の
+schema/config名を追加します。
+
 run の stage が再実行された場合は `status.json` の `analysis_id`/`relative_dir` が指す最新の成功結果だけを report が読みます。過去の analysis ID を同じ表へ混ぜません。レポート再生成も root の初版を残し、`reports/<report_id>/` に保存します。
 
 ## 最小の編集箇所
 
-移植先で確認・編集するのは解析用 TOML、adapter、schema の3箇所です。公式環境接続が使える PC では、同梱の `input_attribution/adapters/metadrive.py` を既存の環境 factory/model loader へ接続するか、`input_attribution/adapters/port_template.py` をコピーして小さな adapter を実装します。学習時の設定解決、環境生成、model input 前処理、Action decode、未加工テレメトリ取得は adapter に閉じ込めます。既存 `train.py`、`evaluate.py`、MetaDrive本体、SB3 の private helper は変更しません。
+移植先で確認・編集するのは解析用 TOML、adapter、schema の3箇所です。公式環境接続が使える PC では、同梱の `input_attribution/adapters/metadrive.py` を既存の環境 factory/model loader へ接続するか、`input_attribution/adapters/port_template.py` をコピーして小さな adapter を実装します。現在の実走行確認用Pythonは `/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3`、この repository に保存したモデル例は `/home/seigo/workspace/metadrive_rl/metadrive-rl-input-attribution/models/official_baseline.zip`（SHA256: `0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`）です。学習時の設定解決、環境生成、model input 前処理、Action decode、未加工テレメトリ取得は adapter に閉じ込めます。既存 `train.py`、`evaluate.py`、MetaDrive本体、SB3 の private helper は変更しません。
 
 adapter の最小契約は次の通りです。
 
@@ -80,6 +86,12 @@ class MyAdapter(PortAdapterTemplate):
 5. ①-A で保存観測から結果を再計算し、env.step()を呼ばず、元配列と model weights/normalization が不変であることを確認します。
 6. ①-B は P00、追加特徴、重点 group を逐次実行します。runごとに reset/closeし、terminated/truncated 後に step せず、加工済み入力から物理評価を作りません。
 7. `report` で日本語 HTML/MD、UTF-8 BOM CSV、SVG、media links、manifest/status を確認します。未実行・欠測が0へ置換されていないことを確認します。
+
+既存runの再解析は用途を分けます。表示だけを修正する場合は
+`/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3 -m input_attribution report --run-dir <old-run> --output-dir <new-report-dir>` を使い、旧runを変更しません。新しい①-A variantを追加する場合は
+`/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3 -m input_attribution offline --run-dir <old-run> --config <new-analysis.toml>` を使い、モデルhash、入力意味・順序・正規化・結合条件、前処理hashが一致する子runへ保存観測をコピーします。新しい①-B条件はその子runへ `/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3 -m input_attribution closed-loop --run-dir <child-run> --patterns P00,<重点pattern>` を実行して走り直します。意味定義を変更したschemaは保存観測へ適用せず、移植先の通常走行を新規収集します。
+
+動画は設定の `video.enabled = true` と `video.patterns = ["P00", "<重点pattern>"]` を組み合わせて対象を少数指定します。`closed-loop --patterns P00,<重点pattern>` は走行する介入 pattern の集合を選び、`video.patterns` はその中から動画を保存する集合を選びます。`video.patterns` を省略すると走行対象の全 pattern が動画対象になります。動画を全て無効にする場合は `video.enabled = false` とします。全LiDAR個別動画を暗黙に生成しません。
 
 ## よくあるエラー
 

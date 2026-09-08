@@ -13,5 +13,13 @@
     "metadrive": "0.4.3",
     "captum": "not installed"
   },
-  "reference_model_sha256": "254b19aea772480133e19eb5db68b0fb5e1bdadfa221890a68494c8eb5d513e6"
+  "reference_model_sha256": "254b19aea772480133e19eb5db68b0fb5e1bdadfa221890a68494c8eb5d513e6",
+  "revision_baseline": {
+    "head": "6584bd9f5a5786c137cbf7d3536a5dbd5ea50f11",
+    "branch": "input_attribution",
+    "initial_worktree_clean": true,
+    "base_commit_reset": false,
+    "model_sha256": "0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db",
+    "description": "Revision work started from the current input_attribution HEAD after inspecting the clean initial worktree. The historical base_commit above was not reset to or rebuilt."
+  }
 }

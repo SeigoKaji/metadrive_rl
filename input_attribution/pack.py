@@ -170,7 +170,12 @@ make_reproducible_zip = create_portable_zip
 
 
 def package_manifest(source_root: str | os.PathLike[str]) -> dict[str, object]:
-    """ZIP に入るファイルと SHA256 を確認する（ZIP自体は含めない）。"""
+    """ZIP に入るファイルと SHA256 を確認する（ZIP自体は含めない）。
+
+    The scope field is deliberately explicit: unpacking this package adds an
+    ``input_attribution`` directory and does not replace an external model,
+    MetaDrive checkout, training config, or a port's existing 262-D producer.
+    """
 
     root = Path(source_root).expanduser().resolve()
     files = portable_files(root)
@@ -179,7 +184,13 @@ def package_manifest(source_root: str | os.PathLike[str]) -> dict[str, object]:
         relative = _zip_entry_name(path, root)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         entries.append({"path": relative, "sha256": digest, "bytes": path.stat().st_size})
-    return {"source_root": str(root), "entry_count": len(entries), "entries": entries}
+    return {
+        "source_root": str(root),
+        "entry_count": len(entries),
+        "entries": entries,
+        "scope": "input_attribution_addon_only",
+        "external_environment_policy": "never_overwrite_models_or_262d_observation_sources",
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:

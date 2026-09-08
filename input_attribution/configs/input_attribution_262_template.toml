@@ -69,6 +69,8 @@ episodes = 1
 
 [video]
 enabled = false
+# A resolved port may select declared IDs, for example:
+# patterns = ["P00", "P04_lane_triplet"]
 
 [ig]
 enabled = false
@@ -87,6 +89,8 @@ id = "P01_offset"
 description = "target_lane_offset: fill source-verified integer index and replacement"
 indices = []
 method = "fixed"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
 metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_offset"], skip_reason = "unresolved 262 schema" }
 
 [[patterns]]
@@ -94,6 +98,8 @@ id = "P02_heading"
 description = "target_lane_heading_error: fill source-verified integer index and replacement"
 indices = []
 method = "fixed"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
 metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_heading_error"], skip_reason = "unresolved 262 schema" }
 
 [[patterns]]
@@ -101,6 +107,8 @@ id = "P03_offset_heading"
 description = "target_lane_offset + target_lane_heading_error: fill source-verified indices and replacements"
 indices = []
 method = "fixed"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
 metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_offset", "target_lane_heading_error"], skip_reason = "unresolved 262 schema" }
 
 [[patterns]]
@@ -109,4 +117,6 @@ description = "target-lane offset, heading, valid flag from one compatible refer
 indices = []
 method = "reference"
 reference_id = "episode-0:0"
+scope = "explicitly_conditional"
+on_inapplicable = "continue_unmodified_with_warning"
 metadata = { requires_schema_resolution = true, semantic_ids = ["target_lane_offset", "target_lane_heading_error", "target_lane_valid"], skip_reason = "unresolved 262 schema" }

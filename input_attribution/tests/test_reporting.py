@@ -69,7 +69,10 @@ def test_report_reads_runtime_fixture_and_keeps_p00_pairing(tmp_path: Path) -> N
     assert rows["P01"]["offline_noop_count"] == 1
     assert rows["P01"]["offline_action_change_rate"] == 0.5
     assert rows["P00"]["closed_loop_lane_rms_m"] is not None
-    assert rows["P01"]["p00_delta_lane_rms_m"] is not None
+    # The fixture has no initial/reference or paired episode evidence.  The
+    # report must keep this comparison unknown instead of subtracting the
+    # aggregate P00 baseline.
+    assert rows["P01"]["p00_delta_lane_rms_m"] is None
     assert rows["P01"]["closed_loop_termination"] == "out_of_road"
     assert "N/A" in (run_dir / "report.md").read_text(encoding="utf-8") or "未実行" in (run_dir / "report.md").read_text(encoding="utf-8")
     html = (run_dir / "report.html").read_text(encoding="utf-8")
@@ -97,7 +100,8 @@ def test_report_without_optional_ig_marks_it_as_unexecuted(tmp_path: Path) -> No
     assert result.summary_rows == ()
     text = (run_dir / "report.md").read_text(encoding="utf-8")
     assert "③ IG は未実行" in text
-    assert "report_ig.svg" in text
+    assert "report_ig.svg" not in text
+    assert not (run_dir / "report_ig.svg").exists()
     assert "未実行または結果未記録" in text
 
 
@@ -470,6 +474,8 @@ def test_report_aggregates_distinct_closed_loop_episodes(tmp_path: Path) -> None
                         "arrived": arrived,
                         "progress_m": float(episode + 1),
                         "paired_p00": paired,
+                        "initial_snapshot": {"initial_match": {"matched": True}},
+                        "reference_trace_validation": {"status": "matched", "mismatch_count": 0},
                     },
                     "records": [{"step": 0, "post_time": 0.1, "post_telemetry": {"target_lane_offset_m": rms}}],
                 },

@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import subprocess
 import tempfile
 from typing import Any
@@ -38,6 +39,136 @@ def sha256_file(path: str | Path) -> str:
 
 def sha256_object(value: object) -> str:
     return sha256_bytes(canonical_json(value).encode("utf-8"))
+
+
+_RECOMMENDATION_KEYS = frozenset(
+    {"kind", "value", "values", "value_method", "level", "levels", "center", "centers", "operation", "method"}
+)
+_SEMANTIC_EXTENSION_KEYS = frozenset(
+    {
+        "adapter_encoding",
+        "decode",
+        "encode",
+        "encoding",
+        "input_encoding",
+        "layout",
+        "observation_encoding",
+        "semantic_adapter",
+        "shape",
+        "dtype",
+    }
+)
+
+
+def _replacement_semantics_payload(value: object) -> object:
+    """Keep invalid/coupling meaning while dropping recommendation values."""
+
+    if not isinstance(value, Mapping):
+        return value
+    return {
+        str(key): _schema_semantics_payload(item)
+        for key, item in value.items()
+        if str(key) not in _RECOMMENDATION_KEYS
+    }
+
+
+def _schema_semantics_payload(value: object) -> object:
+    """Return schema meaning while ignoring replaceable recommendation data.
+
+    A saved observation can be reused when an analysis adds or changes an
+    explicitly verified intervention variant.  That exception must stay narrow:
+    input order, source meaning, encoding, normalization, ranges, invalid
+    sentinels, and coupled flags remain part of the reuse contract.  Schema files are JSON in the
+    portable package; the byte hash fallback keeps custom formats fail-closed.
+    """
+
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            # ``variants`` is the public name used by newer InputSpec schema
+            # snapshots; all three keys describe intervention choices rather
+            # than the input's meaning/order contract.
+            if key_text in {"intervention_variants", "replacement_variants", "variants"}:
+                continue
+            if key_text == "replacement":
+                result[key_text] = _replacement_semantics_payload(item)
+            else:
+                result[key_text] = _schema_semantics_payload(item)
+        return result
+    if isinstance(value, list):
+        return [_schema_semantics_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_schema_semantics_payload(item) for item in value)
+    return value
+
+
+def _semantic_extension_payload(value: object) -> object | None:
+    """Keep adapter-owned encoding metadata omitted by legacy schema models.
+
+    ``InputSchema.to_dict`` intentionally emits the fields understood by this
+    package.  A port may also carry an adapter encoding/decode declaration in
+    an extension field; dropping it during old/new normalization would let an
+    incompatible observation order through reuse.  Collect only those
+    explicitly semantic extension keys and still apply the variant exception.
+    """
+
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in {"intervention_variants", "replacement_variants", "variants"}:
+                continue
+            if key_text in _SEMANTIC_EXTENSION_KEYS:
+                result[key_text] = _schema_semantics_payload(item)
+                continue
+            nested = _semantic_extension_payload(item)
+            if nested not in (None, {}, []):
+                result[key_text] = nested
+        return result
+    if isinstance(value, list):
+        values = [_semantic_extension_payload(item) for item in value]
+        return [item for item in values if item not in (None, {}, [])]
+    if isinstance(value, tuple):
+        values = [_semantic_extension_payload(item) for item in value]
+        return [item for item in values if item not in (None, {}, [])]
+    return None
+
+
+def schema_semantics_hash_from_value(value: object) -> str:
+    """Hash a loaded schema snapshot using the same narrow variant rule."""
+
+    # Normalize legacy JSON and current ``InputSchema.to_dict`` output through
+    # the schema model first.  New defaults (for example an empty top-level
+    # variant map) must not make an old snapshot look semantically different.
+    raw_value = value
+    try:
+        from .schema import InputSchema
+
+        if isinstance(value, Mapping):
+            value = InputSchema.from_dict(value).to_dict()
+    except Exception:
+        # Validation belongs to schema loading; hashing remains useful for a
+        # legacy snapshot that predates a field understood by this package.
+        pass
+    payload: object = _schema_semantics_payload(value)
+    extensions = _semantic_extension_payload(raw_value)
+    if extensions not in (None, {}, []):
+        payload = {"schema": payload, "semantic_extensions": extensions}
+    return sha256_object(payload)
+
+
+def schema_semantics_hash(path: str | Path) -> str | None:
+    """Hash input order/meaning independently from replacement variants."""
+
+    target = Path(path)
+    if not target.is_file():
+        return None
+    try:
+        value = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return sha256_file(target)
+    return schema_semantics_hash_from_value(value)
 
 
 def sha256_paths(paths: Iterable[str | Path]) -> str:
@@ -288,6 +419,7 @@ def build_manifest(
     except (OSError, subprocess.CalledProcessError):
         git = {"head": None, "dirty": None, "error": "git metadata unavailable"}
 
+    semantics_hash = schema_semantics_hash(schema_path) if schema_path is not None else None
     manifest: dict[str, Any] = {
         "manifest_version": 1,
         "base_commit": "0184eb26509eb33997229d0aa99c0b8939ec6a1e",
@@ -303,7 +435,9 @@ def build_manifest(
         "patterns_sha256": sha256_object(patterns if patterns is not None else (config_dict or {}).get("patterns", [])),
         "preprocess_sha256": sha256_object(preprocess if preprocess is not None else (config_dict or {}).get("preprocess", {})),
         "model": {"path": str(model_path) if model_path is not None else None, "sha256": None},
-        "schema": {"path": str(schema_path) if schema_path is not None else None, "sha256": None},
+        "schema": {"path": str(schema_path) if schema_path is not None else None, "sha256": None,
+                   "semantics_sha256": semantics_hash},
+        "input_semantics_sha256": semantics_hash,
         "observations": {"path": str(observations_path) if observations_path is not None else None, "sha256": None},
         "code_sha256": code_fingerprint(),
     }
@@ -346,6 +480,37 @@ def seal_reference(store: RunArtifacts) -> None:
     manifest["observations"] = {"path": str(store.reference_dir / "observations.npy"),
                                 "sha256": files["00_reference/observations.npy"]}
     store.save_manifest(manifest)
+
+
+def copy_reference(source: RunArtifacts, destination: RunArtifacts) -> dict[str, str]:
+    """Copy a sealed reference snapshot into a new run without touching source.
+
+    The copy is intentionally a regular byte-for-byte copy rather than a
+    symlink/hardlink.  A child analysis therefore remains portable and later
+    edits cannot mutate the parent run through shared inodes.
+    """
+
+    verify_reference(source)
+    if destination.reference_dir.exists():
+        existing = [path for path in destination.reference_dir.rglob("*") if path.is_file()]
+        if existing:
+            raise FileExistsError(f"destination reference is not empty: {destination.reference_dir}")
+    destination.reference_dir.mkdir(parents=True, exist_ok=True)
+    for path in sorted(source.reference_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source.reference_dir)
+        target = destination.reference_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    files = {
+        str(path.relative_to(destination.run_dir)): sha256_file(path)
+        for path in sorted(destination.reference_dir.rglob("*"))
+        if path.is_file()
+    }
+    if not files:
+        raise ValueError("reference snapshot is empty")
+    return files
 
 
 def verify_reference(store: RunArtifacts) -> None:

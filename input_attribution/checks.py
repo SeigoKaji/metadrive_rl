@@ -193,7 +193,12 @@ def _probe(config: Any, adapter: Any, policy: Any, *, schema: Any, steps: int) -
             if not np.array_equal(identity, obs) or not np.allclose(probabilities, replay, rtol=1e-7, atol=1e-7):
                 raise CheckError("P00 copy/reinference path is inconsistent")
             for pattern in config.patterns:
-                if pattern.get("method") == "fixed":
+                if pattern.get("method", pattern.get("operation")) in {
+                    "fixed",
+                    "fixed_level",
+                    "neutral",
+                    "reflection",
+                }:
                     outcome = apply_intervention(obs, pattern, schema, strict=False)
                     if outcome.skipped and not any(term in (outcome.skip_reason or "") for term in ("precondition", "context")):
                         raise CheckError(f"invalid fixed replacement: {outcome.skip_reason}")

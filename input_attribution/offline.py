@@ -19,6 +19,7 @@ from .interventions import (
 from .metrics import (
     DistributionComparison,
     compare_distributions,
+    intervention_counts,
     marginal_probability_comparison,
     summarize_distribution_comparison,
 )
@@ -42,6 +43,38 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
     return value
+
+
+def _telemetry_time_s(context: Mapping[str, Any] | None) -> float | None:
+    """Return a declared pre-action simulator time from an observation context.
+
+    Offline rows also carry an observation ``step`` index, but that index is
+    not a clock.  Keep the time unavailable when the saved telemetry has no
+    explicit time field instead of manufacturing seconds from the index.
+    """
+
+    if not isinstance(context, Mapping):
+        return None
+    for key in (
+        "simulation_time_s",
+        "simulation_time_seconds",
+        "simulation_time",
+        "sim_time_seconds",
+        "sim_time_s",
+        "sim_time",
+        "time_s",
+        "time",
+    ):
+        value = context.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if np.isfinite(numeric):
+            return numeric
+    return None
 
 
 def _validate_batch(observations: Any, schema: InputSchema) -> np.ndarray:
@@ -156,12 +189,17 @@ class OfflinePatternResult:
     changed_input_mask: np.ndarray
     changed_indices_by_row: tuple[tuple[int, ...], ...]
     changed_probabilities: np.ndarray
+    intervention_counts: Mapping[str, Any] = field(default_factory=dict)
+    step_masks: Mapping[str, np.ndarray] = field(default_factory=dict)
+    road_segment_ids: tuple[Any, ...] = ()
 
     def to_dict(self, *, include_arrays: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = {
             "pattern": self.pattern.to_dict(),
             "rows": [_json_value(row) for row in self.rows],
             "summary": _json_value(self.summary),
+            "intervention_counts": _json_value(self.intervention_counts),
+            "road_segment_ids": _json_value(self.road_segment_ids),
         }
         if include_arrays:
             result.update(
@@ -170,6 +208,10 @@ class OfflinePatternResult:
                     "changed_input_mask": self.changed_input_mask.tolist(),
                     "changed_indices_by_row": [list(item) for item in self.changed_indices_by_row],
                     "changed_probabilities": self.changed_probabilities.tolist(),
+                    "step_masks": {
+                        str(name): np.asarray(values, dtype=bool).tolist()
+                        for name, values in self.step_masks.items()
+                    },
                 }
             )
         return result
@@ -223,21 +265,89 @@ def _build_rows(
     steps: np.ndarray,
     comparison: DistributionComparison,
     interventions: Sequence[InterventionResult],
+    observations: np.ndarray,
+    changed_indices_by_row: Sequence[tuple[int, ...]],
+    schema: InputSchema,
+    observation_contexts: Sequence[Mapping[str, Any] | None] | None = None,
     marginals: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     rows: list[dict[str, Any]] = []
     for index, intervention in enumerate(interventions):
+        changed_indices = tuple(changed_indices_by_row[index])
+        requested_indices = tuple(
+            int(value)
+            for value in getattr(intervention, "requested_indices", pattern.resolve_indices(schema))
+        )
+        original_values = {
+            str(input_index): _json_value(observations[index, input_index])
+            for input_index in requested_indices
+        }
+        modified_values = {
+            str(input_index): _json_value(intervention.observation[input_index])
+            for input_index in requested_indices
+        }
+        delta_values = {
+            input_index: _json_value(
+                np.asarray(intervention.observation[input_index], dtype=np.float64)
+                - np.asarray(observations[index, input_index], dtype=np.float64)
+            )
+            for input_index in requested_indices
+        }
+        delta_abs_values = {
+            input_index: _json_value(abs(float(delta_values[input_index])))
+            for input_index in requested_indices
+            if isinstance(delta_values[input_index], (int, float, np.integer, np.floating))
+        }
+        context = observation_contexts[index] if observation_contexts is not None else None
+        road_segment_id = context.get("road_segment_id") if isinstance(context, Mapping) else None
+        time_s = _telemetry_time_s(context)
+        eligible = getattr(intervention, "eligible", None)
+        if eligible is None:
+            eligible = not bool(getattr(intervention, "skipped", False))
+        reason_text = str(getattr(intervention, "skip_reason", "") or "").casefold()
+        if getattr(pattern, "scope", None) == "explicitly_conditional" and any(
+            token in reason_text
+            for token in ("compatibility context", "reference context", "reference observation")
+        ):
+            eligible = False
+        applied = getattr(intervention, "applied", None)
+        if applied is None:
+            applied = bool(eligible) and not bool(getattr(intervention, "skipped", False))
+        skipped = bool(getattr(intervention, "skipped", False))
         rows.append(
             {
                 "pattern_id": pattern.pattern_id,
                 "episode": _json_value(episodes[index]),
                 "step": _json_value(steps[index]),
-                "requested_indices": list(intervention.requested_indices),
-                "changed_indices": list(intervention.changed_indices),
-                "no_op_indices": list(intervention.no_op_indices),
-                "actual_input_changed": intervention.changed,
-                "skipped": intervention.skipped,
-                "skip_reason": intervention.skip_reason,
+                "requested_indices": list(requested_indices),
+                "changed_indices": list(changed_indices),
+                "no_op_indices": (
+                    [item for item in requested_indices if item not in changed_indices]
+                    if applied and not skipped
+                    else []
+                ),
+                "actual_input_changed": bool(changed_indices),
+                "changed_exact": bool(changed_indices),
+                "eligible": bool(eligible),
+                "applied": bool(applied),
+                "skipped": skipped,
+                "skip_reason": getattr(intervention, "skip_reason", None),
+                "skip_category": getattr(intervention, "skip_category", None),
+                "road_segment_id": _json_value(road_segment_id),
+                "time_s": time_s,
+                "original_values": original_values,
+                "modified_values": modified_values,
+                "delta_values": delta_values,
+                "delta_abs_values": delta_abs_values,
+                "meaningful_changed_indices": list(
+                    getattr(intervention, "meaningful_changed_indices", ()) or ()
+                ),
+                "meaningful_changed_count": int(
+                    getattr(intervention, "meaningful_changed_count", 0) or 0
+                ),
+                "tolerance": _json_value(getattr(intervention, "tolerance", {})),
+                "clipped_indices": list(getattr(intervention, "clipped_indices", ()) or ()),
+                "clip_count": int(getattr(intervention, "clip_count", 0) or 0),
                 "original_argmax": int(comparison.original_argmax[index]),
                 "changed_argmax": int(comparison.changed_argmax[index]),
                 "action_changed": bool(comparison.action_changed[index]),
@@ -246,6 +356,8 @@ def _build_rows(
                 "selected_probability_changed": float(comparison.selected_probability_changed[index]),
                 "selected_probability_delta": float(comparison.selected_probability_delta[index]),
                 "selected_probability_delta_pp": float(comparison.selected_probability_delta_pp[index]),
+                "selected_probability_abs_delta": float(comparison.selected_probability_abs_delta[index]),
+                "selected_probability_abs_delta_pp": float(comparison.selected_probability_abs_delta_pp[index]),
                 "js_divergence": float(comparison.js[index]),
             }
         )
@@ -369,6 +481,10 @@ def analyze_offline(
         altered_rows: list[np.ndarray] = []
         changed_mask = np.zeros((time_count, schema.dimension), dtype=bool)
         changed_row_indices: list[tuple[int, ...]] = []
+        eligible_mask = np.zeros(time_count, dtype=bool)
+        applied_mask = np.zeros(time_count, dtype=bool)
+        meaningful_mask = np.zeros(time_count, dtype=bool)
+        road_segment_ids: list[Any] = []
         for row_index, row in enumerate(original_observations):
             try:
                 intervention = apply_intervention(
@@ -387,9 +503,55 @@ def analyze_offline(
                     f"pattern {pattern.pattern_id} failed: {exc}"
                 ) from exc
             interventions.append(intervention)
-            altered_rows.append(intervention.observation)
-            changed_mask[len(interventions) - 1, list(intervention.changed_indices)] = True
-            changed_row_indices.append(intervention.changed_indices)
+            altered = np.asarray(intervention.observation).copy()
+            altered_rows.append(altered)
+            requested_indices = tuple(
+                int(value)
+                for value in getattr(intervention, "requested_indices", pattern.resolve_indices(schema))
+            )
+            # Recompute exact changes from the final dtype passed to the policy.
+            # This deliberately keeps tiny representational differences in the
+            # exact count; meaningful thresholds are a separate core field.
+            exact_changed = tuple(
+                index
+                for index in requested_indices
+                if not np.array_equal(row[index], altered[index], equal_nan=False)
+            )
+            changed_mask[row_index, list(exact_changed)] = True
+            changed_row_indices.append(exact_changed)
+            skipped = bool(getattr(intervention, "skipped", False))
+            skip_reason_text = str(getattr(intervention, "skip_reason", "") or "").casefold()
+            declared_out_of_scope = bool(
+                getattr(pattern, "scope", None) == "explicitly_conditional"
+                and any(
+                    token in skip_reason_text
+                    for token in ("compatibility context", "reference context", "reference observation")
+                )
+            )
+            eligible = getattr(intervention, "eligible", None)
+            if eligible is None:
+                eligible = not skipped
+            if declared_out_of_scope:
+                eligible = False
+            applied = getattr(intervention, "applied", None)
+            if applied is None:
+                applied = bool(eligible) and not skipped
+            eligible_mask[row_index] = bool(eligible)
+            applied_mask[row_index] = bool(applied) and not skipped
+            meaningful = getattr(intervention, "meaningful", None)
+            if meaningful is None:
+                meaningful = getattr(intervention, "meaningful_changed", None)
+            if meaningful is None:
+                meaningful_indices = getattr(intervention, "meaningful_changed_indices", ()) or ()
+                tolerance_values = getattr(intervention, "tolerance", {}) or {}
+                if meaningful_indices or tolerance_values:
+                    meaningful = getattr(intervention, "meaningful_changed_count", None)
+            if meaningful is not None:
+                meaningful_mask[row_index] = bool(meaningful)
+            context = contexts[row_index]
+            road_segment_ids.append(
+                _json_value(context.get("road_segment_id")) if isinstance(context, Mapping) else None
+            )
         altered_observations = np.stack(altered_rows, axis=0)
         try:
             changed_probabilities = adapter.probabilities(altered_observations)
@@ -421,10 +583,14 @@ def analyze_offline(
             steps=step_values,
             comparison=comparison,
             interventions=interventions,
+            observations=original_observations,
+            changed_indices_by_row=changed_row_indices,
+            schema=schema,
+            observation_contexts=contexts,
             marginals=marginals,
         )
         actual_row_mask = np.any(changed_mask, axis=1)
-        valid_row_mask = np.asarray([not item.skipped for item in interventions], dtype=bool)
+        valid_row_mask = np.array(applied_mask, copy=True)
         summary = summarize_distribution_comparison(
             comparison,
             changed_input_mask=actual_row_mask,
@@ -434,6 +600,43 @@ def analyze_offline(
         valid_count = int(np.sum(valid_row_mask))
         actual_valid_count = int(np.sum(actual_row_mask & valid_row_mask))
         no_op_valid_count = valid_count - actual_valid_count
+        counts = intervention_counts(
+            interventions,
+            target_step_count=time_count,
+            declared_out_of_scope=[
+                bool(
+                    getattr(pattern, "scope", None) == "explicitly_conditional"
+                    and any(
+                        token in str(getattr(item, "skip_reason", "") or "").casefold()
+                        for token in ("compatibility context", "reference context", "reference observation")
+                    )
+                )
+                for item in interventions
+            ],
+        )
+        counts.update(
+            {
+                "eligible_count": int(np.sum(eligible_mask)),
+                "applied_count": int(np.sum(applied_mask)),
+                "changed_count_exact": actual_valid_count,
+                "changed_count": actual_valid_count,
+                "noop_count": no_op_valid_count,
+                "meaningful_changed_count": int(np.sum(meaningful_mask))
+                if any(
+                    getattr(item, "meaningful", None) is not None
+                    or getattr(item, "meaningful_changed", None) is not None
+                    or bool(getattr(item, "meaningful_changed_indices", ()) or ())
+                    or bool(getattr(item, "tolerance", {}) or {})
+                    for item in interventions
+                )
+                else None,
+            }
+        )
+        # Keep denominator/rates consistent with the exact dtype comparison.
+        counts["applied_rate_over_target"] = float(np.sum(applied_mask) / time_count) if time_count else None
+        counts["eligible_rate_over_target"] = float(np.sum(eligible_mask) / time_count) if time_count else None
+        counts["changed_rate_over_applied"] = float(actual_valid_count / valid_count) if valid_count else None
+        counts["noop_rate_over_applied"] = float(no_op_valid_count / valid_count) if valid_count else None
         action_marginal_summary: dict[str, Any] = {}
         if marginals:
             for dimension, values in marginals.items():
@@ -446,6 +649,17 @@ def analyze_offline(
                         for category in values["categories"]
                     },
                 }
+        per_input_summary = _index_stats(
+            original_observations,
+            pattern,
+            changed_mask,
+            schema,
+            valid_row_mask,
+        )
+        for input_summary in per_input_summary:
+            delta_summary = counts.get("per_input_delta", {}).get(str(input_summary["index"]))
+            if isinstance(delta_summary, Mapping):
+                input_summary.update(delta_summary)
         summary = {
             **summary,
             "pattern_id": pattern.pattern_id,
@@ -454,13 +668,47 @@ def analyze_offline(
             "actual_changed_row_count": actual_valid_count,
             "no_op_row_count": no_op_valid_count,
             "applied_row_count": valid_count,
-            "skipped_row_count": int(sum(item.skipped for item in interventions)),
+            "eligible_row_count": int(np.sum(eligible_mask)),
+            "skipped_row_count": int(sum(bool(getattr(item, "skipped", False)) for item in interventions)),
+            "changed_count_exact": actual_valid_count,
+            "noop_count": no_op_valid_count,
+            "changed_element_count_exact": counts.get("changed_element_count_exact"),
+            "applied_element_count": counts.get("applied_element_count"),
+            "noop_element_count": counts.get("noop_element_count"),
+            "target_step_count": time_count,
             "valid_row_count": valid_count,
             "skip_reasons": sorted({item.skip_reason for item in interventions if item.skip_reason}),
+            "intervention_counts": counts,
+            "step_masks": {
+                "target": np.ones(time_count, dtype=bool).tolist(),
+                "eligible": eligible_mask.tolist(),
+                "applied": applied_mask.tolist(),
+                "changed_exact": np.any(changed_mask, axis=1).tolist(),
+                "meaningful_changed": meaningful_mask.tolist(),
+                "skipped": (~applied_mask).tolist(),
+            },
+            "road_segment_ids": road_segment_ids,
             "action_count": action_count,
-            "per_input": _index_stats(original_observations, pattern, changed_mask, schema, valid_row_mask),
+            "per_input": per_input_summary,
             "episode_summaries": _episode_summaries(episodes, comparison, actual_row_mask, valid_row_mask),
             "action_marginals": action_marginal_summary,
+            "execution_status": "completed",
+            "assessment_status": (
+                "control_baseline"
+                if pattern.pattern_id == "P00"
+                else "not_evaluable_no_application"
+                if valid_count == 0
+                else "conditional_or_partial_application"
+                if valid_count < time_count
+                else "numerical_only"
+                if actual_valid_count > 0 and counts.get("meaningful_changed_count") == 0
+                else "no_exact_input_change"
+                if actual_valid_count == 0
+                else "evaluated"
+            ),
+            "scope": getattr(pattern, "scope", None),
+            "on_inapplicable": getattr(pattern, "on_inapplicable", None),
+            "variant_id": getattr(pattern, "variant_id", None),
             "group_note": "per-input and group results are diagnostic comparisons; no composite importance score is computed",
         }
         outputs.append(
@@ -472,6 +720,16 @@ def analyze_offline(
                 changed_input_mask=changed_mask,
                 changed_indices_by_row=tuple(changed_row_indices),
                 changed_probabilities=changed_probabilities,
+                intervention_counts=counts,
+                step_masks={
+                    "target": np.ones(time_count, dtype=bool),
+                    "eligible": eligible_mask,
+                    "applied": applied_mask,
+                    "changed_exact": np.any(changed_mask, axis=1),
+                    "meaningful_changed": meaningful_mask,
+                    "skipped": ~applied_mask,
+                },
+                road_segment_ids=tuple(road_segment_ids),
             )
         )
     fingerprint_after: str | None = None

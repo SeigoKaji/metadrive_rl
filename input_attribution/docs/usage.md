@@ -1,36 +1,47 @@
 # 実行方法
 
-解析用設定は学習用 TOML へ追加せず、`input_attribution/configs/` の解析設定として管理します。既存の仮想環境の Python を使い、SB3、PyTorch、MetaDrive を無条件に更新しません。259 の公式接続では実モデルと実環境が必要です。MetaDriveなしの fake adapter では接続契約と保存形式だけを検証します。
+解析用設定は学習用 TOML へ追加せず、`input_attribution/configs/` の解析設定として管理します。既存の仮想環境の Python を使い、SB3、PyTorch、MetaDrive を無条件に更新しません。現在の実走行確認用環境は `/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3`、この repository に保存した公式モデルは `/home/seigo/workspace/metadrive_rl/metadrive-rl-input-attribution/models/official_baseline.zip`（SHA256: `0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`）です。259 の公式接続では実モデルと実環境が必要です。MetaDriveなしの fake adapter では接続契約と保存形式だけを検証します。
 
 ## 最短の実行
 
-Linux/Ubuntu:
+Linux/Ubuntu（既存環境をそのまま使用）:
 
 ```bash
-.venv/bin/python -m input_attribution check --config input_attribution/configs/input_attribution_official_259.toml
-.venv/bin/python -m input_attribution run --config input_attribution/configs/input_attribution_official_259.toml
+PYTHON=/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3
+$PYTHON -m input_attribution check --config input_attribution/configs/input_attribution_official_259_variants.toml
+$PYTHON -m input_attribution run --config input_attribution/configs/input_attribution_official_259_variants.toml
 ```
 
 PowerShell:
 
 ```powershell
-.\.venv\Scripts\python.exe -m input_attribution check --config input_attribution/configs/input_attribution_official_259.toml
-.\.venv\Scripts\python.exe -m input_attribution run --config input_attribution/configs/input_attribution_official_259.toml
+.\.venv\Scripts\python.exe -m input_attribution check --config input_attribution/configs/input_attribution_official_259_variants.toml
+.\.venv\Scripts\python.exe -m input_attribution run --config input_attribution/configs/input_attribution_official_259_variants.toml
 ```
 
-`run` は check、通常走行収集、①-A、設定で指定した①-B、主レポート生成を順に行います。`run` では③ IG は常に未実行（skipped）として残ります。設定の `[ig].enabled` は Captum 依存の利用可否を check するためだけの項目で、実際の IG は下記の `ig` サブコマンドを対象 episode/step と baseline とともに明示して実行します。check はモデル、設定、adapter、schema、入力次元・dtype・範囲・全 index の被覆、離散 Action、前処理、代表確率再現、対象レーン、パターンの解決状態を人間向けと JSON で出します。`custom_262_schema_template` に未確定フィールドが残る設定は成功扱いにしません。
+`run` は check、通常走行収集、①-A、設定で指定した①-B、主レポート生成を順に行います。`run` では③ IG は常に未実行（skipped）として残ります。設定の `[ig].enabled` は Captum 依存の利用可否を check するためだけの項目で、実際の IG は下記の `ig` サブコマンドを対象 episode/step と baseline とともに明示して実行します。check はモデル、設定、adapter、schema、入力次元・dtype・範囲・全 index の被覆、離散 Action、前処理、代表確率再現、対象レーン、パターンの解決状態を人間向けと JSON で出します。`input_attribution/schemas/custom_262_template.json` に未確定フィールドが残る設定は成功扱いにしません。
 
 ## 部分実行と保存結果からの再解析
 
 ```bash
-# Linux
-.venv/bin/python -m input_attribution collect --config input_attribution/configs/input_attribution_official_259.toml
-.venv/bin/python -m input_attribution offline --run-dir outputs/input_attribution/<experiment>/<model>/<run_id>
-.venv/bin/python -m input_attribution closed-loop --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> --patterns P00,P02_heading_reference
-.venv/bin/python -m input_attribution report --run-dir outputs/input_attribution/<experiment>/<model>/<run_id>
+# Linux（保存済み通常観測を使うコマンドは環境を起動しない）
+PYTHON=/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3
+$PYTHON -m input_attribution collect --config input_attribution/configs/input_attribution_official_259_variants.toml
+$PYTHON -m input_attribution offline --run-dir outputs/input_attribution/<experiment>/<model>/<run_id>
+$PYTHON -m input_attribution closed-loop --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> --patterns P00,P02_heading_neutral
+$PYTHON -m input_attribution report --run-dir outputs/input_attribution/<experiment>/<model>/<run_id>
+
+# 旧runを変更せず、表示だけを別ディレクトリへ再生成
+$PYTHON -m input_attribution report --run-dir outputs/input_attribution/<experiment>/<model>/<old_run_id> --output-dir /tmp/input-attribution-report-revision
+
+# 新しいA（①-A）設定を保存観測から計算。新しい子runが表示される
+$PYTHON -m input_attribution offline --run-dir outputs/input_attribution/<experiment>/<model>/<old_run_id> --config input_attribution/configs/input_attribution_official_259_variants.toml
+
+# 子runに対する新しいB（①-B）は、選択した条件で環境を走り直す
+$PYTHON -m input_attribution closed-loop --run-dir outputs/input_attribution/<experiment>/<model>/<child_run_id> --patterns P00,P02_heading_neutral
 
 # 任意 IG（Captum が利用可能な環境だけ）
-.venv/bin/python -m input_attribution ig --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> --episode 0 --steps 12,20 --baseline episode-0:0
+$PYTHON -m input_attribution ig --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> --episode 0 --steps 12,20 --baseline episode-0:0
 ```
 
 PowerShell では `.venv\Scripts\python.exe` と Windows のパス区切りを使います。IG の baseline 指定形式は設定と `--help` の表示を優先します。Captumを追加する場合も、既存環境へ無条件に更新せず、同梱の任意 requirements-ig と独立した仮想環境/一時 wheel を使って互換性を確認します。
@@ -53,7 +64,11 @@ outputs/input_attribution/<experiment>/<model>/<run_id>/
 └── reports/<report_id>/           # 再生成時の追加 view（root 初版を保持）
 ```
 
-過去の run directory は新しい run id で作成し、実験結果を上書きしません。最初の report は run root に保存し、同じ run の再生成は `reports/<report_id>/` へ保存して root 初版を残します。設定、model hash、schema hash、pattern hash、観測 hash が manifest と一致しない部分実行は停止します。
+過去の run directory は新しい run id で作成し、実験結果を上書きしません。最初の report は run root に保存し、同じ run の再生成は `reports/<report_id>/` へ保存して root 初版を残します。`--output-dir` を指定した report は旧runの status/manifest/生データを変更せず、指定先だけへ出力します。`offline --run-dir PARENT --config NEW` は旧runを読み取り専用で検証し、モデルhash、入力意味・順序・正規化・結合条件、前処理hashが一致するときだけ、通常観測をコピーした子runへ①-Aを保存します。patternのvariant追加は許可されますが、入力の意味や順序を変えた設定は拒否します。Bの新条件は子runで closed-loop を走り直してください。
+
+動画を作る場合は設定の `video.enabled = true` と `video.patterns = ["P00", "P02_heading_neutral"]` を指定します。`video.patterns` は config に宣言した pattern ID のうち動画を保存するものだけを選ぶ配列で、未指定なら実行対象の全 pattern です。動画を全て無効にする場合は `video.enabled = false` とします。`closed-loop --patterns P00,P02_heading_neutral` は走行する介入 pattern の選択であり、動画選択とは別です。個別LiDAR全件などを動画の既定対象にしません。
+
+旧初期参照を再現する場合の設定例は `input_attribution/configs/input_attribution_official_259_legacy_freeze.toml` です。新しい全域variant設定 `input_attribution_official_259_variants.toml` と同じpattern条件として扱わず、レポートでも条件付き試験として区別します。
 
 ## レポートの読み方
 

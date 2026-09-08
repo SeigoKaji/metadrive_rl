@@ -16,9 +16,12 @@ import numpy as np
 
 from .artifacts import (
     build_manifest,
+    copy_reference,
     create_run,
     jsonl_read,
     open_run,
+    schema_semantics_hash,
+    schema_semantics_hash_from_value,
     verify_manifest_compatibility,
     seal_reference, verify_reference, sha256_file, sha256_object,
 )
@@ -116,6 +119,105 @@ def _all_patterns(config: AnalysisConfig, schema: Any) -> list[Any]:
     return patterns
 
 
+def _pattern_index_value(
+    value: Any,
+    schema: Any,
+    index: int,
+    indices: Sequence[int],
+) -> Any:
+    """Resolve a scalar, target-ordered sequence, or input-keyed mapping."""
+
+    if isinstance(value, Mapping):
+        spec = schema.spec(index)
+        for key in (index, str(index), getattr(spec, "id", None)):
+            if key is not None and key in value:
+                return value[key]
+        if len(value) == 1:
+            return next(iter(value.values()))
+        return None
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = list(value)
+        position = list(indices).index(index)
+        return values[position] if position < len(values) else None
+    return value
+
+
+def _pattern_variant_metadata(pattern: Any, schema: Any) -> dict[str, Any]:
+    """Persist typed variant values/evidence beside the offline pattern row.
+
+    The execution layer resolves these values again for every observation.  A
+    compact resolution record here makes ``patterns.json`` and the report
+    auditable without pretending that a reflection has one fixed replacement
+    value: its value is ``2 * center - source_value`` at each step.
+    """
+
+    indices = tuple(pattern.resolve_indices(schema))
+    if not indices:
+        return {}
+    records: dict[str, Mapping[str, Any]] = {}
+    for index in indices:
+        record: Mapping[str, Any] | None = None
+        if isinstance(getattr(pattern, "variant", None), Mapping):
+            record = pattern.variant
+        else:
+            variant_id = getattr(pattern, "variant_id", None)
+            if variant_id is None and isinstance(getattr(pattern, "metadata", None), Mapping):
+                variant_id = pattern.metadata.get("variant_id")
+            if variant_id:
+                record = schema.variant(index, str(variant_id))
+        if record is not None:
+            records[str(index)] = dict(record)
+
+    metadata: dict[str, Any] = {}
+    if not records:
+        return metadata
+    metadata["variant_ids"] = {
+        key: record.get("id", getattr(pattern, "variant_id", None))
+        for key, record in records.items()
+    }
+    metadata["variant_evidence"] = {
+        key: record.get(
+            "evidence",
+            record.get("source", record.get("reference", record.get("provenance"))),
+        )
+        for key, record in records.items()
+    }
+    metadata["variant_classification"] = {
+        key: record.get(
+            "classification",
+            record.get("class", record.get("replacement_kind", record.get("operation"))),
+        )
+        for key, record in records.items()
+    }
+    metadata["variant_records"] = records
+
+    method = str(getattr(pattern, "method", "")).casefold()
+    resolved: dict[str, Any] = {}
+    if method == "reflection":
+        for key, record in records.items():
+            center = record.get("centers", record.get("center"))
+            index = int(key)
+            resolved[key] = {
+                "center": _pattern_index_value(center, schema, index, indices),
+                "expression": "2 * center - source_value",
+            }
+        metadata["resolved_expression"] = "2 * center - source_value"
+    elif method in {"neutral", "fixed_level", "fixed"}:
+        for key, record in records.items():
+            raw = record.get("values", record.get("levels"))
+            if raw is None:
+                raw = record.get("level", record.get("value"))
+            index = int(key)
+            if raw is not None:
+                resolved[key] = _pattern_index_value(raw, schema, index, indices)
+    if not resolved and getattr(pattern, "values", None) is not None:
+        for index in indices:
+            resolved[str(index)] = _pattern_index_value(pattern.values, schema, index, indices)
+    if resolved:
+        metadata["resolved_values"] = resolved
+    return metadata
+
+
 def _new_store(config: AnalysisConfig, command: str, adapter: Any, policy: Any, schema: Any, check: CheckResult):
     store = create_run(
         config.output_root,
@@ -148,8 +250,14 @@ def _new_store(config: AnalysisConfig, command: str, adapter: Any, policy: Any, 
     store.save_manifest(manifest)
     store.write_json("input_schema.json", schema.to_dict())
     _write_csv(store.run_dir / "input_schema.csv", schema.to_dict()["inputs"])
-    listing = [p.to_dict() | {"indices": list(p.resolve_indices(schema)),
-               "names_ja": [schema.spec(i).name_ja for i in p.resolve_indices(schema)]} for p in _all_patterns(config, schema)]
+    listing = []
+    for pattern in _all_patterns(config, schema):
+        row = pattern.to_dict() | {
+            "indices": list(pattern.resolve_indices(schema)),
+            "names_ja": [schema.spec(i).name_ja for i in pattern.resolve_indices(schema)],
+        }
+        row.update(_pattern_variant_metadata(pattern, schema))
+        listing.append(row)
     store.write_json("patterns.json", listing)
     _write_csv(store.run_dir / "patterns.csv", listing)
     store.write_json("check.json", check.as_dict())
@@ -190,13 +298,14 @@ def _run_offline(store: Any, config: AnalysisConfig, policy: Any, schema: Any) -
         for pattern in patterns:
             indices = pattern.resolve_indices(schema)
             row = pattern.to_dict() | {"indices": list(indices), "names_ja": [schema.spec(i).name_ja for i in indices]}
+            row.update(_pattern_variant_metadata(pattern, schema))
             if pattern.method == "reference":
                 if pattern.reference_id not in references:
                     row["resolution_status"] = "unavailable"
                     row["skip_reason"] = f"saved reference does not exist: {pattern.reference_id}"
                 else:
                     row["resolved_values"] = {str(i): float(references[pattern.reference_id][i]) for i in indices}
-            elif pattern.method == "fixed":
+            elif pattern.method == "fixed" and "resolved_values" not in row:
                 row["resolved_values"] = pattern.values if pattern.values is not None else {str(i): schema.spec(i).replacement.get("value") for i in indices}
             resolved_patterns.append(row)
         analysis.write_json("01_offline/patterns.json", resolved_patterns)
@@ -205,7 +314,10 @@ def _run_offline(store: Any, config: AnalysisConfig, policy: Any, schema: Any) -
             "min": float(observations[:,spec.index].min()), "max": float(observations[:,spec.index].max()),
             "mean": float(observations[:,spec.index].mean()), "std": float(observations[:,spec.index].std()),
             "constant": bool(np.all(observations[:,spec.index] == observations[0,spec.index]))} for spec in schema.inputs])
-        action_rows = store.read_json("check.json")["checks"]["action_mapping"]
+        check_payload = store.read_json("check.json")
+        action_rows = (check_payload.get("checks") or {}).get("action_mapping", [])
+        if not isinstance(action_rows, list):
+            action_rows = []
         action_mapping = {key: [str(row[key]) for row in action_rows] for key in ("steering", "throttle_brake")
                           if all(isinstance(row, dict) and key in row for row in action_rows)}
         result = run_offline(observations, policy, schema, patterns,
@@ -222,7 +334,22 @@ def _run_offline(store: Any, config: AnalysisConfig, policy: Any, schema: Any) -
         payload = result.to_dict(include_arrays=False)
         payload["input_schema"] = schema.to_dict()
         for item, resolved in zip(payload["patterns"], resolved_patterns, strict=True):
-            item["pattern"].update(names_ja=resolved["names_ja"], resolved_values=resolved.get("resolved_values"))
+            item["pattern"].update(
+                names_ja=resolved["names_ja"],
+                **{
+                    key: resolved[key]
+                    for key in (
+                        "resolved_values",
+                        "resolved_expression",
+                        "variant_ids",
+                        "variant_id",
+                        "variant_evidence",
+                        "variant_classification",
+                        "variant_records",
+                    )
+                    if key in resolved
+                },
+            )
         for pattern, item in zip(result.patterns, payload["patterns"], strict=True):
             identifier = pattern.pattern.pattern_id
             target = analysis.offline_dir / identifier
@@ -383,6 +510,273 @@ def _load_existing(args: argparse.Namespace) -> tuple[Any, AnalysisConfig, Any, 
     return store, config, adapter, policy, schema
 
 
+def _reuse_provenance_mismatches(
+    parent: Any,
+    parent_config: AnalysisConfig,
+    config: AnalysisConfig,
+) -> list[str]:
+    """Check the immutable contract needed to reuse saved observations.
+
+    A new analysis may change explicitly declared intervention variants, so a
+    full resolved-config/pattern hash comparison would reject the intended
+    operation.  The model bytes, schema semantics/order, and preprocessing
+    contract remain strict and are checked independently here.
+    """
+
+    manifest = parent.load_manifest()
+    mismatches: list[str] = []
+    expected_model = (manifest.get("model") or {}).get("sha256")
+    actual_model = sha256_file(config.model_path) if config.model_path and config.model_path.is_file() else None
+    if expected_model != actual_model:
+        mismatches.append("model.sha256")
+
+    expected_semantics, _semantics_source = _parent_input_semantics(parent)
+    schema_meta = manifest.get("schema") or {}
+    actual_semantics = schema_semantics_hash(config.schema_path) if config.schema_path else None
+    if expected_semantics is not None:
+        if expected_semantics != actual_semantics:
+            mismatches.append("input_semantics_sha256")
+    else:
+        expected_schema = schema_meta.get("sha256")
+        actual_schema = sha256_file(config.schema_path) if config.schema_path and config.schema_path.is_file() else None
+        if expected_schema != actual_schema:
+            mismatches.append("schema.sha256")
+
+    expected_preprocess = manifest.get("preprocess_sha256")
+    actual_preprocess = sha256_object(config.preprocess)
+    if expected_preprocess != actual_preprocess:
+        mismatches.append("preprocess_sha256")
+
+    # Saved observations carry the parent collection's scenario and adapter
+    # provenance.  A new A variant may change analysis/pattern sections, but it
+    # must not be labelled as if it came from a different world or producer.
+    parent_mapping = parent_config.to_dict()
+    new_mapping = config.to_dict()
+    for section in ("scenario", "seeds", "environment", "adapter"):
+        if parent_mapping.get(section, {}) != new_mapping.get(section, {}):
+            mismatches.append(f"parent.{section}")
+
+    # The saved config is resolved from the parent run.  A config that points
+    # to a different observation dimension is rejected even when an old
+    # manifest predates the semantic hash field.
+    try:
+        if config.schema_path is None or parent_config.schema_path is None:
+            mismatches.append("schema.path")
+        else:
+            from .schema import load_schema
+
+            if load_schema(config.schema_path).dimension != load_schema(parent_config.schema_path).dimension:
+                mismatches.append("schema.dimension")
+    except Exception:
+        mismatches.append("schema")
+    return list(dict.fromkeys(mismatches))
+
+
+def _parent_input_semantics(parent: Any) -> tuple[str | None, str | None]:
+    """Return the parent input-meaning hash and its immutable evidence path."""
+
+    manifest = parent.load_manifest()
+    value = manifest.get("input_semantics_sha256") or (manifest.get("schema") or {}).get("semantics_sha256")
+    if value is not None:
+        return str(value), "manifest.input_semantics_sha256"
+    snapshot_path = parent.run_dir / "input_schema.json"
+    if snapshot_path.is_file():
+        try:
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            return schema_semantics_hash_from_value(snapshot), "input_schema.json"
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    return None, None
+
+
+def _verify_parent_integrity(parent: Any) -> list[str]:
+    """Verify immutable metadata before creating a reuse child run.
+
+    The package code hash is deliberately excluded: a report/reuse fix may be
+    made after the original run.  Saved config, snapshots, model, adapter
+    source, preprocessing/environment files, and the sealed reference remain
+    strict provenance inputs.
+    """
+
+    manifest = parent.load_manifest()
+    mismatches: list[str] = []
+    resolved_path = parent.resolved_config_path
+    if not resolved_path.is_file():
+        mismatches.append("resolved_config.json")
+    else:
+        try:
+            saved_config = json.loads(resolved_path.read_text(encoding="utf-8"))
+            expected = manifest.get("config_sha256")
+            if expected is not None and expected != sha256_object(saved_config):
+                mismatches.append("config_sha256")
+            expected_preprocess = manifest.get("preprocess_sha256")
+            if expected_preprocess is not None and expected_preprocess != sha256_object(saved_config.get("preprocess", {})):
+                mismatches.append("parent.preprocess_sha256")
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            mismatches.append("resolved_config.json")
+
+    for relative, digest in (manifest.get("snapshot_files") or {}).items():
+        path = (parent.run_dir / str(relative)).resolve()
+        try:
+            path.relative_to(parent.run_dir.resolve())
+        except ValueError:
+            mismatches.append(f"snapshot_path:{relative}")
+            continue
+        if not path.is_file() or sha256_file(path) != digest:
+            mismatches.append(f"snapshot:{relative}")
+
+    for path_text, expected in (manifest.get("input_files") or {}).items():
+        path = Path(path_text)
+        if not path.is_file() or expected != sha256_file(path):
+            mismatches.append(f"input_file:{path_text}")
+    for path_text, expected in (manifest.get("adapter_sources") or {}).items():
+        path = Path(path_text)
+        if not path.is_file() or expected != sha256_file(path):
+            mismatches.append(f"adapter_source:{path_text}")
+    model_meta = manifest.get("model") or {}
+    model_path = Path(model_meta["path"]) if model_meta.get("path") else None
+    if model_meta.get("sha256") is not None and (
+        model_path is None or not model_path.is_file() or sha256_file(model_path) != model_meta["sha256"]
+    ):
+        mismatches.append("parent.model.sha256")
+    return list(dict.fromkeys(mismatches))
+
+
+def _reuse_boundary_check(config: AnalysisConfig, adapter: Any, policy: Any, schema: Any) -> CheckResult:
+    """Validate a new A-only config without constructing an environment."""
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    checks: dict[str, Any] = {"mode": "saved_reference_reuse", "probe_isolated": True}
+    try:
+        schema.validate_for_execution()
+        declared_dimension = config.schema.get("dimension", schema.dimension)
+        if declared_dimension != schema.dimension:
+            raise CLIError(f"configured schema dimension mismatch: {declared_dimension} != {schema.dimension}")
+        checks["patterns"] = resolve_pattern_listing(schema, config.patterns)
+        checks["schema_validation"] = {
+            "dimension": schema.dimension,
+            "entry_count": len(schema.inputs),
+            "indices": sorted(item.index for item in schema.inputs),
+        }
+        checks["adapter_contract"] = adapter.assert_contract(expected_dimension=schema.dimension)
+        checks["adapter_schema_contract"] = adapter.verify_schema_contract(
+            schema, expected_dimension=schema.dimension
+        )
+        if checks["adapter_schema_contract"].get("verified") is not True:
+            raise CLIError("observation ordering/source contract has not been verified")
+        checks["policy_fingerprint"] = policy.fingerprint()
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+    return CheckResult(not errors, errors, warnings, checks)
+
+
+def _new_reuse_store(
+    parent: Any,
+    parent_config: AnalysisConfig,
+    config: AnalysisConfig,
+    adapter: Any,
+    policy: Any,
+    schema: Any,
+    check: CheckResult,
+) -> Any:
+    """Create a child analysis run and copy the parent's sealed reference."""
+
+    parent_manifest = parent.load_manifest()
+    parent_semantics, parent_semantics_source = _parent_input_semantics(parent)
+    parent_mapping = parent_config.to_dict()
+    collection_provenance = {
+        section: parent_mapping.get(section, {})
+        for section in ("scenario", "seeds", "environment", "adapter")
+    }
+    store = create_run(config.output_root, config.experiment_name, config.model_name)
+    store.save_resolved_config(config)
+    store.save_manifest(
+        build_manifest(
+            config=config,
+            command="offline --run-dir --config (reuse saved reference)",
+            model_path=config.model_path,
+            schema_path=config.schema_path,
+            patterns=config.patterns,
+            preprocess=config.preprocess,
+            observations_path=store.reference_dir / "observations.npy",
+            extra={
+                "reuse": {
+                    "mode": "saved_reference_child_run",
+                    "parent_run_id": parent.run_id,
+                    "parent_run_dir": str(parent.run_dir),
+                    "parent_data_id": parent_manifest.get("data_id"),
+                    "parent_reference_files": parent_manifest.get("reference_files", {}),
+                    "parent_model_sha256": (parent_manifest.get("model") or {}).get("sha256"),
+                    "parent_input_semantics_sha256": parent_semantics,
+                    "parent_input_semantics_source": parent_semantics_source,
+                    "parent_preprocess_sha256": parent_manifest.get("preprocess_sha256"),
+                    "parent_collection_provenance": collection_provenance,
+                    "parent_collection_provenance_sha256": sha256_object(collection_provenance),
+                },
+                "parent_run_id": parent.run_id,
+                "parent_data_id": parent_manifest.get("data_id"),
+                "parent_reference_files": parent_manifest.get("reference_files", {}),
+                "parent_model_sha256": (parent_manifest.get("model") or {}).get("sha256"),
+                "parent_input_semantics_sha256": parent_semantics,
+                "parent_input_semantics_source": parent_semantics_source,
+                "parent_preprocess_sha256": parent_manifest.get("preprocess_sha256"),
+                "reference_reused": True,
+            },
+        )
+    )
+    manifest = store.load_manifest()
+    source = Path(inspect.getfile(type(adapter))).resolve()
+    sources = [source]
+    hook = getattr(adapter, "source_paths", None)
+    if callable(hook):
+        sources.extend(Path(path).resolve() for path in hook())
+    manifest.update(
+        adapter_sources={str(path): sha256_file(path) for path in sources},
+        policy_fingerprint=policy.fingerprint(),
+        runtime=check.checks.get("packages", {}),
+        environment_resolved=getattr(adapter, "env_config", None),
+        experiment=config.experiment_name,
+        model_name=config.model_name,
+        run_id=store.run_id,
+        optional_ig="not executed by run; use the ig command explicitly",
+    )
+    store.save_manifest(manifest)
+    copy_reference(parent, store)
+    seal_reference(store)
+    store.write_json("input_schema.json", schema.to_dict())
+    _write_csv(store.run_dir / "input_schema.csv", schema.to_dict()["inputs"])
+    listing = []
+    for pattern in _all_patterns(config, schema):
+        row = pattern.to_dict() | {
+            "indices": list(pattern.resolve_indices(schema)),
+            "names_ja": [schema.spec(i).name_ja for i in pattern.resolve_indices(schema)],
+        }
+        row.update(_pattern_variant_metadata(pattern, schema))
+        listing.append(row)
+    store.write_json("patterns.json", listing)
+    _write_csv(store.run_dir / "patterns.csv", listing)
+    store.write_json("check.json", check.as_dict())
+    manifest = store.load_manifest()
+    manifest["snapshot_files"] = {
+        name: sha256_file(store.run_dir / name)
+        for name in ("input_schema.json", "patterns.json", "check.json")
+    }
+    store.save_manifest(manifest)
+    store.update_status("ig", "skipped", reason="任意実行。igコマンドで対象時刻と実観測基準を指定してください")
+    store.update_status(
+        "collect",
+        "skipped",
+        reason="保存通常観測を親runから再利用。新しい走行収集は行っていません",
+    )
+    store.update_status(
+        "closed_loop",
+        "skipped",
+        reason="A-only reuse child。新しい条件のBはclosed-loopを別途実行してください",
+    )
+    return store
+
+
 def command_collect(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     adapter, policy, schema = load_components(config)
@@ -404,6 +798,63 @@ def command_collect(args: argparse.Namespace) -> int:
 
 
 def command_offline(args: argparse.Namespace) -> int:
+    if args.config is not None:
+        try:
+            parent = open_run(args.run_dir)
+            verify_reference(parent)
+            parent_integrity = _verify_parent_integrity(parent)
+            if parent_integrity:
+                raise CLIError(
+                    "parent run provenance mismatch: " + ", ".join(parent_integrity)
+                )
+            parent_config = load_config(parent.resolved_config_path)
+            config = load_config(args.config)
+            mismatches = _reuse_provenance_mismatches(parent, parent_config, config)
+            if mismatches:
+                raise CLIError(
+                    "saved-reference reuse provenance mismatch: " + ", ".join(mismatches)
+                )
+            adapter, policy, schema = load_components(config)
+            parent_manifest = parent.load_manifest()
+            expected_policy = parent_manifest.get("policy_fingerprint")
+            if expected_policy is not None and policy.fingerprint() != expected_policy:
+                raise CLIError("saved-reference reuse policy fingerprint mismatch")
+            # The reuse path is intentionally environment-free.  A full
+            # boundary check would reset an environment even with probe=False;
+            # the saved-observation replay below is the strict runtime check.
+            check = _reuse_boundary_check(config, adapter, policy, schema)
+            try:
+                parent_check = parent.read_json("check.json")
+                parent_action_mapping = (parent_check.get("checks") or {}).get("action_mapping")
+                if isinstance(parent_action_mapping, list):
+                    check.checks["action_mapping"] = parent_action_mapping
+            except FileNotFoundError:
+                pass
+            if not check.ok:
+                raise CLIError("new analysis config failed check: " + "; ".join(check.errors))
+            child = _new_reuse_store(parent, parent_config, config, adapter, policy, schema, check)
+            try:
+                _run_offline(child, config, policy, schema)
+                from .reporting import generate_report
+
+                child.update_status("run", "success", mode="offline_reuse")
+                report = generate_report(child.run_dir)
+                child.update_status("report", "success", files=[str(path) for path in report.files])
+                print(child.run_dir)
+                return 0
+            except Exception as exc:
+                child.update_status("run", "failed", error=f"{type(exc).__name__}: {exc}", mode="offline_reuse")
+                try:
+                    from .reporting import generate_report
+
+                    report = generate_report(child.run_dir)
+                    child.update_status("report", "success", files=[str(path) for path in report.files], partial=True)
+                except Exception as report_exc:
+                    child.update_status("report", "failed", error=f"{type(report_exc).__name__}: {report_exc}")
+                raise
+        except Exception as exc:
+            print(f"offline reuse failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     try:
         store, config, _adapter, policy, schema = _load_existing(args)
         _run_offline(store, config, policy, schema)
@@ -430,8 +881,11 @@ def command_report(args: argparse.Namespace) -> int:
         store = open_run(args.run_dir)
         from .reporting import generate_report
 
-        result = generate_report(store.run_dir)
-        store.update_status("report", "success", files=[str(path) for path in result.files])
+        result = generate_report(store.run_dir, output_dir=args.output_dir)
+        # An explicitly separate output is a read-only view of the old run;
+        # do not update its status or any other file in that run.
+        if args.output_dir is None:
+            store.update_status("report", "success", files=[str(path) for path in result.files])
         print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, default=str))
         return 0
     except Exception as exc:
@@ -513,6 +967,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     offline = subparsers.add_parser("offline", help="保存観測だけで①-Aを実行")
     offline.add_argument("--run-dir", type=Path, required=True)
+    offline.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="新しい解析設定で保存通常観測を再利用し、別の子runへ①-Aを保存",
+    )
     offline.set_defaults(function=command_offline)
 
     closed = subparsers.add_parser("closed-loop", help="指定patternを逐次環境で実行")
@@ -529,6 +989,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = subparsers.add_parser("report", help="保存結果から日本語レポート再生成")
     report.add_argument("--run-dir", type=Path, required=True)
+    report.add_argument("--output-dir", type=Path, default=None, help="旧run外へレポートだけを書き出す")
     report.set_defaults(function=command_report)
     return parser
 

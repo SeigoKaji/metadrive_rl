@@ -43,6 +43,7 @@ from .interventions import (
     apply_intervention,
     patterns_from_config,
 )
+from .metrics import compare_distributions, summarize_intervention_records
 from .schema import InputSchema
 from .trajectory_metrics import paired_deltas, summarize_trajectory
 
@@ -580,6 +581,9 @@ class ClosedLoopResult:
     store: RunArtifacts | None
     patterns: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     baseline_references: dict[int, dict[str, Any]] = field(default_factory=dict)
+    policy_fingerprint_before: str | None = None
+    policy_fingerprint_after: str | None = None
+    policy_unchanged: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         def numeric(value: Any) -> float | None:
@@ -687,10 +691,321 @@ class ClosedLoopResult:
                 },
             }
 
+        def intervention_summary(episodes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            rows = [
+                item.get("intervention_counts")
+                for item in episodes
+                if isinstance(item.get("intervention_counts"), Mapping)
+            ]
+            integer_names = (
+                "target_step_count",
+                "planned_target_step_count",
+                "attempted_step_count",
+                "executed_env_step_count",
+                "actual_target_step_count",
+                "aborted_before_env_step_count",
+                "eligible_count",
+                "applied_count",
+                "changed_count_exact",
+                "applied_element_count",
+                "changed_element_count_exact",
+                "noop_element_count",
+                "noop_count",
+                "skipped_count",
+                "out_of_scope_count",
+                "failed_count",
+                "unknown_record_count",
+            )
+            aggregate: dict[str, Any] = {
+                name: int(sum(int(row.get(name, 0) or 0) for row in rows))
+                for name in integer_names
+            }
+            aggregate["episodes"] = len(episodes)
+            aggregate["recorded_episodes"] = len(rows)
+            aggregate["skip_reasons"] = {}
+            for row in rows:
+                reasons = row.get("skip_reasons", {})
+                if not isinstance(reasons, Mapping):
+                    continue
+                for reason, count in reasons.items():
+                    aggregate["skip_reasons"][str(reason)] = (
+                        aggregate["skip_reasons"].get(str(reason), 0) + int(count or 0)
+                    )
+            per_input: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                row_delta = row.get("per_input_delta")
+                if not isinstance(row_delta, Mapping):
+                    continue
+                for input_index, values in row_delta.items():
+                    if not isinstance(values, Mapping):
+                        continue
+                    key = str(input_index)
+                    target = per_input.setdefault(
+                        key,
+                        {
+                            "applied_count": 0,
+                            "delta_abs_count": 0,
+                            "delta_abs_weighted_sum": 0.0,
+                            "delta_abs_max": None,
+                            "tolerance_values": set(),
+                            "tolerance_observed_count": 0,
+                            "clip_count": 0,
+                        },
+                    )
+                    applied_count = int(values.get("applied_count", 0) or 0)
+                    delta_count = int(values.get("delta_abs_count", 0) or 0)
+                    target["applied_count"] += applied_count
+                    target["delta_abs_count"] += delta_count
+                    delta_mean = values.get("delta_abs_mean")
+                    if delta_mean is not None and delta_count:
+                        target["delta_abs_weighted_sum"] += float(delta_mean) * delta_count
+                    delta_max = values.get("delta_abs_max")
+                    if delta_max is not None:
+                        target["delta_abs_max"] = (
+                            float(delta_max)
+                            if target["delta_abs_max"] is None
+                            else max(float(target["delta_abs_max"]), float(delta_max))
+                        )
+                    for tolerance in values.get("tolerance_values", ()) or ():
+                        try:
+                            target["tolerance_values"].add(float(tolerance))
+                        except (TypeError, ValueError):
+                            continue
+                    target["tolerance_observed_count"] += int(
+                        values.get("tolerance_observed_count", 0) or 0
+                    )
+                    target["clip_count"] += int(values.get("clip_count", 0) or 0)
+            aggregate["per_input_delta"] = {}
+            for input_index in sorted(per_input, key=lambda value: int(value)):
+                values = per_input[input_index]
+                tolerance_values = sorted(values["tolerance_values"])
+                delta_count = values["delta_abs_count"]
+                aggregate["per_input_delta"][input_index] = {
+                    "applied_count": values["applied_count"],
+                    "delta_abs_count": delta_count,
+                    "delta_abs_mean": (
+                        values["delta_abs_weighted_sum"] / delta_count
+                        if delta_count
+                        else None
+                    ),
+                    "delta_abs_max": values["delta_abs_max"],
+                    "tolerance_observed_count": values["tolerance_observed_count"],
+                    "tolerance_values": tolerance_values,
+                    "tolerance": tolerance_values[0] if len(tolerance_values) == 1 else None,
+                    "clip_count": values["clip_count"],
+                }
+            aggregate["applied_rate_over_target"] = (
+                aggregate["applied_count"] / aggregate["target_step_count"]
+                if aggregate["target_step_count"]
+                else None
+            )
+            aggregate["changed_rate_over_applied"] = (
+                aggregate["changed_count_exact"] / aggregate["applied_count"]
+                if aggregate["applied_count"]
+                else None
+            )
+            return aggregate
+
+        def paired_summary(episodes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            verified_rows: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+            missing_reasons: dict[str, int] = {}
+            for episode in episodes:
+                status = episode.get("paired_p00_status")
+                paired = episode.get("metrics", {}).get("paired_p00") if isinstance(episode.get("metrics", {}), Mapping) else None
+                if (
+                    status == "matched"
+                    and isinstance(paired, Mapping)
+                    and _pair_execution_eligible(episode)
+                ):
+                    verified_rows.append((paired, episode))
+                    continue
+                if status is None:
+                    # P00 itself has no pair; for other legacy rows this means
+                    # pairing was not recorded and must remain N/A.
+                    reason = "paired_status_missing"
+                else:
+                    reason = str(episode.get("paired_p00_missing_reason") or status)
+                # A pair can have more than one independent missing condition
+                # (for example both P00 and the intervention were budget
+                # censored). Preserve each reason as its own aggregate key so
+                # consumers can count the affected side without parsing a
+                # concatenated human-readable field.
+                reasons = [item.strip() for item in reason.split(";") if item.strip()]
+                for missing_reason in reasons or [reason]:
+                    missing_reasons[missing_reason] = missing_reasons.get(missing_reason, 0) + 1
+            fields = (
+                "lane_rms_m",
+                "lane_max_abs_m",
+                "departure_count",
+                "departure_time_s",
+                "progress_m",
+                "duration_s",
+                "speed_mean_m_s",
+                "low_speed_duration_s",
+                "action_switch_count",
+                "steering_variation_sum",
+                "cumulative_reward",
+            )
+            episode_mean: dict[str, float | None] = {}
+            step_weighted: dict[str, float | None] = {}
+            for field_name in fields:
+                values: list[float] = []
+                weighted: list[tuple[float, int]] = []
+                for row, episode in verified_rows:
+                    value = row.get(field_name)
+                    try:
+                        parsed = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not np.isfinite(parsed):
+                        continue
+                    values.append(parsed)
+                    try:
+                        weight = max(1, int(episode.get("record_count", 1)))
+                    except (TypeError, ValueError):
+                        weight = 1
+                    weighted.append((parsed, weight))
+                episode_mean[field_name] = float(np.mean(values)) if values else None
+                total_weight = sum(weight for _, weight in weighted)
+                step_weighted[field_name] = (
+                    float(sum(value * weight for value, weight in weighted) / total_weight)
+                    if total_weight
+                    else None
+                )
+            return {
+                "status": "available" if verified_rows else "unavailable",
+                "verified_pair_count": len(verified_rows),
+                "missing_pair_count": len(episodes) - len(verified_rows),
+                "missing_reasons": missing_reasons,
+                "episode_mean": episode_mean,
+                "step_weighted": step_weighted,
+            }
+
+        def video_summary(episodes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+            rows = [
+                item.get("video")
+                for item in episodes
+                if isinstance(item.get("video"), Mapping)
+            ]
+            reason_counts: dict[str, int] = {}
+            for row in rows:
+                reason = row.get("reason")
+                if reason:
+                    reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+            return {
+                "episodes": len(episodes),
+                "requested_episodes": sum(bool(row.get("requested")) for row in rows),
+                "enabled_episodes": sum(bool(row.get("enabled")) for row in rows),
+                "generated_episodes": sum(
+                    str(row.get("status", "")).casefold()
+                    in {"saved", "generated", "frames_saved_without_store"}
+                    for row in rows
+                ),
+                "frame_count": int(sum(int(row.get("frame_count", 0) or 0) for row in rows)),
+                "not_generated_reasons": reason_counts,
+            }
+
+        def execution_group_summary(
+            label: str,
+            episodes: Sequence[Mapping[str, Any]],
+            episode_indices: Sequence[int],
+        ) -> dict[str, Any]:
+            """Summarize one termination class without changing legacy totals."""
+
+            status_counts: dict[str, int] = {}
+            terminal_counts: dict[str, int] = {}
+            assessment_counts: dict[str, int] = {}
+            episode_ids: list[Any] = []
+            for episode in episodes:
+                episode_id = episode.get("episode_id", episode.get("episode"))
+                episode_ids.append(episode_id)
+                for field_name, counts in (
+                    ("execution_status", status_counts),
+                    ("terminal_reason", terminal_counts),
+                    ("assessment_status", assessment_counts),
+                ):
+                    value = episode.get(field_name)
+                    if value in (None, ""):
+                        value = "unknown"
+                    text_value = str(value)
+                    counts[text_value] = counts.get(text_value, 0) + 1
+            aggregate = metric_summary(episodes)
+            aggregate_counts = aggregate["counts"]
+            return {
+                "classification": label,
+                "episode_indices": [int(index) for index in episode_indices],
+                "episode_ids": episode_ids,
+                "episodes": len(episodes),
+                "records": int(aggregate_counts["records"]),
+                "metrics": [
+                    episode.get("metrics", {})
+                    for episode in episodes
+                ],
+                "metric_summary": aggregate,
+                "intervention_counts": intervention_summary(episodes),
+                "counts": {
+                    "episodes": len(episodes),
+                    "records": int(aggregate_counts["records"]),
+                    "poststeps": int(aggregate_counts["poststeps"]),
+                    "execution_status": status_counts,
+                    "terminal_reason": terminal_counts,
+                    "assessment_status": assessment_counts,
+                },
+                "reasons": {
+                    "execution_status": status_counts,
+                    "terminal_reason": terminal_counts,
+                    "assessment_status": assessment_counts,
+                },
+            }
+
         pattern_summary: dict[str, Any] = {}
         for pattern_id, episodes in self.patterns.items():
             metrics = [episode.get("metrics", {}) for episode in episodes]
             aggregate = metric_summary(episodes)
+            natural_indices = [
+                index
+                for index, episode in enumerate(episodes)
+                if _pair_execution_eligible(episode)
+            ]
+            partial_indices = [
+                index
+                for index, episode in enumerate(episodes)
+                if not _pair_execution_eligible(episode)
+            ]
+            partial_unknown_indices = [
+                index
+                for index, episode in enumerate(episodes)
+                if _pair_execution_is_partial_unknown(episode)
+            ]
+            natural_episodes = [episodes[index] for index in natural_indices]
+            partial_episodes = [episodes[index] for index in partial_indices]
+            partial_unknown_episodes = [episodes[index] for index in partial_unknown_indices]
+            execution_group_counts = {
+                "natural_completion": len(natural_episodes),
+                "partial_or_interrupted": len(partial_episodes),
+            }
+            execution_groups = {
+                "natural_completion": execution_group_summary(
+                    "natural_completion",
+                    natural_episodes,
+                    natural_indices,
+                ),
+                "partial_or_interrupted": execution_group_summary(
+                    "partial_or_interrupted",
+                    partial_episodes,
+                    partial_indices,
+                ),
+            }
+            # Keep the legacy two-group shape when there are no ambiguous
+            # records, while exposing an explicit subset for missing/unknown
+            # execution metadata when it occurs.
+            if partial_unknown_episodes:
+                execution_group_counts["partial_unknown"] = len(partial_unknown_episodes)
+                execution_groups["partial_unknown"] = execution_group_summary(
+                    "partial_unknown",
+                    partial_unknown_episodes,
+                    partial_unknown_indices,
+                )
             pattern_summary[pattern_id] = {
                 "episodes": len(episodes),
                 "records": sum(int(item.get("record_count", 0)) for item in episodes),
@@ -704,10 +1019,31 @@ class ClosedLoopResult:
                 "sum": aggregate["sum"],
                 "aggregation": aggregate["aggregation"],
                 "counts": aggregate["counts"],
+                "intervention_counts": intervention_summary(episodes),
+                "execution_group_counts": execution_group_counts,
+                "execution_groups": execution_groups,
+                "video": video_summary(episodes),
+                "execution_status": sorted({str(item.get("execution_status", "unknown")) for item in episodes}),
+                "assessment_status": sorted({str(item.get("assessment_status", "unknown")) for item in episodes}),
+                "paired_p00": (
+                    {
+                        "status": "baseline_control",
+                        "verified_pair_count": 0,
+                        "missing_pair_count": 0,
+                        "missing_reasons": {},
+                        "episode_mean": {},
+                        "step_weighted": {},
+                    }
+                    if pattern_id == "P00"
+                    else paired_summary(episodes)
+                ),
             }
         return {
             "store": str(self.store.run_dir) if self.store else None,
             "p00_reference_episodes": len(self.baseline_references),
+            "policy_fingerprint_before": self.policy_fingerprint_before,
+            "policy_fingerprint_after": self.policy_fingerprint_after,
+            "policy_unchanged": self.policy_unchanged,
             "patterns": pattern_summary,
         }
 
@@ -771,6 +1107,231 @@ def _terminal_reason(
     return "unknown"
 
 
+def _pattern_execution_policy(pattern: InterventionPattern) -> tuple[str, str]:
+    """Return the declared B scope and inapplicable handling policy.
+
+    Legacy/reference patterns remain explicitly conditional for compatibility.
+    A pattern opts into the stricter full-episode contract with
+    ``scope = "full_episode"``; unless it explicitly declares a continuation
+    policy, an unexpected skip aborts that pattern before ``env.step``.
+    """
+
+    metadata = pattern.metadata if isinstance(pattern.metadata, Mapping) else {}
+    scope = getattr(pattern, "scope", None) or metadata.get("scope") or "explicitly_conditional"
+    scope = str(scope).casefold().replace("-", "_")
+    if scope not in {"full_episode", "explicitly_conditional"}:
+        scope = "explicitly_conditional"
+    configured = getattr(pattern, "on_inapplicable", None) or metadata.get("on_inapplicable")
+    if configured is None:
+        configured = "abort_pattern" if scope == "full_episode" else "continue_unmodified_with_warning"
+    action = str(configured).casefold().replace("-", "_")
+    if action not in {"abort_pattern", "continue_unmodified_with_warning"}:
+        action = "abort_pattern" if scope == "full_episode" else "continue_unmodified_with_warning"
+    return scope, action
+
+
+_VIDEO_PATTERNS_UNSET = object()
+
+
+def _video_pattern_selector(video_config: Mapping[str, Any]) -> tuple[frozenset[str] | None, str]:
+    """Resolve optional per-pattern B video selection.
+
+    ``None`` means the legacy behaviour: when video is enabled, every selected
+    closed-loop pattern captures frames.  An explicit ``false`` disables all
+    B videos, while a list limits capture to those pattern identifiers.  The
+    config validator owns the public shape; this runtime check keeps direct
+    callers fail-closed when they bypass config loading.
+    """
+
+    configured = video_config.get("patterns", _VIDEO_PATTERNS_UNSET)
+    if configured is _VIDEO_PATTERNS_UNSET or configured is True:
+        return None, "all_patterns"
+    if configured is False:
+        return frozenset(), "disabled_by_config"
+    if isinstance(configured, (str, bytes)):
+        values = [configured]
+    elif isinstance(configured, Sequence) and not isinstance(configured, Mapping):
+        values = list(configured)
+    else:
+        raise ClosedLoopError("video.patterns must be false or an array of pattern identifiers")
+    identifiers: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ClosedLoopError("video.patterns entries must be non-empty strings")
+        identifiers.add(value.strip())
+    return frozenset(identifiers), "configured_patterns"
+
+
+def _video_state_for_pattern(
+    identifier: str,
+    *,
+    requested: bool,
+    selector: frozenset[str] | None,
+    selector_status: str,
+) -> tuple[bool, str | None]:
+    """Return whether one B pattern captures video and, if not, why."""
+
+    if not requested:
+        return False, "video_disabled"
+    if selector is None:
+        return True, None
+    if identifier in selector:
+        return True, None
+    if selector_status == "disabled_by_config":
+        return False, "disabled_by_video_patterns"
+    return False, "pattern_not_selected_by_video_patterns"
+
+
+def _declared_out_of_scope(
+    pattern: InterventionPattern,
+    intervention: InterventionResult,
+) -> bool:
+    """Identify a predeclared inapplicable state without hiding failures."""
+
+    for name in ("out_of_scope", "inapplicable", "declared_inapplicable"):
+        value = getattr(intervention, name, None)
+        if value is not None:
+            return bool(value)
+    category = getattr(intervention, "skip_category", None)
+    if category is not None and str(category).casefold().replace("-", "_") in {
+        "out_of_scope",
+        "inapplicable",
+        "declared_inapplicable",
+    }:
+        return True
+    metadata = pattern.metadata if isinstance(pattern.metadata, Mapping) else {}
+    if metadata.get("declared_inapplicable") is True or metadata.get("out_of_scope") is True:
+        return True
+    reason = str(getattr(intervention, "skip_reason", "") or "").casefold()
+    configured_reasons = metadata.get(
+        "out_of_scope_reasons",
+        metadata.get("declared_inapplicable_reasons", ()),
+    )
+    if isinstance(configured_reasons, str):
+        configured_reasons = (configured_reasons,)
+    if isinstance(configured_reasons, Sequence) and not isinstance(configured_reasons, (str, bytes)):
+        if any(str(value).casefold() in reason for value in configured_reasons):
+            return True
+    if any(token in reason for token in ("out_of_scope", "out-of-scope", "declared inapplicable")):
+        return True
+    # A legacy reference pattern is conditional by definition.  A donor road
+    # or reference context mismatch is an expected out-of-scope step, while a
+    # typed full-episode operation failing its precondition remains a failure.
+    if getattr(pattern, "scope", None) == "explicitly_conditional" and (
+        "compatibility context" in reason
+        or "reference context" in reason
+        or "reference observation" in reason
+    ):
+        return True
+    return False
+
+
+def _pattern_target_step_count(config: Any, max_steps: int | None) -> int | None:
+    if max_steps is not None:
+        return max(0, int(max_steps))
+    scenario = getattr(config, "scenario", {}) or {}
+    if isinstance(scenario, Mapping) and scenario.get("horizon") is not None:
+        try:
+            return max(0, int(scenario["horizon"]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _pair_execution_eligible(episode: Mapping[str, Any]) -> bool:
+    """Allow P00 pairing only for complete, naturally terminated episodes."""
+
+    if str(episode.get("execution_status", "")).casefold() != "completed":
+        return False
+    terminal_reason = episode.get("terminal_reason")
+    if str(terminal_reason or "").casefold() not in {
+        "terminated",
+        "horizon",
+        "arrive_dest",
+        "wrong_lane_arrival",
+        "out_of_road",
+        "crash",
+        "start_lane_departure",
+    }:
+        return False
+    if any(
+        isinstance(record, Mapping) and bool(record.get("budget_truncated"))
+        for record in episode.get("records", ())
+    ):
+        return False
+    return True
+
+
+def _pair_execution_is_partial_unknown(episode: Mapping[str, Any]) -> bool:
+    """Identify missing/ambiguous execution metadata separately from aborts."""
+
+    status = str(episode.get("execution_status") or "").casefold()
+    terminal_reason = str(episode.get("terminal_reason") or "").casefold()
+    if not status or not terminal_reason:
+        return True
+    if terminal_reason in {"unknown", "truncated"}:
+        return True
+    if status == "completed" and terminal_reason not in {
+        "terminated",
+        "horizon",
+        "arrive_dest",
+        "wrong_lane_arrival",
+        "out_of_road",
+        "crash",
+        "start_lane_departure",
+        "budget_censored",
+        "intervention_abort",
+        "runtime_error",
+        "failed",
+    }:
+        return True
+    return False
+
+
+def _selected_policy_change(
+    original_probabilities: np.ndarray,
+    probabilities: np.ndarray,
+    original_action: int,
+) -> dict[str, Any]:
+    comparison = compare_distributions(
+        np.asarray(original_probabilities, dtype=np.float64),
+        np.asarray(probabilities, dtype=np.float64),
+        selected_actions=np.asarray([original_action], dtype=np.int64),
+    )
+    return {
+        "selected_action": int(comparison.selected_actions[0]),
+        "selected_probability_original": float(comparison.selected_probability_original[0]),
+        "selected_probability_changed": float(comparison.selected_probability_changed[0]),
+        "selected_probability_delta": float(comparison.selected_probability_delta[0]),
+        "selected_probability_delta_pp": float(comparison.selected_probability_delta_pp[0]),
+        "selected_probability_abs_delta": float(comparison.selected_probability_abs_delta[0]),
+        "selected_probability_abs_delta_pp": float(comparison.selected_probability_abs_delta_pp[0]),
+        "js_divergence": float(comparison.js[0]),
+        "action_changed": bool(comparison.action_changed[0]),
+    }
+
+
+def _policy_fingerprint(policy: Any, adapter: Any) -> str | None:
+    """Read a stable policy fingerprint when the runtime exposes one."""
+
+    seen: set[int] = set()
+    for target in (policy, adapter):
+        if target is None or id(target) in seen:
+            continue
+        seen.add(id(target))
+        fingerprint = getattr(target, "fingerprint", None)
+        if not callable(fingerprint):
+            continue
+        try:
+            value = fingerprint()
+        except Exception as exc:
+            raise ClosedLoopError(
+                f"failed to fingerprint policy before/after closed-loop execution: {exc}"
+            ) from exc
+        return str(value)
+    return None
+
+
 def run_closed_loop(
     policy: Any,
     adapter: Any,
@@ -823,6 +1384,9 @@ def run_closed_loop(
     if video is None:
         video = bool((getattr(config, "video", {}) or {}).get("enabled", False))
     video_config = getattr(config, "video", {}) or {}
+    if not isinstance(video_config, Mapping):
+        raise ClosedLoopError("video configuration must be a mapping")
+    video_pattern_selector, video_pattern_selector_status = _video_pattern_selector(video_config)
     configured_video_fps = video_config.get("fps") if isinstance(video_config, Mapping) else None
     if video_fps is None and configured_video_fps is not None:
         try:
@@ -830,13 +1394,24 @@ def run_closed_loop(
         except (TypeError, ValueError):
             raise ClosedLoopError(f"video.fps must be numeric: {configured_video_fps!r}") from None
     thresholds = _thresholds(config)
-    result = ClosedLoopResult(store)
+    policy_fingerprint_before = _policy_fingerprint(policy, adapter)
+    result = ClosedLoopResult(
+        store,
+        policy_fingerprint_before=policy_fingerprint_before,
+    )
     explicit_reference_rows = _reference_records_by_episode(reference_records)
     if store:
         store.update_status("closed_loop", "running", pattern_ids=[pattern.pattern_id for pattern in resolved_patterns])
     try:
         for pattern in resolved_patterns:
             identifier = pattern.pattern_id
+            pattern_scope, pattern_on_inapplicable = _pattern_execution_policy(pattern)
+            pattern_video, pattern_video_reason = _video_state_for_pattern(
+                identifier,
+                requested=bool(video),
+                selector=video_pattern_selector,
+                selector_status=video_pattern_selector_status,
+            )
             result.patterns.setdefault(identifier, [])
             for episode_index in range(episodes):
                 episode_dir = store.closed_loop_dir / identifier / f"episode-{episode_index}" if store else None
@@ -844,7 +1419,7 @@ def run_closed_loop(
                     if episode_dir.exists():
                         raise ClosedLoopError(f"closed-loop episode output already exists: {episode_dir}")
                     episode_dir.mkdir(parents=True, exist_ok=False)
-                if video:
+                if pattern_video:
                     if video_dir is not None:
                         episode_video_dir = Path(video_dir) / identifier / f"episode-{episode_index}"
                     elif episode_dir is not None:
@@ -862,15 +1437,21 @@ def run_closed_loop(
                 records: list[dict[str, Any]] = []
                 frames: list[dict[str, Any]] = []
                 terminal_reason = "unknown"
+                current_phase = "episode_start"
+                episode_result_saved = False
                 try:
+                    current_phase = "runtime_seed"
                     seed_metadata = seed_runtime(adapter, env, episode_rl_seed)
+                    current_phase = "reset"
                     raw_obs, reset_info = reset_environment(adapter, env, episode_seed)
                     done = False
                     step = 0
                     seed_verified = episode_seed is None
                     initial_snapshot: dict[str, Any] | None = None
                     while not done:
+                        current_phase = "pre_telemetry"
                         pre = telemetry(adapter, env, reset_info, phase="pre", step=step)
+                        current_phase = "seed_verification"
                         actual_scenario_seed = _actual_scenario_seed(env, reset_info, pre)
                         if not seed_verified:
                             if actual_scenario_seed is None or actual_scenario_seed != episode_seed:
@@ -879,8 +1460,10 @@ def run_closed_loop(
                                     f"actual={actual_scenario_seed!r}"
                                 )
                             seed_verified = True
+                        current_phase = "preprocess"
                         original_input, preprocess_info = model_input(adapter, raw_obs, reset_info)
                         try:
+                            current_phase = "schema_validation"
                             schema.validate_observation(original_input, copy=False)
                         except Exception as exc:
                             raise ClosedLoopError(f"original model input violates schema at step {step}: {exc}") from exc
@@ -928,6 +1511,7 @@ def run_closed_loop(
                                     "matched": None,
                                     "reasons": ["P00 baseline has not completed"],
                                 }
+                        current_phase = "intervention"
                         intervention = apply_pattern(
                             original_input,
                             pattern,
@@ -939,6 +1523,7 @@ def run_closed_loop(
                             observation_context=pre,
                             strict=False,
                         )
+                        current_phase = "policy"
                         changed_input = np.array(intervention.observation, copy=True)
                         probabilities = policy_probabilities(policy, changed_input)
                         original_probabilities = policy_probabilities(policy, original_input)
@@ -950,10 +1535,67 @@ def run_closed_loop(
                             raise ClosedLoopError(
                                 f"original policy action is outside Discrete({original_probabilities.size}): {original_action}"
                             )
-                        next_raw, reward, terminated, truncated, step_info = step_environment(env, action)
-                        post = telemetry(adapter, env, step_info, phase="post", step=step + 1)
+                        intervention_skipped = bool(getattr(intervention, "skipped", False))
+                        declared_out_of_scope = _declared_out_of_scope(pattern, intervention)
+                        abort_intervention = bool(
+                            intervention_skipped
+                            and pattern_on_inapplicable == "abort_pattern"
+                            and not declared_out_of_scope
+                        )
+                        current_phase = "env_step"
+                        if abort_intervention:
+                            # Preserve the attempted input and reason while
+                            # guaranteeing that this pattern never advances
+                            # the physical environment after an unexpected
+                            # full-episode inapplicability.
+                            next_raw = raw_obs
+                            reward = None
+                            terminated = False
+                            truncated = False
+                            step_info: Mapping[str, Any] = {}
+                            post: Mapping[str, Any] | None = None
+                        else:
+                            next_raw, reward, terminated, truncated, step_info = step_environment(env, action)
+                            post = telemetry(adapter, env, step_info, phase="post", step=step + 1)
                         pre_time = telemetry_time(pre, step)
-                        post_time = telemetry_time(post, step + 1)
+                        post_time = telemetry_time(post, step + 1) if post is not None else None
+                        selected_change = _selected_policy_change(
+                            original_probabilities,
+                            probabilities,
+                            int(original_action),
+                        )
+                        requested_indices = tuple(
+                            int(value) for value in intervention.requested_indices
+                        )
+                        original_values = {
+                            index: _plain(original_input[index]) for index in requested_indices
+                        }
+                        modified_values = {
+                            index: _plain(changed_input[index]) for index in requested_indices
+                        }
+                        delta_values = {
+                            index: _plain(
+                                np.asarray(changed_input[index], dtype=np.float64)
+                                - np.asarray(original_input[index], dtype=np.float64)
+                            )
+                            for index in requested_indices
+                        }
+                        intervention_payload = intervention.to_dict()
+                        # Result objects from older cores default ``eligible``
+                        # to true even when a conditional reference is outside
+                        # its declared context.  Normalize the serialized B
+                        # record from the execution decision so denominators
+                        # describe this run rather than the donor schema.
+                        intervention_payload["eligible"] = bool(
+                            not intervention_skipped or not declared_out_of_scope
+                        )
+                        intervention_payload["applied"] = bool(not intervention_skipped)
+                        intervention_payload["scope"] = pattern_scope
+                        intervention_payload["on_inapplicable"] = pattern_on_inapplicable
+                        if getattr(intervention, "skip_category", None) is not None:
+                            intervention_payload["skip_category"] = _plain(
+                                getattr(intervention, "skip_category")
+                            )
                         record = {
                             "pattern_id": identifier,
                             "episode": episode_index,
@@ -974,24 +1616,55 @@ def run_closed_loop(
                             "post_time": _plain(post_time),
                             "probabilities": probabilities.tolist(),
                             "original_probabilities": original_probabilities.tolist(),
-                            "action": _plain(action),
-                            "action_forwarded": _plain(action),
+                            "action": None if abort_intervention else _plain(action),
+                            "action_forwarded": None if abort_intervention else _plain(action),
                             "original_action": _plain(original_action),
-                            "decoded_action": decode_action(adapter, action, config=config),
-                            "intervention": intervention.to_dict(),
+                            "decoded_action": (
+                                None if abort_intervention else decode_action(adapter, action, config=config)
+                            ),
+                            "intervention": intervention_payload,
+                            "intervention_scope": pattern_scope,
+                            "intervention_on_inapplicable": pattern_on_inapplicable,
+                            "intervention_scope_status": (
+                                "aborted"
+                                if abort_intervention
+                                else "out_of_scope"
+                                if intervention_skipped and declared_out_of_scope
+                                else "skipped_conditional"
+                                if intervention_skipped
+                                else "applied"
+                            ),
+                            "intervention_declared_out_of_scope": declared_out_of_scope,
+                            "original_values": original_values,
+                            "modified_values": modified_values,
+                            "delta_values": delta_values,
+                            "delta_abs_values": {
+                                index: _plain(abs(float(value)))
+                                for index, value in delta_values.items()
+                                if isinstance(value, (int, float, np.integer, np.floating))
+                            },
                             "preprocess": preprocess_info,
                             "pre_telemetry": pre,
+                            "road_segment_id": _plain(pre.get("road_segment_id")) if isinstance(pre, Mapping) else None,
                             "post_telemetry": post,
                             "reward": _plain(reward),
                             "terminated": terminated,
                             "truncated": truncated,
                             "done": bool(terminated or truncated),
+                            "env_step_called": not abort_intervention,
                             "info": _plain(step_info),
                         }
+                        record.update(selected_change)
+                        if abort_intervention:
+                            record["intervention_abort"] = True
+                            record["intervention_abort_reason"] = getattr(
+                                intervention, "skip_reason", None
+                            )
                         observations.append(np.array(original_input, copy=True))
                         modified_observations.append(changed_input)
                         records.append(record)
-                        if video:
+                        current_phase = "video"
+                        if pattern_video:
                             frame, frame_status = render_frame(
                                 adapter,
                                 env,
@@ -1012,6 +1685,11 @@ def run_closed_loop(
                             frame_status["episode"] = episode_index
                             frames.append(frame_status)
                             record["frame_status"] = frame_status
+                        if abort_intervention:
+                            terminal_reason = "intervention_abort"
+                            record["terminal_reason"] = terminal_reason
+                            done = True
+                            continue
                         raw_obs = next_raw
                         reset_info = step_info
                         step += 1
@@ -1026,7 +1704,37 @@ def run_closed_loop(
                             done = True
                     if terminal_reason == "unknown":
                         terminal_reason = "unknown"
+                    current_phase = "metrics"
                     metrics = summarize_trajectory(records, terminal_reason=terminal_reason, **thresholds)
+                    planned_target_steps = _pattern_target_step_count(config, max_steps)
+                    executed_step_count = sum(
+                        bool(record.get("env_step_called")) for record in records
+                    )
+                    intervention_count = summarize_intervention_records(
+                        records=records,
+                        target_step_count=len(records),
+                        declared_out_of_scope=[
+                            bool(record.get("intervention_declared_out_of_scope", False))
+                            for record in records
+                        ],
+                    )
+                    intervention_count.update(
+                        {
+                            "planned_target_step_count": planned_target_steps,
+                            "attempted_step_count": len(records),
+                            "executed_env_step_count": int(executed_step_count),
+                            "actual_target_step_count": int(executed_step_count),
+                            "aborted_before_env_step_count": int(
+                                sum(not bool(record.get("env_step_called")) for record in records)
+                            ),
+                            "target_step_count": len(records),
+                            "planned_range_complete": (
+                                None
+                                if planned_target_steps is None
+                                else len(records) >= planned_target_steps
+                            ),
+                        }
+                    )
                     skipped_interventions = [
                         record.get("intervention", {})
                         for record in records
@@ -1038,6 +1746,35 @@ def run_closed_loop(
                         for item in skipped_interventions
                         if item.get("skip_reason")
                     })
+                    execution_status = (
+                        "aborted"
+                        if terminal_reason == "intervention_abort"
+                        else "completed"
+                    )
+                    if terminal_reason == "intervention_abort":
+                        assessment_status = "not_evaluable_intervention_abort"
+                    elif identifier == "P00":
+                        assessment_status = "control_baseline"
+                    elif skipped_interventions:
+                        assessment_status = (
+                            "conditional_out_of_scope"
+                            if all(
+                                bool(record.get("intervention_declared_out_of_scope", False))
+                                for record in records
+                                if isinstance(record.get("intervention"), Mapping)
+                                and record["intervention"].get("skipped") is True
+                            )
+                            else "conditional_or_partial_application"
+                        )
+                    elif (
+                        intervention_count.get("changed_count_exact", 0) > 0
+                        and intervention_count.get("meaningful_changed_count") == 0
+                    ):
+                        assessment_status = "numerical_only"
+                    elif intervention_count.get("changed_count_exact", 0) == 0:
+                        assessment_status = "no_exact_input_change"
+                    else:
+                        assessment_status = "evaluated"
                     episode_result: dict[str, Any] = {
                         "pattern_id": identifier,
                         "episode": episode_index,
@@ -1049,10 +1786,49 @@ def run_closed_loop(
                         "initial_snapshot": initial_snapshot,
                         "records": records,
                         "metrics": metrics,
+                        "execution_status": execution_status,
+                        "assessment_status": assessment_status,
+                        "scope": pattern_scope,
+                        "on_inapplicable": pattern_on_inapplicable,
+                        "video": {
+                            "requested": bool(video),
+                            "enabled": bool(pattern_video),
+                            "selector": video_pattern_selector_status,
+                            "configured_patterns": (
+                                None
+                                if video_pattern_selector is None
+                                else sorted(video_pattern_selector)
+                            ),
+                            "status": "pending" if pattern_video else "not_generated",
+                            "reason": pattern_video_reason,
+                            "frame_count": 0,
+                        },
+                        "target_step_count": len(records),
+                        "planned_target_step_count": planned_target_steps,
+                        "actual_target_step_count": int(executed_step_count),
+                        "eligible_count": intervention_count.get("eligible_count"),
+                        "applied_count": intervention_count.get("applied_count"),
+                        "changed_count_exact": intervention_count.get("changed_count_exact"),
+                        "changed_count": intervention_count.get("changed_count_exact"),
+                        "changed_element_count_exact": intervention_count.get("changed_element_count_exact"),
+                        "applied_element_count": intervention_count.get("applied_element_count"),
+                        "noop_element_count": intervention_count.get("noop_element_count"),
+                        "noop_count": intervention_count.get("noop_count"),
+                        "skipped_count": intervention_count.get("skipped_count"),
+                        "per_input_delta": intervention_count.get("per_input_delta", {}),
+                        "intervention_counts": intervention_count,
+                        # Pairing is filled only after the per-episode initial
+                        # and execution checks below.  Explicit nulls keep a
+                        # control episode from being mistaken for a verified
+                        # intervention pair by legacy readers.
+                        "paired_p00_status": None,
+                        "paired_p00_verified": None,
+                        "paired_p00_missing_reason": "baseline_control" if identifier == "P00" else None,
                         "intervention_skipped": bool(skipped_interventions),
                         "intervention_skip_count": len(skipped_interventions),
                         "intervention_skip_reasons": skip_reasons,
                     }
+                    current_phase = "pairing"
                     if identifier == "P00":
                         reference = {
                             "episode": episode_index,
@@ -1096,27 +1872,100 @@ def run_closed_loop(
                             current_initial_status = (
                                 (current_initial.get("initial_match") or {}).get("status")
                             )
-                            if baseline_initial_status == "matched" and current_initial_status == "matched":
+                            baseline_episode = (
+                                result.patterns.get("P00", [])[episode_index]
+                                if episode_index < len(result.patterns.get("P00", []))
+                                else {}
+                            )
+                            baseline_execution_status = baseline_episode.get("execution_status")
+                            pair_reasons: list[str] = []
+                            if baseline_initial_status != "matched":
+                                pair_reasons.append(
+                                    f"baseline_initial_{baseline_initial_status or 'missing'}"
+                                )
+                            if current_initial_status != "matched":
+                                pair_reasons.append(
+                                    f"pattern_initial_{current_initial_status or 'missing'}"
+                                )
+                            if baseline_execution_status == "aborted":
+                                pair_reasons.append("baseline_intervention_abort")
+                            elif not _pair_execution_eligible(baseline_episode):
+                                pair_reasons.append(
+                                    f"baseline_terminal_{baseline_episode.get('terminal_reason') or 'incomplete'}"
+                                )
+                            if execution_status == "aborted":
+                                pair_reasons.append("pattern_intervention_abort")
+                            elif not _pair_execution_eligible(episode_result):
+                                pair_reasons.append(
+                                    f"pattern_terminal_{episode_result.get('terminal_reason') or 'incomplete'}"
+                                )
+                            if (
+                                baseline_initial_status == "matched"
+                                and current_initial_status == "matched"
+                                and _pair_execution_eligible(baseline_episode)
+                                and _pair_execution_eligible(episode_result)
+                            ):
                                 episode_result["metrics"]["paired_p00"] = paired_deltas(
                                     metrics,
-                                    result.patterns["P00"][episode_index]["metrics"],
+                                    baseline_episode.get("metrics", {}),
                                 )
+                                episode_result["paired_p00_status"] = "matched"
+                                episode_result["paired_p00_verified"] = True
+                                episode_result["paired_p00_missing_reason"] = None
                             else:
                                 episode_result["metrics"]["paired_p00"] = None
-                                episode_result["paired_p00_status"] = "unverified"
+                                episode_result["paired_p00_status"] = (
+                                    "interrupted"
+                                    if execution_status == "aborted"
+                                    else "unverified"
+                                    if baseline_initial_status != "matched"
+                                    or current_initial_status != "matched"
+                                    else "incomplete"
+                                    if not _pair_execution_eligible(episode_result)
+                                    or not _pair_execution_eligible(baseline_episode)
+                                    else "unverified"
+                                )
+                                episode_result["paired_p00_verified"] = False
+                                episode_result["paired_p00_missing_reason"] = "; ".join(pair_reasons)
+                        else:
+                            episode_result["paired_p00_status"] = "unavailable"
+                            episode_result["paired_p00_verified"] = False
+                            episode_result["paired_p00_missing_reason"] = "p00_reference_missing"
+                    video_result: dict[str, Any] | None = None
+                    if pattern_video and store:
+                        video_result = finalize_video(
+                            frames,
+                            episode_video_dir,
+                            fps=video_fps if video_fps is not None else infer_video_fps(records),
+                        )
+                        episode_result["video"] = {
+                            **episode_result["video"],
+                            **video_result,
+                            "status": str(video_result.get("status", "generated")),
+                            "frame_count": len(frames),
+                            "reason": video_result.get("reason"),
+                        }
+                    elif pattern_video:
+                        # Without a RunArtifacts store the frame files may
+                        # still be written to the requested/default directory,
+                        # but there is no durable video.json to point to.
+                        episode_result["video"] = {
+                            **episode_result["video"],
+                            "status": "frames_saved_without_store",
+                            "frame_count": len(frames),
+                            "reason": "store_not_provided",
+                        }
                     result.patterns[identifier].append(episode_result)
+                    episode_result_saved = True
+                    current_phase = "artifact"
                     if store:
                         np.save(episode_dir / "observations.npy", _safe_stack(observations, schema.dimension), allow_pickle=False)
                         np.save(episode_dir / "modified_observations.npy", _safe_stack(modified_observations, schema.dimension), allow_pickle=False)
                         store.write_json(episode_dir.relative_to(store.run_dir) / "trajectory.json", episode_result)
-                        if video:
+                        if pattern_video and video_result is not None:
                             store.write_json(
                                 episode_dir.relative_to(store.run_dir) / "video.json",
-                                finalize_video(
-                                    frames,
-                                    episode_video_dir,
-                                    fps=video_fps if video_fps is not None else infer_video_fps(records),
-                                ),
+                                video_result,
                             )
                     if identifier == "P00" and store:
                         reference_dir = store.closed_loop_dir / "P00" / f"episode-{episode_index}"
@@ -1127,8 +1976,153 @@ def run_closed_loop(
                             "initial_snapshot": initial_snapshot,
                         })
                         np.save(reference_dir / "reference_observations.npy", _safe_stack(observations, schema.dimension), allow_pickle=False)
+                except Exception as exc:
+                    # Preserve an attempted episode when a runtime hook fails
+                    # after records have already been collected.  An
+                    # intervention-resolution failure in a full-episode
+                    # pattern is a pattern abort; policy/decode/schema/env
+                    # failures remain explicit runtime failures instead of
+                    # being silently reclassified as intervention skips.
+                    if episode_result_saved or current_phase in {
+                        "runtime_seed",
+                        "reset",
+                        "seed_verification",
+                    }:
+                        raise
+                    failure_reason = f"{type(exc).__name__}: {exc}"
+                    intervention_abort_failure = (
+                        pattern_scope == "full_episode"
+                        and current_phase == "intervention"
+                    )
+                    failure_terminal_reason = (
+                        "intervention_abort"
+                        if intervention_abort_failure
+                        else "runtime_error"
+                    )
+                    failure_execution_status = (
+                        "aborted" if intervention_abort_failure else "failed"
+                    )
+                    failure_assessment_status = (
+                        "not_evaluable_intervention_abort"
+                        if intervention_abort_failure
+                        else "not_evaluable_runtime_error"
+                    )
+                    failure_metrics = summarize_trajectory(
+                        records,
+                        terminal_reason=failure_terminal_reason,
+                        **thresholds,
+                    )
+                    failure_planned_steps = _pattern_target_step_count(config, max_steps)
+                    failure_executed_steps = sum(
+                        bool(record.get("env_step_called")) for record in records
+                    )
+                    failure_counts = summarize_intervention_records(
+                        records=records,
+                        target_step_count=len(records),
+                        declared_out_of_scope=[
+                            bool(record.get("intervention_declared_out_of_scope", False))
+                            for record in records
+                        ],
+                    )
+                    failure_counts.update(
+                        {
+                            "planned_target_step_count": failure_planned_steps,
+                            "attempted_step_count": len(records),
+                            "executed_env_step_count": int(failure_executed_steps),
+                            "actual_target_step_count": int(failure_executed_steps),
+                            "aborted_before_env_step_count": int(
+                                sum(not bool(record.get("env_step_called")) for record in records)
+                            ),
+                            "target_step_count": len(records),
+                            "planned_range_complete": False,
+                        }
+                    )
+                    failed_episode: dict[str, Any] = {
+                        "pattern_id": identifier,
+                        "episode": episode_index,
+                        "episode_id": f"episode-{episode_index}",
+                        "scenario_seed": episode_seed,
+                        "rl_seed": episode_rl_seed,
+                        "record_count": len(records),
+                        "terminal_reason": failure_terminal_reason,
+                        "initial_snapshot": initial_snapshot,
+                        "records": records,
+                        "metrics": failure_metrics,
+                        "execution_status": failure_execution_status,
+                        "assessment_status": failure_assessment_status,
+                        "scope": pattern_scope,
+                        "on_inapplicable": pattern_on_inapplicable,
+                        "failure_phase": current_phase,
+                        "failure_reason": failure_reason,
+                        "video": {
+                            "requested": bool(video),
+                            "enabled": bool(pattern_video),
+                            "selector": video_pattern_selector_status,
+                            "configured_patterns": (
+                                None
+                                if video_pattern_selector is None
+                                else sorted(video_pattern_selector)
+                            ),
+                            "status": "partial" if pattern_video and frames else "not_generated",
+                            "reason": failure_reason,
+                            "frame_count": len(frames),
+                        },
+                        "target_step_count": len(records),
+                        "planned_target_step_count": failure_planned_steps,
+                        "actual_target_step_count": int(failure_executed_steps),
+                        "eligible_count": failure_counts.get("eligible_count"),
+                        "applied_count": failure_counts.get("applied_count"),
+                        "changed_count_exact": failure_counts.get("changed_count_exact"),
+                        "changed_count": failure_counts.get("changed_count_exact"),
+                        "changed_element_count_exact": failure_counts.get("changed_element_count_exact"),
+                        "applied_element_count": failure_counts.get("applied_element_count"),
+                        "noop_element_count": failure_counts.get("noop_element_count"),
+                        "noop_count": failure_counts.get("noop_count"),
+                        "skipped_count": failure_counts.get("skipped_count"),
+                        "per_input_delta": failure_counts.get("per_input_delta", {}),
+                        "intervention_counts": failure_counts,
+                        "paired_p00_status": (
+                            "interrupted" if intervention_abort_failure else "unverified"
+                        ) if identifier != "P00" else None,
+                        "paired_p00_verified": False if identifier != "P00" else None,
+                        "paired_p00_missing_reason": (
+                            f"pattern_{failure_terminal_reason}"
+                            if identifier != "P00"
+                            else "baseline_control"
+                        ),
+                        "intervention_skipped": False,
+                        "intervention_skip_count": failure_counts.get("skipped_count"),
+                        "intervention_skip_reasons": sorted(
+                            failure_counts.get("skip_reasons", {})
+                        ),
+                    }
+                    result.patterns[identifier].append(failed_episode)
+                    episode_result_saved = True
+                    if store:
+                        np.save(
+                            episode_dir / "observations.npy",
+                            _safe_stack(observations, schema.dimension),
+                            allow_pickle=False,
+                        )
+                        np.save(
+                            episode_dir / "modified_observations.npy",
+                            _safe_stack(modified_observations, schema.dimension),
+                            allow_pickle=False,
+                        )
+                        store.write_json(
+                            episode_dir.relative_to(store.run_dir) / "trajectory.json",
+                            failed_episode,
+                        )
                 finally:
                     close_environment(adapter, env)
+        policy_fingerprint_after = _policy_fingerprint(policy, adapter)
+        result.policy_fingerprint_after = policy_fingerprint_after
+        if policy_fingerprint_before is not None and policy_fingerprint_after is not None:
+            result.policy_unchanged = policy_fingerprint_before == policy_fingerprint_after
+            if not result.policy_unchanged:
+                raise ClosedLoopError(
+                    "policy parameters/buffers changed during closed-loop analysis"
+                )
         if store:
             store.write_json("02_closed_loop/summary.json", result.as_dict())
             manifest = store.load_manifest() if store.manifest_path.is_file() else build_manifest(config=config, command="closed-loop")
@@ -1137,6 +2131,12 @@ def run_closed_loop(
                 "patterns": list(result.patterns),
                 "p00_reference_episodes": len(result.baseline_references),
                 "video": bool(video),
+                "video_pattern_selector": video_pattern_selector_status,
+                "video_patterns": (
+                    None
+                    if video_pattern_selector is None
+                    else sorted(video_pattern_selector)
+                ),
             }
             store.save_manifest(manifest)
             store.update_status("closed_loop", "success", patterns=list(result.patterns))

@@ -17,7 +17,14 @@ Typical port shape::
         # assert_contract, source_paths, and optionally render_frame
 
 Keep the target repository's existing files unchanged; this adapter is the
-only place where its private connection details should be absorbed.
+only place where its private connection details should be absorbed.  The
+portable package never overwrites an external 262-dimensional producer or
+model.  A port should expose only source-verified meanings.  The
+``closed-loop --patterns`` selection chooses the patterns to run, while
+``video.patterns`` chooses a small set of those patterns to capture (normally
+``P00`` plus one or two focused variants).  Omit it to capture every run
+pattern when video is enabled, or set ``video.enabled`` to false to disable
+all capture; it must not infer a 262-D layout from length.
 """
 
 from __future__ import annotations

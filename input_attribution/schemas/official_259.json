@@ -37,6 +37,72 @@
       "lane_line_detector_num_lasers": 0
     }
   },
+  "intervention_variants": {
+    "lidar_no_detection_default": {
+      "id": "lidar_no_detection_default",
+      "operation": "fixed_level",
+      "value": 1.0,
+      "value_type": "continuous",
+      "range": [0.0, 1.0],
+      "allowed_groups": ["lidar_all"],
+      "meaning": "remove a LiDAR hit by using the detector's verified no-detection fraction",
+      "evidence": "MetaDrive distance_detector.py:177-180 and state_obs.py:165-247",
+      "confirmed": true,
+      "replacement_kind": "information_removal"
+    },
+    "lidar_virtual_detection_0_5": {
+      "id": "lidar_virtual_detection_0_5",
+      "operation": "fixed_level",
+      "value": 0.5,
+      "value_type": "continuous",
+      "range": [0.0, 1.0],
+      "allowed_groups": ["lidar_all"],
+      "meaning": "diagnostic synthetic normalized distance-like input; no obstacle is added to the environment",
+      "evidence": "source-verified LiDAR hit fraction range [0,1]; diagnostic setting only",
+      "confirmed": true,
+      "replacement_kind": "diagnostic_virtual_detection"
+    },
+    "speed_fixed_level_0_2": {
+      "id": "speed_fixed_level_0_2",
+      "operation": "fixed_level",
+      "value": 0.2,
+      "allowed_ids": ["normalized_speed"],
+      "meaning": "explicit normalized speed diagnostic level; not a claim of zero physical speed",
+      "evidence": "state_obs.py speed encoding (speed_km_h+1)/(max_speed_km_h+1), verified range [0,1]",
+      "confirmed": true,
+      "replacement_kind": "diagnostic_normalized_level"
+    },
+    "steering_neutral_0_5": {
+      "id": "steering_neutral_0_5",
+      "operation": "neutral",
+      "value": 0.5,
+      "allowed_ids": ["current_steering"],
+      "meaning": "center of the normalized current steering representation",
+      "evidence": "state_obs.py current steering normalization by MAX_STEERING",
+      "confirmed": true,
+      "replacement_kind": "diagnostic_neutral"
+    },
+    "previous_steering_neutral_0_5": {
+      "id": "previous_steering_neutral_0_5",
+      "operation": "neutral",
+      "value": 0.5,
+      "allowed_ids": ["previous_steering_action"],
+      "meaning": "center of the normalized previous steering action representation",
+      "evidence": "state_obs.py and env_input_policy.py previous steering action encoding",
+      "confirmed": true,
+      "replacement_kind": "diagnostic_neutral"
+    },
+    "previous_throttle_neutral_0_5": {
+      "id": "previous_throttle_neutral_0_5",
+      "operation": "neutral",
+      "value": 0.5,
+      "allowed_ids": ["previous_throttle_brake_action"],
+      "meaning": "center of the normalized previous throttle/brake action representation",
+      "evidence": "state_obs.py and env_input_policy.py previous throttle/brake action encoding",
+      "confirmed": true,
+      "replacement_kind": "diagnostic_neutral"
+    }
+  },
   "inputs": [
     {
       "index": 0,
@@ -113,6 +179,48 @@
         "kind": "reference",
         "value_method": "saved_observation"
       },
+      "variants": [
+        {
+          "id": "heading_neutral_0_5",
+          "operation": "neutral",
+          "value": 0.5,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "centered normalized heading component",
+          "evidence": "state_obs.py:103-112 and BaseVehicle.heading_diff; source mapping verified",
+          "confirmed": true
+        },
+        {
+          "id": "heading_reflection_center_0_5",
+          "operation": "reflection",
+          "center": 0.5,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "reflect the normalized heading component around its verified 0.5 center",
+          "evidence": "state_obs.py:103-112 and BaseVehicle.heading_diff; source mapping verified",
+          "confirmed": true
+        },
+        {
+          "id": "heading_fixed_level_0_4",
+          "operation": "fixed_level",
+          "value": 0.4,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "explicit lower diagnostic normalized level; not a physical angle",
+          "evidence": "source-verified normalized component range [0,1]",
+          "confirmed": true
+        },
+        {
+          "id": "heading_fixed_level_0_6",
+          "operation": "fixed_level",
+          "value": 0.6,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "explicit upper diagnostic normalized level; not a physical angle",
+          "evidence": "source-verified normalized component range [0,1]",
+          "confirmed": true
+        }
+      ],
       "related_valid_flags": [],
       "coupled_indices": [],
       "independently_replaceable": true,
@@ -275,6 +383,48 @@
         "kind": "reference",
         "value_method": "saved_observation"
       },
+      "variants": [
+        {
+          "id": "lateral_neutral_0_5",
+          "operation": "neutral",
+          "value": 0.5,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "center of the normalized current-lane lateral representation",
+          "evidence": "state_obs.py current lane local coordinate mapping; max_lane_width conversion verified",
+          "confirmed": true
+        },
+        {
+          "id": "lateral_reflection_center_0_5",
+          "operation": "reflection",
+          "center": 0.5,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "reflect the normalized current-lane lateral representation around its center",
+          "evidence": "state_obs.py current lane local coordinate mapping; max_lane_width conversion verified",
+          "confirmed": true
+        },
+        {
+          "id": "lateral_fixed_level_0_4",
+          "operation": "fixed_level",
+          "value": 0.4,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "explicit lower diagnostic normalized lateral level; physical offset requires max_lane_width",
+          "evidence": "source-verified normalized range [0,1] and lane-width encoding",
+          "confirmed": true
+        },
+        {
+          "id": "lateral_fixed_level_0_6",
+          "operation": "fixed_level",
+          "value": 0.6,
+          "value_type": "continuous",
+          "range": [0.0, 1.0],
+          "meaning": "explicit upper diagnostic normalized lateral level; physical offset requires max_lane_width",
+          "evidence": "source-verified normalized range [0,1] and lane-width encoding",
+          "confirmed": true
+        }
+      ],
       "related_valid_flags": [],
       "coupled_indices": [],
       "independently_replaceable": true,

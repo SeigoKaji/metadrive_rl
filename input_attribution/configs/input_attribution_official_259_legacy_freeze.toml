@@ -1,0 +1,98 @@
+# Supplementary legacy experiment.  Reference values come from the frozen
+# initial observation only when the declared road/lane context is compatible.
+# This is explicitly conditional and is not the new full-episode standard.
+
+[analysis]
+name = "input_attribution_official_259_legacy_freeze"
+experiment = "official_baseline_259_legacy_reference_freeze"
+description = "Legacy initial-reference compatibility experiment"
+deterministic = true
+individual_inputs = false
+reference_id = "episode-0:0"
+
+[model]
+path = "../../models/official_baseline.zip"
+name = "official_baseline"
+format = "stable_baselines3_ppo_zip"
+device = "cpu"
+deterministic = true
+
+[adapter]
+module = "input_attribution.adapters.metadrive"
+factory = "input_attribution.adapters.metadrive.create_adapter"
+
+[schema]
+path = "../schemas/official_259.json"
+name = "metadrive_default_259"
+dimension = 259
+template = false
+
+[environment]
+path = "../../configs/official.toml"
+
+[scenario]
+map = "C"
+seed = 5
+scenario_seed = 5
+rl_seed = 0
+horizon = 500
+traffic_density = 0
+episodes = 1
+
+[seeds]
+scenario_seed = 5
+rl_seed = 0
+intervention = 0
+
+[preprocess]
+name = "sb3_vector_preprocess_from_schema"
+external_normalization = false
+
+[output]
+root = "../../outputs/input_attribution"
+experiment = "official_baseline_259_legacy_reference_freeze"
+model = "official_baseline"
+
+[closed_loop]
+enabled = true
+patterns = ["P00", "P02_heading_reference", "P04_lateral_reference"]
+episodes = 1
+max_steps = 500
+
+[video]
+enabled = false
+# Example focused capture selection when video is enabled:
+# patterns = ["P00", "P04_lateral_reference"]
+
+[ig]
+enabled = false
+
+[[patterns]]
+id = "P00"
+description = "unchanged reference observation"
+indices = []
+method = "identity"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P02_heading_reference"
+description = "legacy frozen initial-reference heading replacement; compatible context required"
+indices = [2]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+scope = "explicitly_conditional"
+on_inapplicable = "continue_unmodified_with_warning"
+metadata = { compatibility_keys = ["road_segment_id", "target_lane_ordinal"] }
+
+[[patterns]]
+id = "P04_lateral_reference"
+description = "legacy frozen initial-reference lateral replacement; compatible context required"
+indices = [8]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+scope = "explicitly_conditional"
+on_inapplicable = "continue_unmodified_with_warning"
+metadata = { compatibility_keys = ["road_segment_id", "target_lane_ordinal"] }

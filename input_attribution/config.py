@@ -53,9 +53,15 @@ _SECTION_KEYS: dict[str, frozenset[str]] = {
     ),
     "output": frozenset({"root", "experiment", "model", "run_id", "overwrite"}),
     "closed_loop": frozenset({"patterns", "episodes", "max_steps", "enabled", "seed", "departure_tolerance_ratio", "departure_consecutive_steps", "low_speed_m_s"}),
-    "video": frozenset({"enabled", "format", "fps", "directory"}),
+    "video": frozenset({"enabled", "format", "fps", "directory", "patterns"}),
     "ig": frozenset({"enabled", "steps", "baseline", "n_steps", "method", "completeness_tolerance", "max_retries", "compatibility_keys"}),
 }
+
+_PATTERN_METHODS = frozenset(
+    {"identity", "fixed", "reference", "neutral", "reflection", "fixed_level", "fixed-value", "fixed_value"}
+)
+_PATTERN_SCOPES = frozenset({"full_episode", "explicitly_conditional"})
+_PATTERN_INAPPLICABLE = frozenset({"abort_pattern", "continue_unmodified_with_warning"})
 
 
 def _mapping(value: object, location: str) -> dict[str, Any]:
@@ -134,8 +140,14 @@ def _check_patterns(raw: object) -> list[dict[str, Any]]:
         if identifier in seen:
             raise ConfigError(f"patterns に重複idがあります: {identifier}")
         seen.add(identifier)
-        # Intervention details are intentionally validated by schema/interventions;
-        # retain their fields here so new input groups can travel through the CLI.
+        # Intervention details are validated again by schema/interventions;
+        # retain their fields here so new input groups can travel through the
+        # CLI while checking the execution-scope contract at config load time.
+        method = pattern.get("method", pattern.get("operation", pattern.get("kind", "fixed")))
+        if not isinstance(method, str) or method.strip().casefold() not in _PATTERN_METHODS:
+            raise ConfigError(
+                f"patterns[{index}].method はidentity/fixed/reference/neutral/reflection/fixed_levelのいずれかで指定してください"
+            )
         if "indices" in pattern:
             indices = pattern["indices"]
             if not isinstance(indices, list) or any(
@@ -144,11 +156,77 @@ def _check_patterns(raw: object) -> list[dict[str, Any]]:
                 raise ConfigError(f"patterns[{index}].indices は0以上の整数または意味IDのarrayで指定してください")
         pattern = _plain(pattern, f"patterns[{index}]")
         pattern["id"] = identifier
-        if pattern.get("method") == "reference":
-            pattern.setdefault("metadata", {}).setdefault("compatibility_keys", ["road_segment_id", "target_lane_ordinal"])
+        normalized_method = str(
+            pattern.get("method", pattern.get("operation", pattern.get("kind", "fixed")))
+        ).strip().casefold().replace("-", "_")
+        if normalized_method == "fixed_value":
+            normalized_method = "fixed_level"
+        if normalized_method == "fixed-value":
+            normalized_method = "fixed"
+        if "scope" not in pattern:
+            # Preserve the old reference-bank experiment as explicitly
+            # conditional.  Local typed operations are full-episode by
+            # default, so a missing donor/context cannot silently turn them
+            # into the old 19/127 experiment.
+            pattern["scope"] = "explicitly_conditional" if normalized_method == "reference" else "full_episode"
+        scope = str(pattern["scope"]).strip().casefold().replace("-", "_")
+        if scope not in _PATTERN_SCOPES:
+            raise ConfigError(
+                f"patterns[{index}].scope はfull_episodeまたはexplicitly_conditionalで指定してください"
+            )
+        pattern["scope"] = scope
+        if "on_inapplicable" not in pattern:
+            pattern["on_inapplicable"] = (
+                "continue_unmodified_with_warning"
+                if scope == "explicitly_conditional"
+                else "abort_pattern"
+            )
+        action = str(pattern["on_inapplicable"]).strip().casefold().replace("-", "_")
+        if action not in _PATTERN_INAPPLICABLE:
+            raise ConfigError(
+                f"patterns[{index}].on_inapplicable はabort_patternまたはcontinue_unmodified_with_warningで指定してください"
+            )
+        pattern["on_inapplicable"] = action
+        if normalized_method == "reference" and scope == "explicitly_conditional":
+            # Compatibility keys are a property of the legacy reference
+            # pattern, not a global rule for every future reference adapter.
+            metadata = pattern.setdefault("metadata", {})
+            if not isinstance(metadata, dict):
+                raise ConfigError(f"patterns[{index}].metadata はtableで指定してください")
+            metadata.setdefault("compatibility_keys", ["road_segment_id", "target_lane_ordinal"])
         result.append(pattern)
     if not any(item["id"] == "P00" for item in result):
         raise ConfigError("patterns には変更なしのP00を明示してください")
+    return result
+
+
+def _check_video_patterns(raw: object, pattern_ids: set[str]) -> list[str]:
+    """Validate an optional, explicit subset used for video capture.
+
+    Video selection is an output policy.  It must refer to the same declared
+    intervention IDs as the experiment instead of silently creating a second
+    pattern namespace or falling back to an unrelated row.
+    """
+
+    if not isinstance(raw, list):
+        raise ConfigError("video.patterns はpattern idの文字列arrayで指定してください")
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, value in enumerate(raw):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"video.patterns[{index}] は空でないpattern id文字列で指定してください"
+            )
+        identifier = _basename(value.strip(), f"video.patterns[{index}]")
+        if identifier in seen:
+            raise ConfigError(f"video.patterns に重複idがあります: {identifier}")
+        seen.add(identifier)
+        result.append(identifier)
+    missing = sorted(seen - pattern_ids)
+    if missing:
+        raise ConfigError(
+            f"video.patterns に未定義idがあります: {', '.join(missing)}"
+        )
     return result
 
 
@@ -368,6 +446,8 @@ def config_from_mapping(raw: Mapping[str, Any], *, source_path: str | Path = "<m
     missing = sorted(set(closed_loop["patterns"]) - pattern_ids)
     if missing:
         raise ConfigError(f"closed_loop.patterns に未定義idがあります: {', '.join(missing)}")
+    if "patterns" in video:
+        video["patterns"] = _check_video_patterns(video["patterns"], pattern_ids)
 
     resolved: dict[str, Any] = {
         "analysis": analysis,

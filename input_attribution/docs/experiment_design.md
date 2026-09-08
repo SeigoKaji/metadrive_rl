@@ -6,7 +6,9 @@
 
 標準 schema は、実装ソースで確認した 259 次元です。公式接続の fixture では 0–8 が自車状態、9–18 が navigation、19–258 が LiDAR です。これはこの schema の記録であり、次元数だけから別環境の意味や並びを推測しません。特に index 2 の向き整合度と index 8 の横位置は、同じレーン参照だと仮定しません。各入力の source、単位、正規化、範囲、置換可否は `input_schema.json`/`input_schema.csv` に保存します。
 
-移植先の 262 次元は、開始時の目標レーンからの横ずれ、目標レーンへの向き誤差、有効フラグという3入力を含むテンプレートです。テンプレートは非末尾 index も表現できますが、index、符号、正規化、中立値、無効時の組、道路区間更新規則は未確認のまま成功扱いにしません。`custom_262_schema_template` に残る `UNRESOLVED_` を adapter と schema で解決してから実験します。
+259次元の新しい標準設定は `input_attribution/configs/input_attribution_official_259_variants.toml` です。旧初期参照を固定して再現する設定は `input_attribution/configs/input_attribution_official_259_legacy_freeze.toml` として分離し、同じ実験条件として混ぜません。新しい local neutral/reflection/fixed variant はエピソード全体の適用範囲を明示した別patternとして扱います。`index 2` は生角度ではなく確認済みの向き成分、`index 8` は現行schemaの正規化値であり、別PCの262次元へ数値を移植しません。
+
+移植先の 262 次元は、開始時の目標レーンからの横ずれ、目標レーンへの向き誤差、有効フラグという3入力を含むテンプレートです。テンプレートは非末尾 index も表現できますが、index、符号、正規化、中立値、無効時の組、道路区間更新規則は未確認のまま成功扱いにしません。`input_attribution/schemas/custom_262_template.json` に残る `UNRESOLVED_` を adapter と schema で解決してから実験します。
 
 ## ①-A、①-B、③の違い
 
@@ -14,11 +16,17 @@
 
 ①-A（offline）は各保存時刻について `x_t` と対象だけを置換した `x'_t` を同じ方策へ入力します。`env.step()` は呼ばず、次時刻は元の通常走行観測を使います。主表示は次の三つです。
 
-* 元と置換後の argmax Action の一致/不一致と行動変更割合。
-* 元観測の Action `a_t` について、`q_t[a_t]-p_t[a_t]` を百分率ポイント（pp）で表示します。正は置換後に元 Action の確率が増えた向きです。
+* 元と置換後の argmax Action の一致/不一致と行動変更割合。分母は、その pattern で置換が適用された時刻（`applied`）とし、適用不能な時刻は `skipped` として分けます。
+* 元観測の Action `a_t` について、`q_t[a_t]-p_t[a_t]` を符号付き百分率ポイント（pp）で保存します。正は置換後に元 Action の確率が増えた向きです。主表は実際に入力が変わった時刻の絶対値平均 `|q_t[a_t]-p_t[a_t]|` と、その母数（`meaningful`/`changed_exact` 件数）を表示し、符号付き平均は詳細表で確認します。
 * `JS(p,q)=0.5 KL(p||m)+0.5 KL(q||m)`、`m=(p+q)/2` を自然対数で計算します。0 の項は0とし、値の範囲は `[0, ln(2)]` nats です。
 
+pattern の `scope` と `on_inapplicable` は集計の母数と一緒に保存します。`scope=full_episode` は全保存時刻を対象にし、前提不成立なら `on_inapplicable=abort_pattern` でその pattern を中断します。`scope=explicitly_conditional` は宣言した道路・レーン等の条件が成立する時刻だけを対象にし、`continue_unmodified_with_warning` なら不成立時刻を元入力のまま通過させて `skipped` と理由を記録します。条件不成立を0件の影響として集計しません。
+
+各 pattern の A 集計は、`target`（計画対象）、`eligible`（前提を満たし比較可能）、`applied`（置換を実行）、`changed_exact`（保存精度で実入力が変化）、`noop`（`applied - changed_exact`）、`skipped`（前提不成立または範囲外）を別々に示します。`meaningful` は設定した報告許容幅を超えた変化だけで、`changed_exact` を上書きしません。したがって、許容幅により0になった行と、実入力が本当に同じだった no-op を区別できます。
+
 ①-B（closed-loop）はパターンごとに環境を逐次 reset し、毎 step、その走行自身から得た最新観測のコピーへ同じ置換を適用して Action を実環境へ渡します。通常走行の未来観測を再生する比較ではありません。P00（変更なし）を対応する対照として保存し、分岐後の同じ step を同一状態の比較とは呼びません。評価は加工観測からではなく、adapter が返す未加工の物理テレメトリから計算します。
+
+B で走行する pattern の集合は `closed-loop --patterns` または `closed_loop.patterns` で指定し、動画を保存する pattern の集合は `[video].patterns` で指定します。`video.enabled=true` のとき、`video.patterns` を省略すると走行した全 pattern、配列ならその ID だけが動画対象になります。動画を全て無効にする場合は `video.enabled=false` とし、動画選択を介入対象の選択と混同しません。
 
 ①-B の主指標は、目標レーン横ずれ RMS (m)、最大絶対横ずれ (m)、目標レーン逸脱回数/時刻、到達、ルート進行度、走行時間、平均速度・停止、終了理由です。道路外逸脱と衝突は目標レーン逸脱とは分けます。Action 切替や操舵指令差分は補助指標であり、横加速度やジャークとは呼びません。目標レーン参照が欠測の区間は最近傍レーンで埋めず、valid count/valid time と N/A を表示します。
 
@@ -32,11 +40,19 @@
 
 ③（Integrated Gradients）は任意の補足です。対象 episode/step と保存された baseline を明示し、元観測の argmax Action `a*` を固定して `F(x;a*) = z[a*] - logsumexp(z[other actions])` を追跡します。baseline 未指定時にゼロベクトルへ黙ってフォールバックしません。bool・カテゴリ・有効フラグは同じ値の baseline とし、直線補間が実在状態とは限らないことを記録します。`sum(IG)` と `F(x)-F(baseline)`、completeness 残差、積分点数を保存し、IGを①-Aの順位や①-Bの性能へ合算しません。Captum は遅延 import の任意依存です。
 
+保存済み通常観測の再利用は、report表示の再生成、①-Aの新variant、①-Bの新走行を別操作にします。`report --run-dir OLD --output-dir DIR` は保存値からDIRだけへ出力し、`offline --run-dir OLD --config NEW` はモデル・入力意味/順序/正規化・結合条件・前処理が一致するときだけ参照観測をコピーした子runを作ります。variant追加は許可されますが、意味定義の変更は拒否します。①-Bは子runの設定で環境を再走行し、旧Bの数値を新条件へ流用しません。
+
 ## 置換パターンと集計
 
-最初に P00 を指定します。追加特徴はスキーマの意味確認済み置換値だけを使い、非独立の有効フラグは関連値と組で変更します。保存参照を使う場合は episode/step/reference id を残し、同じ一つの実観測から対象群を取ります。全次元一律0、未知の中立値、任意角度への LiDAR 割当ては行いません。実際に変更した index、適用件数、実変更件数、no-op件数、skip reason を記録します。元から置換値と同じ値だった no-op は「この条件では評価不能」と記載し、影響0や不要の証拠にしません。
+最初に P00 を指定します。追加特徴はスキーマの意味確認済み置換値だけを使い、非独立の有効フラグは関連値と組で変更します。保存参照を使う場合は episode/step/reference id を残し、同じ一つの実観測から対象群を取ります。全次元一律0、未知の中立値、任意角度への LiDAR 割当ては行いません。実際に変更した index、適用件数、実変更件数、no-op件数、skip reason を記録します。
 
-全時刻集計と実変更時刻だけの集計を分け、episode 平均と step 加重平均を別列にします。入力1個の結果と大きなグループの結果は同じ順位へ混ぜません。no-op、未実行、範囲外、依存不足、テレメトリ欠測は0ではなく理由付き N/A です。数値から言えるのは「このモデル・対象場面・指定置換条件で影響が確認された」までです。
+LiDAR は単一 index、方向 sector/group、全240次元を同じ影響として順位付けしません。`information_removal`（確認済み no-detection 値）と `diagnostic_virtual_detection`（仮想検出値、物体追加を意味しない）を `variant_classification` として分け、対象 sector と実変更件数を保存します。これは LiDAR の物理的な物体検出結果や道路上の障害物追加とは解釈しません。
+
+主影響欄では、適用されたが元値と同じ no-op、または `meaningful` 判定に届かない変化を影響0とは表示せず N/A（評価対象外）とします。一方、詳細表・JSON・CSV には生の実測値として `changed_exact=0`、`noop`、符号付き pp、JSを保存します。これにより「変化が無かった」という観測と「比較できなかった」という状態を後から区別できます。
+
+全時刻集計と実変更時刻だけの集計を分け、episode 平均と step 加重平均を別列にします。入力1個の結果と大きなグループの結果は同じ順位へ混ぜません。未実行、範囲外、依存不足、テレメトリ欠測は0ではなく理由付き N/A です。数値から言えるのは「このモデル・対象場面・指定置換条件で影響が確認された」までです。
+
+①-B は「到達」と「到達後のレーン維持」を別に判定します。到達は確認済みの target-lane identity と到達条件を満たしたか、維持は到達後または走行区間の valid telemetry で横ずれ RMS・逸脱回数・逸脱時間を評価したかで示します。未到達、wrong-lane arrival、参照欠測、衝突・道路外逸脱・停止・中断は成功や維持の0へ潰さず、それぞれの状態と valid 分母を保存します。
 
 ## 参考手法との関係
 

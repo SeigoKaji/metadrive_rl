@@ -120,6 +120,18 @@ class DistributionComparison:
 
         return self.selected_probability_delta * 100.0
 
+    @property
+    def selected_probability_abs_delta(self) -> np.ndarray:
+        """Absolute probability change for the original policy's action."""
+
+        return np.abs(self.selected_probability_delta)
+
+    @property
+    def selected_probability_abs_delta_pp(self) -> np.ndarray:
+        """Absolute selected-action probability change in percentage points."""
+
+        return self.selected_probability_abs_delta * 100.0
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "original_argmax": self.original_argmax.tolist(),
@@ -129,6 +141,8 @@ class DistributionComparison:
             "selected_probability_changed": self.selected_probability_changed.tolist(),
             "selected_probability_delta": self.selected_probability_delta.tolist(),
             "selected_probability_delta_pp": self.selected_probability_delta_pp.tolist(),
+            "selected_probability_abs_delta": self.selected_probability_abs_delta.tolist(),
+            "selected_probability_abs_delta_pp": self.selected_probability_abs_delta_pp.tolist(),
             "js": self.js.tolist(),
             "action_changed": self.action_changed.tolist(),
         }
@@ -314,6 +328,10 @@ def summarize_distribution_comparison(
                 "action_change_count": 0,
                 "action_change_rate": None,
                 "selected_probability_delta": _finite_summary(np.asarray([], dtype=np.float64)),
+                "selected_probability_abs_delta": _finite_summary(np.asarray([], dtype=np.float64)),
+                "selected_probability_delta_pp": _finite_summary(np.asarray([], dtype=np.float64)),
+                "selected_probability_delta_abs_pp": _finite_summary(np.asarray([], dtype=np.float64)),
+                "selected_probability_abs_delta_pp": _finite_summary(np.asarray([], dtype=np.float64)),
                 "js": _finite_summary(np.asarray([], dtype=np.float64)),
             }
         return {
@@ -321,6 +339,10 @@ def summarize_distribution_comparison(
             "action_change_count": int(np.sum(changed_actions[mask])),
             "action_change_rate": float(np.mean(changed_actions[mask])),
             "selected_probability_delta": _finite_summary(selected_delta[mask]),
+            "selected_probability_abs_delta": _finite_summary(np.abs(selected_delta[mask])),
+            "selected_probability_delta_pp": _finite_summary(selected_delta[mask] * 100.0),
+            "selected_probability_delta_abs_pp": _finite_summary(np.abs(selected_delta[mask]) * 100.0),
+            "selected_probability_abs_delta_pp": _finite_summary(np.abs(selected_delta[mask]) * 100.0),
             "js": _finite_summary(js[mask]),
         }
 
@@ -340,7 +362,355 @@ def summarize_distribution_comparison(
                 "actual_input_changes_only": section(mask & changed_mask & valid),
             }
         result["episodes"] = episode_sections
+        # Keep episode-mean and step-weighted views explicit.  The former gives
+        # every episode equal weight; the latter pools timestamps in the same
+        # mask used by ``all_timestamps``/``actual_input_changes_only``.
+        for name, mask in (
+            ("all_timestamps", valid),
+            ("actual_input_changes_only", changed_mask & valid),
+        ):
+            means: list[float] = []
+            counts: list[int] = []
+            for episode in dict.fromkeys(episode_array.tolist()):
+                episode_mask = (episode_array == episode) & mask
+                if np.any(episode_mask):
+                    means.append(float(np.mean(selected_delta[episode_mask])))
+                    counts.append(int(np.sum(episode_mask)))
+            result.setdefault("episode_mean", {})[name] = float(np.mean(means)) if means else None
+            result.setdefault("step_weighted", {})[name] = (
+                float(np.average(np.asarray(means), weights=np.asarray(counts)))
+                if means and sum(counts)
+                else None
+            )
+            abs_means: list[float] = []
+            for episode in dict.fromkeys(episode_array.tolist()):
+                episode_mask = (episode_array == episode) & mask
+                if np.any(episode_mask):
+                    abs_means.append(float(np.mean(np.abs(selected_delta[episode_mask]))))
+            result.setdefault("episode_mean_abs", {})[name] = float(np.mean(abs_means)) if abs_means else None
+            abs_values = np.abs(selected_delta[mask])
+            result.setdefault("step_weighted_abs", {})[name] = (
+                float(np.mean(abs_values)) if abs_values.size else None
+            )
+        # A compact, metric-complete view for consumers that need episode and
+        # step weighting for JS as well as signed/absolute probability deltas.
+        episode_mean_metrics: dict[str, Any] = {}
+        step_weighted_metrics: dict[str, Any] = {}
+        for name, mask in (
+            ("all_timestamps", valid),
+            ("actual_input_changes_only", changed_mask & valid),
+        ):
+            per_episode: dict[str, list[float]] = {
+                "selected_probability_delta": [],
+                "selected_probability_abs_delta": [],
+                "js": [],
+            }
+            weighted_values: dict[str, list[tuple[float, int]]] = {
+                key: [] for key in per_episode
+            }
+            for episode in dict.fromkeys(episode_array.tolist()):
+                episode_mask = (episode_array == episode) & mask
+                count = int(np.sum(episode_mask))
+                if not count:
+                    continue
+                values_by_name = {
+                    "selected_probability_delta": selected_delta[episode_mask],
+                    "selected_probability_abs_delta": np.abs(selected_delta[episode_mask]),
+                    "js": js[episode_mask],
+                }
+                for metric_name, values in values_by_name.items():
+                    mean_value = float(np.mean(values))
+                    per_episode[metric_name].append(mean_value)
+                    weighted_values[metric_name].append((mean_value, count))
+            episode_mean_metrics[name] = {
+                metric_name: float(np.mean(values)) if values else None
+                for metric_name, values in per_episode.items()
+            }
+            step_weighted_metrics[name] = {
+                metric_name: (
+                    float(sum(value * weight for value, weight in values) / sum(weight for _, weight in values))
+                    if values and sum(weight for _, weight in values)
+                    else None
+                )
+                for metric_name, values in weighted_values.items()
+            }
+        result["episode_mean_metrics"] = episode_mean_metrics
+        result["step_weighted_metrics"] = step_weighted_metrics
     return result
+
+
+def _intervention_bool(item: Any, name: str, *, default: bool = False) -> bool:
+    """Read a bool-like intervention field across old and new result objects."""
+
+    value = item.get(name, default) if isinstance(item, Mapping) else getattr(item, name, default)
+    if value is None:
+        return bool(default)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    return bool(value)
+
+
+def _intervention_reason(item: Any) -> str | None:
+    if isinstance(item, Mapping):
+        value = item.get("skip_reason")
+    else:
+        value = getattr(item, "skip_reason", None)
+    return None if value in (None, "") else str(value)
+
+
+def _reason_category(reason: str | None, *, declared_out_of_scope: bool = False) -> str | None:
+    """Classify a skipped application without treating every skip as a no-op."""
+
+    if declared_out_of_scope:
+        return "out_of_scope"
+    if reason is None:
+        return None
+    lowered = reason.casefold()
+    if any(
+        token in lowered
+        for token in ("out_of_scope", "out-of-scope", "outside scope", "declared inapplicable")
+    ):
+        return "out_of_scope"
+    return "failed"
+
+
+def summarize_intervention_records(
+    interventions: Sequence[Any] | None = None,
+    *,
+    records: Sequence[Mapping[str, Any]] | None = None,
+    target_step_count: int | None = None,
+    declared_out_of_scope: Sequence[bool] | None = None,
+) -> dict[str, Any]:
+    """Count intervention applicability independently of policy/trajectory metrics.
+
+    Counts are step-based: a pattern applied to several indices at one timestamp
+    contributes one applied step. ``applied = changed_exact + noop`` is kept as
+    an invariant, and skipped steps never enter the no-op denominator. Both
+    live ``InterventionResult`` objects and serialized mappings are accepted so
+    A and B can report their own observations.
+    """
+
+    if interventions is None:
+        items: list[Any] = []
+        if records is not None:
+            items = [
+                row.get("intervention") if "intervention" in row else None
+                for row in records
+                if isinstance(row, Mapping)
+            ]
+    else:
+        items = list(interventions)
+    total = len(items) if target_step_count is None else max(0, int(target_step_count))
+    if len(items) > total:
+        total = len(items)
+    scope_flags = list(declared_out_of_scope or ())
+    if scope_flags and len(scope_flags) != len(items):
+        raise MetricError("declared_out_of_scope must match intervention count")
+    if not scope_flags:
+        scope_flags = [False] * len(items)
+
+    eligible = applied = changed = noop = skipped = out_of_scope = failed = 0
+    applied_element_count = changed_element_count = noop_element_count = 0
+    reasons: dict[str, int] = {}
+    meaningful_observed = False
+    meaningful = 0
+    unknown_records = 0
+    per_input_accumulators: dict[str, dict[str, Any]] = {}
+
+    def field_value(item: Any, name: str, default: Any = None) -> Any:
+        return item.get(name, default) if isinstance(item, Mapping) else getattr(item, name, default)
+
+    def indexed_value(values: Any, index: int) -> Any:
+        if not isinstance(values, Mapping):
+            return None
+        if index in values:
+            return values[index]
+        return values.get(str(index))
+
+    def finite_scalar(value: Any) -> float | None:
+        try:
+            array = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if array.ndim != 0:
+            return None
+        number = float(array)
+        return number if np.isfinite(number) else None
+
+    for index, item in enumerate(items):
+        if item is None or (
+            isinstance(item, Mapping)
+            and not set(item).intersection(
+                {
+                    "skipped",
+                    "applied",
+                    "eligible",
+                    "requested_indices",
+                    "changed_indices",
+                    "no_op_indices",
+                    "changed",
+                }
+            )
+        ) or (
+            not isinstance(item, Mapping) and not hasattr(item, "skipped")
+        ):
+            unknown_records += 1
+            continue
+        reason = _intervention_reason(item)
+        skipped_item = _intervention_bool(item, "skipped", default=bool(reason))
+        explicit_eligible = item.get("eligible") if isinstance(item, Mapping) else getattr(item, "eligible", None)
+        explicit_applied = item.get("applied") if isinstance(item, Mapping) else getattr(item, "applied", None)
+        is_eligible = (not skipped_item) if explicit_eligible is None else bool(explicit_eligible)
+        if scope_flags[index]:
+            is_eligible = False
+        is_applied = (not skipped_item) if explicit_applied is None else bool(explicit_applied)
+        category = _reason_category(reason, declared_out_of_scope=scope_flags[index])
+        raw_category = item.get("skip_category") if isinstance(item, Mapping) else getattr(item, "skip_category", None)
+        if raw_category is not None and str(raw_category).casefold().replace("-", "_") in {
+            "out_of_scope",
+            "declared_out_of_scope",
+            "inapplicable",
+        }:
+            category = "out_of_scope"
+            is_eligible = False
+        if is_eligible:
+            eligible += 1
+        if is_applied and not skipped_item:
+            applied += 1
+            requested = field_value(item, "requested_indices", ())
+            changed_indices = field_value(item, "changed_indices", ())
+            no_op_indices = field_value(item, "no_op_indices", ())
+            try:
+                applied_element_count += len(requested)
+                changed_element_count += len(changed_indices)
+                noop_element_count += len(no_op_indices)
+            except TypeError:
+                pass
+            try:
+                requested_indices = tuple(int(value) for value in requested)
+            except (TypeError, ValueError):
+                requested_indices = ()
+            delta_values = field_value(item, "delta_values", {})
+            delta_abs_values = field_value(item, "delta_abs_values", {})
+            tolerance_values = field_value(item, "tolerance", {})
+            clipped_indices = field_value(item, "clipped_indices", ())
+            try:
+                clipped_set = {int(value) for value in clipped_indices}
+            except (TypeError, ValueError):
+                clipped_set = set()
+            # Only applied target indices enter this table. Missing delta or
+            # tolerance fields remain unmeasured instead of becoming zero.
+            for input_index in requested_indices:
+                key = str(input_index)
+                accumulator = per_input_accumulators.setdefault(
+                    key,
+                    {
+                        "applied_count": 0,
+                        "delta_abs_values": [],
+                        "tolerance_values": [],
+                        "clip_count": 0,
+                    },
+                )
+                accumulator["applied_count"] += 1
+                delta_abs = finite_scalar(indexed_value(delta_abs_values, input_index))
+                if delta_abs is None:
+                    delta = finite_scalar(indexed_value(delta_values, input_index))
+                    if delta is not None:
+                        delta_abs = abs(delta)
+                if delta_abs is not None:
+                    accumulator["delta_abs_values"].append(abs(delta_abs))
+                tolerance = finite_scalar(indexed_value(tolerance_values, input_index))
+                if tolerance is not None:
+                    accumulator["tolerance_values"].append(tolerance)
+                if input_index in clipped_set:
+                    accumulator["clip_count"] += 1
+            changed_item = _intervention_bool(item, "changed", default=False)
+            if isinstance(item, Mapping) and "changed" not in item:
+                changed_item = bool(item.get("changed_indices", ()))
+            if changed_item:
+                changed += 1
+            else:
+                noop += 1
+            meaningful_value = item.get("meaningful", None) if isinstance(item, Mapping) else getattr(item, "meaningful", None)
+            if meaningful_value is None:
+                meaningful_value = item.get("meaningful_changed", None) if isinstance(item, Mapping) else getattr(item, "meaningful_changed", None)
+            if meaningful_value is None:
+                meaningful_indices = item.get("meaningful_changed_indices", None) if isinstance(item, Mapping) else getattr(item, "meaningful_changed_indices", None)
+                tolerance = item.get("tolerance", None) if isinstance(item, Mapping) else getattr(item, "tolerance", None)
+                # ``meaningful_changed_count=0`` is emitted by newer cores for
+                # every result, including patterns without a declared
+                # tolerance.  It becomes an observed diagnostic only when the
+                # core also records indices or a non-empty tolerance mapping.
+                if meaningful_indices or tolerance:
+                    meaningful_value = item.get("meaningful_changed_count", None) if isinstance(item, Mapping) else getattr(item, "meaningful_changed_count", None)
+            if meaningful_value is not None:
+                meaningful_observed = True
+                meaningful += int(bool(meaningful_value))
+        else:
+            skipped += 1
+            if category == "out_of_scope":
+                out_of_scope += 1
+            else:
+                failed += 1
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+
+    unobserved = max(0, total - len(items))
+    if applied != changed + noop:
+        raise MetricError("intervention count invariant violated: applied != changed_exact + noop")
+    per_input_delta: dict[str, dict[str, Any]] = {}
+    for input_index in sorted(per_input_accumulators, key=lambda value: int(value)):
+        accumulator = per_input_accumulators[input_index]
+        delta_abs_values = np.asarray(accumulator["delta_abs_values"], dtype=np.float64)
+        tolerance_values = accumulator["tolerance_values"]
+        unique_tolerances = sorted({float(value) for value in tolerance_values})
+        per_input_delta[input_index] = {
+            "applied_count": int(accumulator["applied_count"]),
+            "delta_abs_count": int(delta_abs_values.size),
+            "delta_abs_mean": float(np.mean(delta_abs_values)) if delta_abs_values.size else None,
+            "delta_abs_max": float(np.max(delta_abs_values)) if delta_abs_values.size else None,
+            "tolerance_observed_count": len(tolerance_values),
+            "tolerance_values": unique_tolerances,
+            "tolerance": unique_tolerances[0] if len(unique_tolerances) == 1 else None,
+            "clip_count": int(accumulator["clip_count"]),
+        }
+
+    result: dict[str, Any] = {
+        "target_step_count": int(total),
+        "observed_step_count": int(len(items)),
+        "unobserved_step_count": int(unobserved),
+        "eligible_count": int(eligible),
+        "applied_count": int(applied),
+        "changed_count_exact": int(changed),
+        "changed_count": int(changed),
+        "applied_element_count": int(applied_element_count),
+        "changed_element_count_exact": int(changed_element_count),
+        "noop_element_count": int(noop_element_count),
+        "meaningful_changed_count": int(meaningful) if meaningful_observed else None,
+        "noop_count": int(noop),
+        "skipped_count": int(skipped),
+        "out_of_scope_count": int(out_of_scope),
+        "failed_count": int(failed),
+        "unknown_record_count": int(unknown_records),
+        "recorded_count": int(len(items) - unknown_records),
+        "status": "unavailable" if unknown_records else "available",
+        "skip_reasons": reasons,
+        "skip_reason_list": sorted(reasons),
+        "skipped_reasons": sorted(reasons),
+        "skipped_reason_counts": reasons,
+        "applied_rate_over_target": float(applied / total) if total else None,
+        "eligible_rate_over_target": float(eligible / total) if total else None,
+        "changed_rate_over_applied": float(changed / applied) if applied else None,
+        "noop_rate_over_applied": float(noop / applied) if applied else None,
+        "measurement": "observed_intervention_records",
+        "per_input_delta": per_input_delta,
+    }
+    return result
+
+
+# Short aliases keep the helper convenient for downstream analysis scripts.
+summarize_interventions = summarize_intervention_records
+intervention_counts = summarize_intervention_records
 
 
 def summarize_values(values: Iterable[float | int | None]) -> dict[str, Any]:

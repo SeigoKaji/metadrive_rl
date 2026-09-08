@@ -198,13 +198,38 @@ def test_invalid_flag_group_requires_explicit_joint_confirmation() -> None:
     pattern = InterventionPattern("invalid", indices=(1, 2), values={1: 0.0, 2: 0.0})
     with pytest.raises(InterventionError, match="invalid flag/value group"):
         apply_intervention(source, pattern, schema)
+    with pytest.raises(InterventionError, match="source-confirmed invalid_value"):
+        apply_intervention(
+            source,
+            InterventionPattern(
+                "invalid-confirmed-without-evidence",
+                indices=(1, 2),
+                values={1: 0.0, 2: 0.0},
+                metadata={"invalid_joint_confirmed": True},
+            ),
+            schema,
+        )
     result = apply_intervention(
         source,
         InterventionPattern(
             "invalid-confirmed",
             indices=(1, 2),
             values={1: 0.0, 2: 0.0},
-            metadata={"invalid_joint_confirmed": True},
+            metadata={
+                "invalid_joint_confirmed": True,
+                "invalid_joint_evidence": {
+                    "valid": {
+                        "value": 0.0,
+                        "confirmed": True,
+                        "evidence": "synthetic validity source",
+                    },
+                    "offset": {
+                        "value": 0.0,
+                        "confirmed": True,
+                        "evidence": "synthetic offset source",
+                    },
+                },
+            },
         ),
         schema,
     )

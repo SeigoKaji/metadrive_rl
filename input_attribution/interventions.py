@@ -21,6 +21,22 @@ class InterventionError(ValueError):
     """Raised when a configured intervention is unsafe or incomplete."""
 
 
+_METHOD_ALIASES = {
+    "noop": "identity",
+    "none": "identity",
+    "unchanged": "identity",
+    "no-change": "identity",
+    "no_change": "identity",
+    "fixed-value": "fixed",
+    "fixed_value": "fixed_level",
+    "fixedlevel": "fixed_level",
+    "mirror": "reflection",
+}
+_SUPPORTED_METHODS = frozenset({"fixed", "fixed_level", "reference", "identity", "neutral", "reflection"})
+_SCOPES = frozenset({"full_episode", "explicitly_conditional"})
+_INAPPLICABLE_ACTIONS = frozenset({"abort_pattern", "continue_unmodified_with_warning"})
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
@@ -80,21 +96,89 @@ class InterventionPattern:
     description: str = ""
     replacement_kind: str = "diagnostic"
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # ``scope`` and ``on_inapplicable`` are explicit because closed-loop
+    # execution must distinguish a full-episode experiment from a legacy
+    # reference that may continue on unmodified input after a mismatch.
+    scope: str | None = None
+    on_inapplicable: str | None = None
+    variant_id: str | None = None
+    variant: Mapping[str, Any] | str | None = None
+    center: Any | None = None
+    tolerance: Any | None = None
+    clip: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.pattern_id, str) or not self.pattern_id.strip():
             raise InterventionError("pattern_id must be a non-empty string")
-        method = self.method.lower().replace("_", "-")
-        if method in {"noop", "none", "unchanged", "no-change"}:
-            method = "identity"
-        if method not in {"fixed", "reference", "identity"}:
-            raise InterventionError("method must be fixed, reference, or identity")
+        if not isinstance(self.method, str):
+            raise InterventionError("method must be a string")
+        method = self.method.lower().strip()
+        method = _METHOD_ALIASES.get(method, method)
+        if method not in _SUPPORTED_METHODS:
+            raise InterventionError(
+                "method must be fixed, fixed_level, reference, identity, neutral, or reflection"
+            )
         object.__setattr__(self, "method", method)
         if isinstance(self.indices, (str, bytes)):
             raise InterventionError("indices must be a sequence of indices")
         object.__setattr__(self, "indices", tuple(self.indices))
         if len(set(self.indices)) != len(self.indices):
             raise InterventionError("pattern indices must be unique")
+        scope = self.scope
+        if scope is None:
+            # Existing reference patterns are compatibility experiments unless
+            # their config opts into full_episode explicitly.  Typed local
+            # operations have no donor context and therefore cover the whole
+            # episode by default.
+            scope = "explicitly_conditional" if method == "reference" else "full_episode"
+        if not isinstance(scope, str):
+            raise InterventionError("scope must be full_episode or explicitly_conditional")
+        scope = scope.strip().lower().replace("-", "_")
+        if scope not in _SCOPES:
+            raise InterventionError("scope must be full_episode or explicitly_conditional")
+        object.__setattr__(self, "scope", scope)
+        on_inapplicable = self.on_inapplicable
+        if on_inapplicable is None:
+            on_inapplicable = (
+                "continue_unmodified_with_warning"
+                if scope == "explicitly_conditional"
+                else "abort_pattern"
+            )
+        if not isinstance(on_inapplicable, str):
+            raise InterventionError(
+                "on_inapplicable must be abort_pattern or continue_unmodified_with_warning"
+            )
+        on_inapplicable = on_inapplicable.strip().lower().replace("-", "_")
+        if on_inapplicable not in _INAPPLICABLE_ACTIONS:
+            raise InterventionError(
+                "on_inapplicable must be abort_pattern or continue_unmodified_with_warning"
+            )
+        object.__setattr__(self, "on_inapplicable", on_inapplicable)
+        if self.variant_id is not None and (
+            not isinstance(self.variant_id, str) or not self.variant_id.strip()
+        ):
+            raise InterventionError("variant_id must be a non-empty string when provided")
+        if self.variant is not None and not isinstance(self.variant, (str, Mapping)):
+            raise InterventionError("variant must be a variant id or mapping")
+        if self.tolerance is not None:
+            if isinstance(self.tolerance, Mapping):
+                for key, value in self.tolerance.items():
+                    try:
+                        number = float(value)
+                    except (TypeError, ValueError) as exc:
+                        raise InterventionError(f"tolerance[{key!r}] must be finite and non-negative") from exc
+                    if not np.isfinite(number) or number < 0:
+                        raise InterventionError(f"tolerance[{key!r}] must be finite and non-negative")
+            else:
+                try:
+                    number = float(self.tolerance)
+                except (TypeError, ValueError) as exc:
+                    raise InterventionError("tolerance must be finite and non-negative") from exc
+                if not np.isfinite(number) or number < 0:
+                    raise InterventionError("tolerance must be finite and non-negative")
+        if not isinstance(self.clip, (bool, np.bool_)):
+            raise InterventionError("clip must be boolean")
+        object.__setattr__(self, "clip", bool(self.clip))
         if method == "reference" and not self.reference_id:
             # A reference may be passed directly to ``apply``; in that case the
             # id is optional.  Keep this pattern serializable and defer the
@@ -106,12 +190,23 @@ class InterventionPattern:
         if not isinstance(value, Mapping):
             raise InterventionError("pattern must be a mapping")
         indices = value.get("indices", value.get("targets", ()))
-        method = value.get("method", value.get("kind", "fixed"))
+        method = value.get("method", value.get("operation", value.get("kind", "fixed")))
         values = value.get(
             "values",
             value.get("replacement_values", value.get("replacement")),
         )
         metadata = value.get("metadata", {})
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, Mapping):
+            raise InterventionError("pattern.metadata must be a mapping")
+        variant_id = value.get("variant_id", value.get("variant_name"))
+        variant = value.get("variant")
+        if variant_id is None and isinstance(variant, str):
+            variant_id = variant
+            variant = None
+        if variant_id is None:
+            variant_id = metadata.get("variant_id")
         return cls(
             pattern_id=str(value.get("pattern_id", value.get("id", ""))),
             indices=tuple(indices),
@@ -121,6 +216,13 @@ class InterventionPattern:
             description=str(value.get("description", "")),
             replacement_kind=str(value.get("replacement_kind", "diagnostic")),
             metadata=metadata,
+            scope=value.get("scope"),
+            on_inapplicable=value.get("on_inapplicable"),
+            variant_id=variant_id,
+            variant=variant,
+            center=value.get("center"),
+            tolerance=value.get("tolerance", value.get("meaningful_tolerance")),
+            clip=value.get("clip", False),
         )
 
     def resolve_indices(self, schema: InputSchema) -> tuple[int, ...]:
@@ -139,6 +241,13 @@ class InterventionPattern:
             "description": self.description,
             "replacement_kind": self.replacement_kind,
             "metadata": _json_value(self.metadata),
+            "scope": self.scope,
+            "on_inapplicable": self.on_inapplicable,
+            "variant_id": self.variant_id,
+            "variant": _json_value(self.variant),
+            "center": _json_value(self.center),
+            "tolerance": _json_value(self.tolerance),
+            "clip": self.clip,
         }
 
 
@@ -155,10 +264,42 @@ class InterventionResult:
     reference_id: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
+    skip_category: str | None = None
+    eligible: bool = True
+    scope: str = "full_episode"
+    on_inapplicable: str = "abort_pattern"
+    # Values are recorded after the observation dtype conversion.  This makes
+    # exact changes auditable for float32 models while ``tolerance`` supports a
+    # separate meaningful-change count.
+    original_values: Mapping[int, Any] = field(default_factory=dict)
+    applied_values: Mapping[int, Any] = field(default_factory=dict)
+    delta_values: Mapping[int, float] = field(default_factory=dict)
+    delta_abs_values: Mapping[int, float] = field(default_factory=dict)
+    meaningful_changed_indices: tuple[int, ...] = ()
+    tolerance: Mapping[int, float] = field(default_factory=dict)
+    clipped_indices: tuple[int, ...] = ()
 
     @property
     def changed(self) -> bool:
         return bool(self.changed_indices)
+
+    @property
+    def applied(self) -> bool:
+        """Whether this target was eligible and received an intervention."""
+
+        return bool(self.eligible and not self.skipped)
+
+    @property
+    def meaningful_changed(self) -> bool:
+        """Whether at least one exact change exceeded its declared tolerance."""
+
+        return bool(self.meaningful_changed_indices)
+
+    @property
+    def meaningful(self) -> bool:
+        """Compatibility alias for :attr:`meaningful_changed`."""
+
+        return self.meaningful_changed
 
     @property
     def applied_count(self) -> int:
@@ -172,6 +313,26 @@ class InterventionResult:
     def no_op_count(self) -> int:
         return len(self.no_op_indices)
 
+    @property
+    def changed_count_exact(self) -> int:
+        return self.actual_change_count
+
+    @property
+    def meaningful_changed_count(self) -> int:
+        return len(self.meaningful_changed_indices)
+
+    @property
+    def skipped_count(self) -> int:
+        return 0 if not self.skipped else len(self.requested_indices)
+
+    @property
+    def clip_count(self) -> int:
+        return len(self.clipped_indices)
+
+    @property
+    def warning(self) -> str | None:
+        return self.skip_reason if self.skipped and self.on_inapplicable == "continue_unmodified_with_warning" else None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "pattern_id": self.pattern_id,
@@ -179,6 +340,8 @@ class InterventionResult:
             "reference_id": self.reference_id,
             "skipped": self.skipped,
             "skip_reason": self.skip_reason,
+            "skip_category": self.skip_category,
+            "applied": self.applied,
             "requested_indices": list(self.requested_indices),
             "changed_indices": list(self.changed_indices),
             "no_op_indices": list(self.no_op_indices),
@@ -186,6 +349,21 @@ class InterventionResult:
             "applied_count": self.applied_count,
             "actual_change_count": self.actual_change_count,
             "no_op_count": self.no_op_count,
+            "changed_count_exact": self.changed_count_exact,
+            "meaningful_changed_indices": list(self.meaningful_changed_indices),
+            "meaningful_changed_count": self.meaningful_changed_count,
+            "meaningful_changed": self.meaningful_changed,
+            "eligible": self.eligible,
+            "scope": self.scope,
+            "on_inapplicable": self.on_inapplicable,
+            "skipped_count": self.skipped_count,
+            "original_values": _json_value(self.original_values),
+            "applied_values": _json_value(self.applied_values),
+            "delta_values": _json_value(self.delta_values),
+            "delta_abs_values": _json_value(self.delta_abs_values),
+            "tolerance": _json_value(self.tolerance),
+            "clipped_indices": list(self.clipped_indices),
+            "clip_count": self.clip_count,
         }
 
 
@@ -417,6 +595,30 @@ def _fixed_value_confirmation(
         if pattern.metadata.get("invalid_joint_confirmed") is not True:
             return "invalid replacement requires metadata.invalid_joint_confirmed=true"
         if "invalid_value" not in declared:
+            evidence = pattern.metadata.get("invalid_joint_evidence")
+            if isinstance(evidence, Mapping):
+                entry = _invalid_joint_evidence_entry(evidence, schema, index)
+                if isinstance(entry, Mapping):
+                    expected = entry.get("invalid_value", entry.get("value"))
+                    if (
+                        entry.get("confirmed") is True
+                        and isinstance(
+                            entry.get(
+                                "evidence",
+                                entry.get("source", entry.get("provenance")),
+                            ),
+                            str,
+                        )
+                        and str(
+                            entry.get(
+                                "evidence",
+                                entry.get("source", entry.get("provenance")),
+                            )
+                        ).strip()
+                        and expected is not None
+                        and _values_equal(expected, value)
+                    ):
+                        return None
             return (
                 f"input {index} has no source-confirmed invalid_value for the "
                 "invalid coupled replacement"
@@ -442,18 +644,505 @@ def _skipped_result(
     pattern: InterventionPattern,
     indices: tuple[int, ...],
     reason: str,
+    *,
+    eligible: bool = True,
+    skip_category: str = "failed",
 ) -> InterventionResult:
     return InterventionResult(
         observation=source,
         requested_indices=indices,
         changed_indices=(),
-        no_op_indices=indices,
+        no_op_indices=(),
         pattern_id=pattern.pattern_id,
         method=pattern.method,
         reference_id=pattern.reference_id,
         skipped=True,
         skip_reason=reason,
+        skip_category=skip_category,
+        eligible=eligible,
+        scope=pattern.scope or "full_episode",
+        on_inapplicable=pattern.on_inapplicable or "abort_pattern",
     )
+
+
+def _variant_record(
+    pattern: InterventionPattern,
+    schema: InputSchema,
+    index: int,
+) -> Mapping[str, Any] | None:
+    """Resolve one pattern variant without guessing from an input index."""
+
+    candidate = pattern.variant
+    if candidate is None:
+        candidate = pattern.metadata.get("variant")
+    if isinstance(candidate, str):
+        try:
+            return schema.variant(index, candidate)
+        except SchemaError as exc:
+            raise InterventionError(str(exc)) from exc
+    if isinstance(candidate, Mapping):
+        return candidate
+    variant_id = pattern.variant_id or pattern.metadata.get("variant_id")
+    if variant_id is None:
+        return None
+    if not isinstance(variant_id, str) or not variant_id.strip():
+        raise InterventionError("variant_id must be a non-empty string")
+    try:
+        return schema.variant(index, variant_id)
+    except SchemaError as exc:
+        raise InterventionError(str(exc)) from exc
+
+
+def _variant_operation(record: Mapping[str, Any], pattern_id: str) -> str:
+    operation = record.get("operation", record.get("method", record.get("kind")))
+    if not isinstance(operation, str) or not operation.strip():
+        raise InterventionError(f"pattern {pattern_id} variant must declare operation")
+    operation = operation.strip().casefold().replace("-", "_")
+    if operation not in {"identity", "neutral", "reflection", "fixed_level", "fixed", "reference"}:
+        raise InterventionError(f"pattern {pattern_id} variant operation {operation!r} is unsupported")
+    return operation
+
+
+def _variant_confirmation_reason(
+    record: Mapping[str, Any],
+    pattern_id: str,
+    operation: str,
+) -> str | None:
+    confirmed = record.get("confirmed", False)
+    if type(confirmed) is not bool:
+        return "variant.confirmed must be a boolean"
+    if not confirmed:
+        return "variant is not source-confirmed"
+    meaning = record.get("meaning", record.get("description"))
+    evidence = record.get(
+        "evidence",
+        record.get("source", record.get("reference", record.get("provenance"))),
+    )
+    if not isinstance(meaning, str) or not meaning.strip():
+        return "confirmed variant requires meaning/description"
+    if not isinstance(evidence, str) or not evidence.strip():
+        return "confirmed variant requires evidence/source provenance"
+    if operation in {"neutral", "fixed_level", "fixed"} and not any(
+        key in record for key in ("value", "values", "level", "levels")
+    ):
+        return f"{operation} variant requires value/level"
+    if operation == "reflection" and not any(key in record for key in ("center", "centers")):
+        return "reflection variant requires center"
+    return None
+
+
+def _variant_mapping_for_indices(
+    value: Any,
+    schema: InputSchema,
+    indices: tuple[int, ...],
+    *,
+    label: str,
+) -> dict[int, Any]:
+    """Accept one scalar, per-input mapping, or target-ordered sequence."""
+
+    if isinstance(value, Mapping):
+        result = _as_index_value_map(value, schema, indices, label=label)
+        missing = sorted(set(indices) - set(result))
+        if missing:
+            raise InterventionError(f"{label} is missing values for indices {missing}")
+        return result
+    if isinstance(value, (str, bytes)) or np.isscalar(value):
+        return {index: value for index in indices}
+    return _as_index_value_map(value, schema, indices, label=label)
+
+
+def _variant_declared_range(
+    record: Mapping[str, Any],
+    pattern_id: str,
+) -> tuple[float | None, float | None] | None:
+    """Read a variant's optional generation domain for inline records."""
+
+    raw = record.get("range", record.get("value_range"))
+    if raw is None:
+        return None
+    if isinstance(raw, (str, bytes)):
+        raise InterventionError(f"pattern {pattern_id} variant range must contain two bounds")
+    try:
+        pair = tuple(raw)
+    except TypeError as exc:
+        raise InterventionError(f"pattern {pattern_id} variant range must contain two bounds") from exc
+    if len(pair) != 2:
+        raise InterventionError(f"pattern {pattern_id} variant range must contain two bounds")
+    result: list[float | None] = []
+    for bound in pair:
+        if bound is None:
+            result.append(None)
+            continue
+        try:
+            number = float(bound)
+        except (TypeError, ValueError) as exc:
+            raise InterventionError(f"pattern {pattern_id} variant range must be numeric") from exc
+        if not np.isfinite(number):
+            raise InterventionError(f"pattern {pattern_id} variant range must be finite")
+        result.append(number)
+    if result[0] is not None and result[1] is not None and result[0] > result[1]:
+        raise InterventionError(f"pattern {pattern_id} variant range minimum exceeds maximum")
+    return result[0], result[1]
+
+
+def _variant_domain_reason(
+    value: Any,
+    bounds: tuple[float | None, float | None],
+    *,
+    label: str,
+) -> str | None:
+    """Return a reason when a generated value leaves the variant domain."""
+
+    minimum, maximum = bounds
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"{label} must be numeric for the declared variant range"
+    if not np.isfinite(number):
+        return f"{label} must be finite for the declared variant range"
+    if minimum is not None and number < minimum:
+        return f"{label}={number} is below the variant range minimum {minimum}"
+    if maximum is not None and number > maximum:
+        return f"{label}={number} exceeds the variant range maximum {maximum}"
+    return None
+
+
+def _contains_unsigned_marker(spec: Any) -> bool:
+    fields = (
+        getattr(spec, "id", ""),
+        getattr(spec, "name_ja", ""),
+        getattr(spec, "description", ""),
+        getattr(spec, "physical_quantity", ""),
+        getattr(spec, "model_representation", ""),
+        getattr(spec, "normalization", ""),
+    )
+    def _structured_text(value: Any) -> list[str]:
+        if isinstance(value, Mapping):
+            result: list[str] = []
+            for key, nested in value.items():
+                result.append(str(key))
+                result.extend(_structured_text(nested))
+            return result
+        if isinstance(value, (list, tuple)):
+            result = []
+            for nested in value:
+                result.extend(_structured_text(nested))
+            return result
+        return [str(value)]
+
+    structured = [
+        getattr(spec, "replacement", None),
+        getattr(spec, "variants", ()),
+    ]
+    text = " ".join(
+        [str(value) for value in fields]
+        + [part for value in structured for part in _structured_text(value)]
+    ).casefold()
+    return "unsigned" in text or "符号なし" in text or "non-negative" in text
+
+
+def _variant_compatibility_reason(
+    record: Mapping[str, Any],
+    spec: Any,
+    index: int,
+    indices: tuple[int, ...],
+) -> str | None:
+    allowed_indices = record.get("allowed_indices")
+    if allowed_indices is not None:
+        try:
+            allowed_index_set = {int(value) for value in allowed_indices}
+        except (TypeError, ValueError):
+            return "variant allowed_indices must contain integers"
+        if index not in allowed_index_set:
+            return f"variant is not declared for input index {index}"
+    allowed_ids = record.get("allowed_ids", record.get("semantic_ids"))
+    if allowed_ids is not None and spec.id not in set(allowed_ids):
+        return f"variant is not declared for semantic input {spec.id!r}"
+    allowed_groups = record.get("allowed_groups")
+    if allowed_groups is not None and spec.group not in set(allowed_groups):
+        return f"variant is not declared for input group {spec.group!r}"
+    declared_type = record.get("value_type", record.get("dtype"))
+    if declared_type is not None:
+        if not isinstance(declared_type, str):
+            return f"variant input {index} value_type must be a string"
+        normalized = declared_type.casefold()
+        if normalized == "boolean":
+            normalized = "bool"
+        if normalized in {"category", "categorical"}:
+            normalized = "categorical"
+        expected = "categorical" if spec.value_type in {"category", "categorical"} else spec.value_type
+        if normalized != expected:
+            return f"variant input {index} value_type={declared_type!r} conflicts with schema {expected!r}"
+    for key in ("coupled_indices", "related_valid_flags"):
+        declared = record.get(key, ())
+        if declared is None:
+            continue
+        try:
+            declared_set = {int(value) for value in declared}
+        except (TypeError, ValueError) as exc:
+            return f"variant input {index} {key} must contain integer indices"
+        if key == "coupled_indices" and not declared_set.issubset(set(indices)):
+            missing = sorted(declared_set - set(indices))
+            return f"variant input {index} omits coupled indices {missing}"
+    categories = record.get("categories", record.get("category_values"))
+    if categories is not None and not spec.is_discrete:
+        return f"variant input {index} declares categories for a continuous input"
+    variant_range = _variant_declared_range(record, f"input {index}")
+    if variant_range is not None and spec.value_range is not None:
+        variant_minimum, variant_maximum = variant_range
+        spec_minimum, spec_maximum = spec.value_range
+        if (
+            variant_minimum is not None
+            and spec_minimum is not None
+            and variant_minimum < spec_minimum
+        ):
+            return f"variant input {index} range extends below the schema range"
+        if (
+            variant_maximum is not None
+            and spec_maximum is not None
+            and variant_maximum > spec_maximum
+        ):
+            return f"variant input {index} range extends above the schema range"
+    return None
+
+
+def _typed_replacement_values(
+    pattern: InterventionPattern,
+    source: np.ndarray,
+    schema: InputSchema,
+    indices: tuple[int, ...],
+) -> tuple[dict[int, Any], dict[int, Mapping[str, Any]], set[int]]:
+    """Resolve neutral/reflection/fixed_level into explicit values.
+
+    The returned values are still uncast.  Casting, exact-change accounting,
+    and optional clipping happen in :func:`apply_intervention`.
+    """
+
+    records: dict[int, Mapping[str, Any]] = {}
+    values: dict[int, Any] = {}
+    if pattern.values is not None:
+        explicit = _as_index_value_map(
+            pattern.values,
+            schema,
+            indices,
+            label=f"pattern {pattern.pattern_id}.values",
+        )
+    else:
+        explicit = {}
+    for index in indices:
+        spec = schema.spec(index)
+        if pattern.method == "reflection" and getattr(spec, "is_discrete", False):
+            raise InterventionError(
+                f"pattern {pattern.pattern_id}[{index}] cannot reflect discrete input {spec.id!r}"
+            )
+        record = _variant_record(pattern, schema, index)
+        if pattern.method == "reflection" and _contains_unsigned_marker(spec):
+            raise InterventionError(
+                f"pattern {pattern.pattern_id}[{index}] cannot reflect unsigned input {spec.id!r}"
+            )
+        if record is None:
+            raise InterventionError(
+                f"pattern {pattern.pattern_id}[{index}] requires a registered or inline confirmed variant"
+            )
+        if record is not None:
+            operation = _variant_operation(record, pattern.pattern_id)
+            reason = _variant_confirmation_reason(record, pattern.pattern_id, operation)
+            if reason is not None:
+                raise InterventionError(f"pattern {pattern.pattern_id}[{index}] rejected: {reason}")
+            compatibility = _variant_compatibility_reason(record, spec, index, indices)
+            if compatibility is not None:
+                raise InterventionError(f"pattern {pattern.pattern_id}[{index}] rejected: {compatibility}")
+            records[index] = record
+            expected_operations = {
+                "neutral": {"neutral"},
+                "reflection": {"reflection"},
+                "fixed_level": {"fixed_level", "fixed"},
+            }
+            if operation not in expected_operations[pattern.method]:
+                return_value = (
+                    f"variant operation {operation!r} does not match method {pattern.method!r}"
+                )
+                raise InterventionError(f"pattern {pattern.pattern_id}[{index}] rejected: {return_value}")
+            declared_range = _variant_declared_range(record, pattern.pattern_id)
+        else:  # pragma: no cover - guarded above; keeps type checkers honest
+            declared_range = None
+        if pattern.method == "reflection":
+            record_center = None if record is None else record.get("centers", record.get("center"))
+            center = pattern.center if pattern.center is not None else record_center
+            if center is None:
+                # A metadata center is accepted for compact legacy mappings.
+                center = pattern.metadata.get("center")
+            if center is None:
+                raise InterventionError(
+                    f"pattern {pattern.pattern_id} reflection requires a source-confirmed center"
+                )
+            center_map = _variant_mapping_for_indices(
+                center, schema, indices, label=f"pattern {pattern.pattern_id}.center"
+            )
+            declared_center = record.get("centers", record.get("center"))
+            if declared_center is not None and pattern.center is not None:
+                declared_center_map = _variant_mapping_for_indices(
+                    declared_center,
+                    schema,
+                    indices,
+                    label=f"pattern {pattern.pattern_id}.variant.center",
+                )
+                if not _values_equal(center_map[index], declared_center_map[index]):
+                    raise InterventionError(
+                        f"pattern {pattern.pattern_id}[{index}] center conflicts with the confirmed variant"
+                    )
+            try:
+                center_value = float(center_map[index])
+            except (TypeError, ValueError) as exc:
+                raise InterventionError(
+                    f"pattern {pattern.pattern_id}[{index}] center must be finite"
+                ) from exc
+            if not np.isfinite(center_value):
+                raise InterventionError(f"pattern {pattern.pattern_id}[{index}] center must be finite")
+            if declared_range is not None:
+                reason = _variant_domain_reason(
+                    center_value,
+                    declared_range,
+                    label=f"pattern {pattern.pattern_id}[{index}] center",
+                )
+                if reason is not None:
+                    raise InterventionError(reason)
+            values[index] = 2.0 * center_value - float(source[index])
+            if declared_range is not None:
+                reason = _variant_domain_reason(
+                    values[index],
+                    declared_range,
+                    label=f"pattern {pattern.pattern_id}[{index}] reflected value",
+                )
+                if reason is not None:
+                    raise InterventionError(reason)
+        elif record is not None:
+            raw = record.get("values", record.get("levels"))
+            if raw is None:
+                raw = record.get("level", record.get("value"))
+            if raw is None:
+                raise InterventionError(
+                    f"pattern {pattern.pattern_id}[{index}] variant has no replacement value"
+                )
+            declared_values = _variant_mapping_for_indices(
+                raw,
+                schema,
+                indices,
+                label=f"pattern {pattern.pattern_id}.variant.values",
+            )
+            if index in explicit and not _values_equal(explicit[index], declared_values[index]):
+                raise InterventionError(
+                    f"pattern {pattern.pattern_id}[{index}] value conflicts with the confirmed variant"
+                )
+            values[index] = explicit[index] if index in explicit else declared_values[index]
+            if declared_range is not None:
+                reason = _variant_domain_reason(
+                    values[index],
+                    declared_range,
+                    label=f"pattern {pattern.pattern_id}[{index}] value",
+                )
+                if reason is not None:
+                    raise InterventionError(reason)
+    # Scalar records may have populated more than the current index; retain
+    # only requested targets and fail closed on omissions.
+    if set(values) != set(indices):
+        missing = sorted(set(indices) - set(values))
+        raise InterventionError(f"pattern {pattern.pattern_id} has no replacement value for indices {missing}")
+    for index, record in records.items():
+        categories = record.get("categories", record.get("category_values"))
+        if categories is None:
+            continue
+        candidate = values[index]
+        if isinstance(candidate, (float, np.floating)) and not np.isfinite(float(candidate)):
+            raise InterventionError(
+                f"pattern {pattern.pattern_id}[{index}] category replacement is non-finite"
+            )
+        if not any(_values_equal(candidate, allowed) for allowed in categories):
+            raise InterventionError(
+                f"pattern {pattern.pattern_id}[{index}] value {candidate!r} is outside declared categories"
+            )
+    return values, records, set()
+
+
+def _tolerance_map(pattern: InterventionPattern, indices: tuple[int, ...]) -> dict[int, float]:
+    raw = pattern.tolerance
+    if raw is None:
+        raw = pattern.metadata.get("meaningful_tolerance", pattern.metadata.get("tolerance", 0.0))
+    if isinstance(raw, Mapping):
+        values: dict[int, float] = {}
+        # Mapping keys may be semantic ids, but integer and decimal-index keys
+        # cover the portable result format; semantic mappings are handled by
+        # the pattern constructor before execution.
+        for index in indices:
+            candidate = raw.get(index, raw.get(str(index), 0.0))
+            if candidate is None:
+                candidate = 0.0
+            number = float(candidate)
+            if not np.isfinite(number) or number < 0:
+                raise InterventionError(f"tolerance[{index}] must be finite and non-negative")
+            values[index] = number
+        return values
+    number = float(raw or 0.0)
+    if not np.isfinite(number) or number < 0:
+        raise InterventionError("tolerance must be finite and non-negative")
+    return {index: number for index in indices}
+
+
+def _invalid_joint_evidence_entry(
+    evidence: Mapping[Any, Any],
+    schema: InputSchema,
+    index: int,
+) -> Mapping[str, Any] | None:
+    """Resolve explicit per-member evidence for a confirmed invalid group."""
+
+    spec = schema.spec(index)
+    for key in (index, str(index), spec.id):
+        candidate = evidence.get(key)
+        if isinstance(candidate, Mapping):
+            return candidate
+    return None
+
+
+def _invalid_joint_evidence_reason(
+    pattern: InterventionPattern,
+    replacement_values: Mapping[int, Any],
+    group: set[int],
+    schema: InputSchema,
+) -> str | None:
+    """Validate explicit evidence when no invalid_value sentinel is registered."""
+
+    raw = pattern.metadata.get("invalid_joint_evidence")
+    if not isinstance(raw, Mapping):
+        return None
+    for member in sorted(group):
+        entry = _invalid_joint_evidence_entry(raw, schema, member)
+        if entry is None:
+            return (
+                f"invalid flag/value group lacks explicit confirmed evidence for input {member}"
+            )
+        if entry.get("confirmed") is not True:
+            return (
+                f"invalid flag/value group has unconfirmed evidence for input {member}"
+            )
+        provenance = entry.get(
+            "evidence",
+            entry.get("source", entry.get("provenance")),
+        )
+        if not isinstance(provenance, str) or not provenance.strip():
+            return (
+                f"invalid flag/value group lacks evidence provenance for input {member}"
+            )
+        expected = entry.get("invalid_value", entry.get("value"))
+        if expected is None:
+            return (
+                f"invalid flag/value group evidence lacks a value for input {member}"
+            )
+        if not _values_equal(replacement_values.get(member), expected):
+            return (
+                f"invalid flag/value group evidence value mismatch at input {member}: "
+                f"expected {expected!r}"
+            )
+    return ""
 
 
 def _invalid_joint_reason(
@@ -482,33 +1171,42 @@ def _invalid_joint_reason(
         invalid_joint_confirmed = pattern.metadata.get("invalid_joint_confirmed") is True
         if invalid_joint_confirmed:
             group = related_values | {index}
-            declared_members = [schema.spec(member).replacement for member in group]
-            # A schema may omit replacement metadata entirely and let an
-            # explicitly confirmed diagnostic pattern provide its values.  If
-            # it declares even one neutral replacement, however, every member
-            # must also declare a source-confirmed invalid variant; otherwise
-            # the neutral sentinel could be mistaken for the invalid state.
-            if any(isinstance(declared, Mapping) for declared in declared_members):
-                for member in sorted(group):
-                    declared = schema.spec(member).replacement
-                    if not isinstance(declared, Mapping) or "invalid_value" not in declared:
-                        return (
-                            f"invalid flag/value group at input {index} lacks a "
-                            f"source-confirmed invalid_value for input {member}"
-                        )
-                    if declared.get("confirmed") is not True:
-                        return (
-                            f"invalid flag/value group at input {index} has an "
-                            f"unconfirmed invalid_value at input {member}"
-                        )
-                    expected = declared["invalid_value"]
-                    if not _values_equal(replacement_values.get(member), expected):
-                        return (
-                            f"invalid flag/value group at input {index} has an "
-                            f"invalid sentinel mismatch at input {member}: "
-                            f"expected {expected!r}"
-                        )
-            continue
+            source_failure: str | None = None
+            source_confirmed = True
+            for member in sorted(group):
+                declared = schema.spec(member).replacement
+                if not isinstance(declared, Mapping) or "invalid_value" not in declared:
+                    source_confirmed = False
+                    source_failure = (
+                        f"invalid flag/value group at input {index} lacks a "
+                        f"source-confirmed invalid_value for input {member}"
+                    )
+                    continue
+                if declared.get("confirmed") is not True:
+                    source_confirmed = False
+                    source_failure = (
+                        f"invalid flag/value group at input {index} has an "
+                        f"unconfirmed invalid_value at input {member}"
+                    )
+                    continue
+                expected = declared["invalid_value"]
+                if not _values_equal(replacement_values.get(member), expected):
+                    return (
+                        f"invalid flag/value group at input {index} has an "
+                        f"invalid sentinel mismatch at input {member}: "
+                        f"expected {expected!r}"
+                    )
+            if source_confirmed:
+                continue
+            evidence_reason = _invalid_joint_evidence_reason(
+                pattern, replacement_values, group, schema
+            )
+            if evidence_reason == "":
+                continue
+            return source_failure or evidence_reason or (
+                f"invalid flag/value group at input {index} requires "
+                "source-confirmed invalid_value or explicit confirmed evidence"
+            )
         all_declared_confirmed = True
         for coupled_index in related_values | {index}:
             declared = schema.spec(coupled_index).replacement
@@ -552,7 +1250,14 @@ def apply_intervention(
     indices = pattern.resolve_indices(schema)
     configured_skip = pattern.metadata.get("skip_reason")
     if configured_skip:
-        return _skipped_result(source, pattern, indices, str(configured_skip))
+        return _skipped_result(
+            source,
+            pattern,
+            indices,
+            str(configured_skip),
+            eligible=False,
+            skip_category=str(pattern.metadata.get("skip_category", "declared_out_of_scope")),
+        )
     coupling_reason = _validate_coupling(indices, schema, source=source)
     if coupling_reason is not None:
         if strict:
@@ -580,9 +1285,26 @@ def apply_intervention(
             pattern_id=pattern.pattern_id,
             method=pattern.method,
             reference_id=pattern.reference_id,
+            scope=pattern.scope or "full_episode",
+            on_inapplicable=pattern.on_inapplicable or "abort_pattern",
+            original_values={index: source[index] for index in indices},
+            applied_values={index: source[index] for index in indices},
+            delta_values={index: 0.0 for index in indices},
+            delta_abs_values={index: 0.0 for index in indices},
+            tolerance={index: 0.0 for index in indices},
         )
 
-    if pattern.method == "reference":
+    typed_records: dict[int, Mapping[str, Any]] = {}
+    if pattern.method in {"neutral", "reflection", "fixed_level"}:
+        try:
+            replacement_values, typed_records, _ = _typed_replacement_values(
+                pattern, source, schema, indices
+            )
+        except InterventionError as exc:
+            if strict:
+                raise
+            return _skipped_result(source, pattern, indices, str(exc))
+    elif pattern.method == "reference":
         ref = reference_observation
         if ref is None and pattern.reference_id and reference_observations is not None:
             try:
@@ -605,6 +1327,9 @@ def apply_intervention(
             return _skipped_result(source, pattern, indices, str(exc))
         replacement_values = {index: ref_array[index] for index in indices}
     else:
+        # Legacy ``method=fixed`` remains intentionally strict against a
+        # schema-confirmed replacement value.  This is separate from the new
+        # fixed_level variant operation, which can register multiple levels.
         if pattern.values is None:
             replacement_values = {}
             for index in indices:
@@ -647,12 +1372,19 @@ def apply_intervention(
                 isinstance(schema.spec(member).replacement, Mapping)
                 and "invalid_value" in schema.spec(member).replacement
                 for member in group
-            ):
+            ) or isinstance(pattern.metadata.get("invalid_joint_evidence"), Mapping):
                 invalid_variant_indices.update(group)
 
+    tolerance = _tolerance_map(pattern, indices)
     result = np.array(source, copy=True)
     changed: list[int] = []
     no_op: list[int] = []
+    meaningful_changed: list[int] = []
+    original_values: dict[int, Any] = {}
+    applied_values: dict[int, Any] = {}
+    delta_values: dict[int, float] = {}
+    delta_abs_values: dict[int, float] = {}
+    clipped_indices: list[int] = []
     for index in indices:
         spec = schema.spec(index)
         value = replacement_values[index]
@@ -670,6 +1402,25 @@ def apply_intervention(
                         f"pattern {pattern.pattern_id}[{index}] rejected: {confirmation_reason}"
                     )
                 return _skipped_result(source, pattern, indices, confirmation_reason)
+        variant = typed_records.get(index)
+        clip = pattern.clip or bool(pattern.metadata.get("clip", False))
+        if variant is not None and isinstance(variant.get("clip"), bool):
+            clip = clip or bool(variant.get("clip"))
+        if spec.value_range is not None and isinstance(value, (int, float, np.integer, np.floating)):
+            minimum, maximum = spec.value_range
+            candidate = float(value)
+            if not np.isfinite(candidate):
+                raise InterventionError(
+                    f"pattern {pattern.pattern_id}[{index}] is non-finite; clip cannot repair NaN/Inf"
+                )
+            outside = (minimum is not None and candidate < minimum) or (
+                maximum is not None and candidate > maximum
+            )
+            if outside and clip:
+                low = -np.inf if minimum is None else minimum
+                high = np.inf if maximum is None else maximum
+                value = float(np.clip(candidate, low, high))
+                clipped_indices.append(index)
         try:
             spec.validate_value(value, location=f"pattern {pattern.pattern_id}[{index}]")
         except SchemaError as exc:
@@ -677,7 +1428,7 @@ def apply_intervention(
         # Assigning a float replacement into an integer source array can lose
         # information silently, so reject it unless numpy can represent the
         # value exactly.  Standard SB3 vectors are float arrays.
-        old = result[index]
+        old = result[index].item() if isinstance(result[index], np.generic) else result[index]
         cast_value = np.asarray(value, dtype=result.dtype).item()
         if strict and isinstance(value, (float, np.floating)) and np.issubdtype(result.dtype, np.integer):
             if float(cast_value) != float(value):
@@ -685,8 +1436,28 @@ def apply_intervention(
                     f"replacement at index {index} cannot be represented by observation dtype {result.dtype}"
                 )
         result[index] = cast_value
-        if bool(np.asarray(old != result[index]).item()):
+        final_value = result[index].item() if isinstance(result[index], np.generic) else result[index]
+        try:
+            # Validate the value that the model actually receives.  This
+            # catches float32 overflow and category/range changes introduced
+            # by dtype conversion.
+            spec.validate_value(final_value, location=f"pattern {pattern.pattern_id}[{index}] after dtype cast")
+        except SchemaError as exc:
+            raise InterventionError(str(exc)) from exc
+        original_values[index] = old
+        applied_values[index] = final_value
+        try:
+            delta = float(final_value) - float(old)
+            delta_values[index] = delta
+            delta_abs_values[index] = abs(delta)
+        except (TypeError, ValueError):
+            delta_values[index] = float("nan")
+            delta_abs_values[index] = float("nan")
+        if bool(np.asarray(old != final_value).item()):
             changed.append(index)
+            threshold = tolerance.get(index, 0.0)
+            if np.isfinite(delta_abs_values[index]) and delta_abs_values[index] > threshold:
+                meaningful_changed.append(index)
         else:
             no_op.append(index)
     return InterventionResult(
@@ -697,6 +1468,15 @@ def apply_intervention(
         pattern_id=pattern.pattern_id,
         method=pattern.method,
         reference_id=pattern.reference_id,
+        scope=pattern.scope or "full_episode",
+        on_inapplicable=pattern.on_inapplicable or "abort_pattern",
+        original_values=original_values,
+        applied_values=applied_values,
+        delta_values=delta_values,
+        delta_abs_values=delta_abs_values,
+        meaningful_changed_indices=tuple(meaningful_changed),
+        tolerance=tolerance,
+        clipped_indices=tuple(clipped_indices),
     )
 
 
@@ -729,6 +1509,23 @@ def _schema_fixed_value(spec: Any) -> tuple[bool, Any | None]:
     return True, declared.get("value", declared.get("fixed_value"))
 
 
+def _preferred_typed_variant(spec: Any) -> Mapping[str, Any] | None:
+    """Pick one source-confirmed local variant for the generated A detail row.
+
+    The generator deliberately emits one row per input for compatibility with
+    existing reports.  Additional stress variants belong in explicit config
+    entries, where their IDs and scope are visible to reviewers.
+    """
+
+    variants = getattr(spec, "variants", ())
+    for preferred in ("neutral", "fixed_level", "reflection"):
+        for variant in variants:
+            operation = str(variant.get("operation", variant.get("method", ""))).casefold().replace("-", "_")
+            if variant.get("confirmed") is True and operation == preferred:
+                return variant
+    return None
+
+
 def generate_individual_patterns(
     schema: InputSchema,
     *,
@@ -750,6 +1547,7 @@ def generate_individual_patterns(
     emitted_groups: set[tuple[int, ...]] = set()
     for spec in sorted(schema.inputs, key=lambda item: item.index):
         fixed, fixed_value = _schema_fixed_value(spec)
+        preferred_variant = _preferred_typed_variant(spec)
         coupled = tuple(sorted(set(spec.coupled_indices) | {spec.index}))
         if not spec.independently_replaceable:
             if include_non_independent:
@@ -817,7 +1615,21 @@ def generate_individual_patterns(
                         )
                     )
             continue
-        if fixed:
+        if preferred_variant is not None:
+            operation = str(
+                preferred_variant.get("operation", preferred_variant.get("method", "fixed_level"))
+            ).casefold().replace("-", "_")
+            result.append(
+                InterventionPattern(
+                    pattern_id=f"input_{spec.index:03d}",
+                    indices=(spec.index,),
+                    method=operation,
+                    variant_id=str(preferred_variant["id"]),
+                    description=f"{spec.name_ja}: source-confirmed {operation} variant",
+                    metadata={"input_index": spec.index, "variant_generated": True},
+                )
+            )
+        elif fixed:
             result.append(
                 InterventionPattern(
                     pattern_id=f"input_{spec.index:03d}",

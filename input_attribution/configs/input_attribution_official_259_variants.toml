@@ -1,0 +1,311 @@
+# Source-verified 259-dimensional typed-variant example.  Local operations
+# cover the full episode; the old reference-bank experiment is preserved in
+# input_attribution_official_259_legacy_freeze.toml.
+
+[analysis]
+name = "input_attribution_official_259_variants"
+experiment = "official_baseline_259_typed_variants"
+description = "Full-episode typed diagnostics for verified indices 2 and 8"
+deterministic = true
+individual_inputs = true
+
+[model]
+path = "../../models/official_baseline.zip"
+name = "official_baseline"
+format = "stable_baselines3_ppo_zip"
+device = "cpu"
+deterministic = true
+
+[adapter]
+module = "input_attribution.adapters.metadrive"
+factory = "input_attribution.adapters.metadrive.create_adapter"
+
+[schema]
+path = "../schemas/official_259.json"
+name = "metadrive_default_259"
+dimension = 259
+template = false
+
+[environment]
+path = "../../configs/official.toml"
+
+[scenario]
+map = "C"
+seed = 5
+scenario_seed = 5
+rl_seed = 0
+horizon = 500
+traffic_density = 0
+episodes = 1
+
+[seeds]
+scenario_seed = 5
+rl_seed = 0
+intervention = 0
+
+[preprocess]
+name = "sb3_vector_box_identity"
+external_normalization = false
+
+[output]
+root = "../../outputs/input_attribution"
+experiment = "official_baseline_259_typed_variants"
+model = "official_baseline"
+
+[closed_loop]
+enabled = true
+# Keep B focused.  A may expand the LiDAR group offline as a separate detail.
+patterns = ["P00", "P01_road_boundaries_reference", "P02_heading_neutral", "P02_heading_reflection", "P02_heading_low", "P02_heading_high", "P03_speed_reference", "P03_steering_reference", "P03_history_group_reference", "P04_lateral_neutral", "P04_lateral_reflection", "P04_lateral_low", "P04_lateral_high", "P06_lidar_no_detection", "P06_lidar_virtual_detection"]
+episodes = 1
+max_steps = 500
+
+[video]
+enabled = false
+# Enable only after selecting the declared pattern IDs, for example:
+# patterns = ["P00", "P04_lateral_low"]
+
+[ig]
+enabled = false
+
+[[patterns]]
+id = "P00"
+description = "unchanged reference observation"
+indices = []
+method = "identity"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P02_heading_neutral"
+description = "index 2 verified neutral normalized component"
+indices = [2]
+method = "neutral"
+variant_id = "heading_neutral_0_5"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+# 1e-7 is only a float32 numerical-difference reporting tolerance for this
+# analysis; it is not a universal scientific significance threshold.
+tolerance = 1e-7
+
+[[patterns]]
+id = "P01_road_boundaries_reference"
+description = "legacy compatibility supplement: road-boundary pair from one frozen reference"
+indices = [0, 1]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+scope = "explicitly_conditional"
+on_inapplicable = "continue_unmodified_with_warning"
+metadata = { compatibility_keys = ["road_segment_id", "target_lane_ordinal"] }
+
+[[patterns]]
+id = "P03_speed_reference"
+description = "speed input reference supplement; no zero-speed assumption"
+indices = [3]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+scope = "explicitly_conditional"
+on_inapplicable = "continue_unmodified_with_warning"
+metadata = { compatibility_keys = ["road_segment_id", "target_lane_ordinal"] }
+
+[[patterns]]
+id = "P03_speed_fixed_level"
+description = "speed input explicit normalized diagnostic level; not called zero physical speed"
+indices = [3]
+method = "fixed_level"
+variant_id = "speed_fixed_level_0_2"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P03_steering_reference"
+description = "current steering input reference supplement"
+indices = [4]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+scope = "explicitly_conditional"
+on_inapplicable = "continue_unmodified_with_warning"
+metadata = { compatibility_keys = ["road_segment_id", "target_lane_ordinal"] }
+
+[[patterns]]
+id = "P03_steering_neutral"
+description = "current steering normalized neutral center"
+indices = [4]
+method = "neutral"
+variant_id = "steering_neutral_0_5"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P03_history_group_reference"
+description = "steering/throttle history and yaw group reference supplement"
+indices = [5, 6, 7]
+method = "reference"
+reference_id = "episode-0:0"
+replacement_kind = "saved_observation_reference"
+scope = "explicitly_conditional"
+on_inapplicable = "continue_unmodified_with_warning"
+metadata = { compatibility_keys = ["road_segment_id", "target_lane_ordinal"] }
+
+[[patterns]]
+id = "P03_history_steering_neutral"
+description = "previous steering history normalized neutral center"
+indices = [5]
+method = "neutral"
+variant_id = "previous_steering_neutral_0_5"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P03_history_throttle_neutral"
+description = "previous throttle/brake history normalized neutral center"
+indices = [6]
+method = "neutral"
+variant_id = "previous_throttle_neutral_0_5"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P03_history_group_neutral"
+description = "previous steering and throttle/brake history neutral group"
+indices = [4, 5, 6]
+method = "neutral"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+variant = { id = "history_group_neutral_0_5", operation = "neutral", values = { current_steering = 0.5, previous_steering_action = 0.5, previous_throttle_brake_action = 0.5 }, allowed_ids = ["current_steering", "previous_steering_action", "previous_throttle_brake_action"], meaning = "normalized neutral action/history group", evidence = "state_obs.py and env_input_policy.py action-history encoding", confirmed = true }
+
+[[patterns]]
+id = "P02_heading_reflection"
+description = "index 2 reflection around verified normalized center 0.5"
+indices = [2]
+method = "reflection"
+variant_id = "heading_reflection_center_0_5"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+tolerance = 1e-7
+
+[[patterns]]
+id = "P02_heading_low"
+description = "index 2 explicit lower normalized diagnostic level"
+indices = [2]
+method = "fixed_level"
+variant_id = "heading_fixed_level_0_4"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P02_heading_high"
+description = "index 2 explicit upper normalized diagnostic level"
+indices = [2]
+method = "fixed_level"
+variant_id = "heading_fixed_level_0_6"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P04_lateral_neutral"
+description = "index 8 verified neutral current-lane normalized lateral value"
+indices = [8]
+method = "neutral"
+variant_id = "lateral_neutral_0_5"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P04_lateral_reflection"
+description = "index 8 reflection around verified normalized center 0.5"
+indices = [8]
+method = "reflection"
+variant_id = "lateral_reflection_center_0_5"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P04_lateral_low"
+description = "index 8 explicit lower normalized diagnostic lateral level"
+indices = [8]
+method = "fixed_level"
+variant_id = "lateral_fixed_level_0_4"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P04_lateral_high"
+description = "index 8 explicit upper normalized diagnostic lateral level"
+indices = [8]
+method = "fixed_level"
+variant_id = "lateral_fixed_level_0_6"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P06_lidar_no_detection"
+description = "one LiDAR direction-group representative with verified no-detection fraction"
+indices = [19]
+method = "fixed_level"
+variant_id = "lidar_no_detection_default"
+replacement_kind = "information_removal"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P06_lidar_virtual_detection"
+description = "one LiDAR direction sector as a diagnostic virtual detection"
+indices = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78]
+method = "fixed_level"
+variant_id = "lidar_virtual_detection_0_5"
+replacement_kind = "diagnostic_virtual_detection"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P06_lidar_all_no_detection"
+description = "all 240 LiDAR values to the verified no-detection default (information removal)"
+indices = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258]
+method = "fixed_level"
+variant_id = "lidar_no_detection_default"
+replacement_kind = "information_removal"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P06_lidar_sector_0_90"
+description = "LiDAR direction group clockwise 0-90 degrees as a diagnostic virtual detection; no obstacle is added"
+indices = [19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78]
+method = "fixed_level"
+variant_id = "lidar_virtual_detection_0_5"
+replacement_kind = "diagnostic_virtual_detection"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P06_lidar_sector_90_180"
+description = "LiDAR direction group clockwise 90-180 degrees as a diagnostic virtual detection; no obstacle is added"
+indices = [79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138]
+method = "fixed_level"
+variant_id = "lidar_virtual_detection_0_5"
+replacement_kind = "diagnostic_virtual_detection"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P06_lidar_sector_180_270"
+description = "LiDAR direction group clockwise 180-270 degrees as a diagnostic virtual detection; no obstacle is added"
+indices = [139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198]
+method = "fixed_level"
+variant_id = "lidar_virtual_detection_0_5"
+replacement_kind = "diagnostic_virtual_detection"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
+
+[[patterns]]
+id = "P06_lidar_sector_270_360"
+description = "LiDAR direction group clockwise 270-360 degrees as a diagnostic virtual detection; no obstacle is added"
+indices = [199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 258]
+method = "fixed_level"
+variant_id = "lidar_virtual_detection_0_5"
+replacement_kind = "diagnostic_virtual_detection"
+scope = "full_episode"
+on_inapplicable = "abort_pattern"
