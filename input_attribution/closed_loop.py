@@ -961,7 +961,7 @@ class ClosedLoopResult:
         pattern_summary: dict[str, Any] = {}
         for pattern_id, episodes in self.patterns.items():
             metrics = [episode.get("metrics", {}) for episode in episodes]
-            aggregate = metric_summary(episodes)
+            diagnostic_aggregate = metric_summary(episodes)
             natural_indices = [
                 index
                 for index, episode in enumerate(episodes)
@@ -980,6 +980,26 @@ class ClosedLoopResult:
             natural_episodes = [episodes[index] for index in natural_indices]
             partial_episodes = [episodes[index] for index in partial_indices]
             partial_unknown_episodes = [episodes[index] for index in partial_unknown_indices]
+            # Runtime-produced episodes carry execution metadata.  Once that
+            # metadata exists, the pattern-level metrics are the primary
+            # evaluation of naturally completed episodes only; raw metrics
+            # from failed/aborted/budget-censored episodes remain available in
+            # the execution groups and diagnostic aggregate below.  Preserve
+            # the legacy direct-constructed result shape when no episode has
+            # execution metadata at all, since such records cannot be
+            # classified without inventing a failure state.
+            has_execution_metadata = any(
+                episode.get("execution_status") not in (None, "")
+                or episode.get("terminal_reason") not in (None, "")
+                for episode in episodes
+            )
+            primary_indices = (
+                natural_indices
+                if has_execution_metadata
+                else list(range(len(episodes)))
+            )
+            primary_episodes = [episodes[index] for index in primary_indices]
+            aggregate = metric_summary(primary_episodes)
             execution_group_counts = {
                 "natural_completion": len(natural_episodes),
                 "partial_or_interrupted": len(partial_episodes),
@@ -1011,6 +1031,18 @@ class ClosedLoopResult:
                 "records": sum(int(item.get("record_count", 0)) for item in episodes),
                 "metrics": metrics,
                 "metric_summary": aggregate,
+                "diagnostic_metric_summary": diagnostic_aggregate,
+                "metric_summary_scope": (
+                    "natural_completion"
+                    if has_execution_metadata
+                    else "legacy_all_episodes"
+                ),
+                "primary_metric_episode_indices": [int(index) for index in primary_indices],
+                "excluded_metric_episode_indices": [
+                    int(index)
+                    for index in range(len(episodes))
+                    if index not in primary_indices
+                ],
                 # Keep the two weighting choices explicit at the pattern level
                 # for report readers that do not need the nested counts.
                 "episode_mean": aggregate["episode_mean"],
@@ -1038,12 +1070,82 @@ class ClosedLoopResult:
                     else paired_summary(episodes)
                 ),
             }
+        all_episodes = [
+            (pattern_id, episode)
+            for pattern_id, episodes in self.patterns.items()
+            for episode in episodes
+        ]
+        execution_counts = {
+            "completed": 0,
+            "failed": 0,
+            "aborted": 0,
+        }
+        for _, episode in all_episodes:
+            status = str(episode.get("execution_status") or "unknown").casefold()
+            if status in execution_counts:
+                execution_counts[status] += 1
+        runtime_failure_count = execution_counts["failed"] + execution_counts["aborted"]
+        pattern_status_ids: dict[str, list[str]] = {
+            "completed": [],
+            "failed": [],
+            "aborted": [],
+            "unknown": [],
+        }
+        for pattern_id, episodes in self.patterns.items():
+            statuses = {
+                str(episode.get("execution_status") or "unknown").casefold()
+                for episode in episodes
+            }
+            if statuses and "aborted" in statuses:
+                classification = "aborted"
+            elif statuses and "failed" in statuses:
+                classification = "failed"
+            elif statuses and statuses <= {"completed"}:
+                classification = "completed"
+            else:
+                classification = "unknown"
+            pattern_status_ids[classification].append(pattern_id)
+        for values in pattern_status_ids.values():
+            values.sort()
+        counts = {
+            "pattern_count": len(self.patterns),
+            "episode_count": len(all_episodes),
+            "completed_episode_count": execution_counts["completed"],
+            "failed_episode_count": execution_counts["failed"],
+            "aborted_episode_count": execution_counts["aborted"],
+            "runtime_failure_count": runtime_failure_count,
+            "execution_failure_count": runtime_failure_count,
+            "unexpected_interruption_count": execution_counts["aborted"],
+            "completed_pattern_count": len(pattern_status_ids["completed"]),
+            "failed_pattern_count": len(pattern_status_ids["failed"]),
+            "aborted_pattern_count": len(pattern_status_ids["aborted"]),
+            "unknown_pattern_count": len(pattern_status_ids["unknown"]),
+            "completed_pattern_ids": pattern_status_ids["completed"],
+            "failed_pattern_ids": pattern_status_ids["failed"],
+            "aborted_pattern_ids": pattern_status_ids["aborted"],
+            "runtime_failure_pattern_count": (
+                len(pattern_status_ids["failed"]) + len(pattern_status_ids["aborted"])
+            ),
+            "runtime_failure_pattern_ids": sorted(
+                pattern_status_ids["failed"] + pattern_status_ids["aborted"]
+            ),
+            "required_experiment_failed": bool(runtime_failure_count),
+        }
+        overall_status = (
+            "success"
+            if runtime_failure_count == 0
+            else "failed"
+            if execution_counts["completed"] == 0
+            else "partial_failure"
+        )
         return {
             "store": str(self.store.run_dir) if self.store else None,
             "p00_reference_episodes": len(self.baseline_references),
             "policy_fingerprint_before": self.policy_fingerprint_before,
             "policy_fingerprint_after": self.policy_fingerprint_after,
             "policy_unchanged": self.policy_unchanged,
+            "status": overall_status,
+            "counts": counts,
             "patterns": pattern_summary,
         }
 
@@ -1438,6 +1540,8 @@ def run_closed_loop(
                 frames: list[dict[str, Any]] = []
                 terminal_reason = "unknown"
                 current_phase = "episode_start"
+                runtime_failure_phase: str | None = None
+                runtime_failure_reason: str | None = None
                 episode_result_saved = False
                 try:
                     current_phase = "runtime_seed"
@@ -1448,11 +1552,20 @@ def run_closed_loop(
                     step = 0
                     seed_verified = episode_seed is None
                     initial_snapshot: dict[str, Any] | None = None
+                    step_context: dict[str, Any] = {}
                     while not done:
+                        step_context = {
+                            "step": step,
+                            "raw_observation": _copy(raw_obs),
+                            "reset_info": _plain(reset_info),
+                            "record_saved": False,
+                        }
                         current_phase = "pre_telemetry"
                         pre = telemetry(adapter, env, reset_info, phase="pre", step=step)
+                        step_context["pre_telemetry"] = pre
                         current_phase = "seed_verification"
                         actual_scenario_seed = _actual_scenario_seed(env, reset_info, pre)
+                        step_context["actual_scenario_seed"] = actual_scenario_seed
                         if not seed_verified:
                             if actual_scenario_seed is None or actual_scenario_seed != episode_seed:
                                 raise ClosedLoopError(
@@ -1462,6 +1575,8 @@ def run_closed_loop(
                             seed_verified = True
                         current_phase = "preprocess"
                         original_input, preprocess_info = model_input(adapter, raw_obs, reset_info)
+                        step_context["original_input"] = np.array(original_input, copy=True)
+                        step_context["preprocess_info"] = preprocess_info
                         try:
                             current_phase = "schema_validation"
                             schema.validate_observation(original_input, copy=False)
@@ -1523,12 +1638,18 @@ def run_closed_loop(
                             observation_context=pre,
                             strict=False,
                         )
+                        step_context["intervention"] = intervention
                         current_phase = "policy"
                         changed_input = np.array(intervention.observation, copy=True)
+                        step_context["changed_input"] = np.array(changed_input, copy=True)
                         probabilities = policy_probabilities(policy, changed_input)
+                        step_context["probabilities"] = np.array(probabilities, copy=True)
                         original_probabilities = policy_probabilities(policy, original_input)
+                        step_context["original_probabilities"] = np.array(original_probabilities, copy=True)
                         action = policy_predict(policy, changed_input, deterministic=deterministic)
+                        step_context["action"] = _plain(action)
                         original_action = policy_predict(policy, original_input, deterministic=deterministic)
+                        step_context["original_action"] = _plain(original_action)
                         if not 0 <= int(action) < probabilities.size:
                             raise ClosedLoopError(f"modified policy action is outside Discrete({probabilities.size}): {action}")
                         if not 0 <= int(original_action) < original_probabilities.size:
@@ -1542,21 +1663,72 @@ def run_closed_loop(
                             and pattern_on_inapplicable == "abort_pattern"
                             and not declared_out_of_scope
                         )
+                        # Keep the env.step call, its successful return, post
+                        # telemetry, and action decoding as separate phases.
+                        # A simulator may have advanced before raising, so an
+                        # env-step exception is recorded as physically unknown
+                        # and is never counted as a returned step.
                         current_phase = "env_step"
+                        env_step_attempted = not abort_intervention
+                        env_step_returned = False
+                        env_step_error: str | None = None
+                        post_telemetry_attempted = False
+                        post_telemetry_error: str | None = None
+                        action_decode_error: str | None = None
+                        step_failure_phase: str | None = None
+                        step_failure_reason: str | None = None
+                        next_raw = raw_obs
+                        reward: Any = None
+                        terminated: bool | None = False if abort_intervention else None
+                        truncated: bool | None = False if abort_intervention else None
+                        step_info: Mapping[str, Any] = {}
+                        post: Mapping[str, Any] | None = None
+                        decoded_action: Any = None
                         if abort_intervention:
                             # Preserve the attempted input and reason while
                             # guaranteeing that this pattern never advances
                             # the physical environment after an unexpected
                             # full-episode inapplicability.
-                            next_raw = raw_obs
-                            reward = None
-                            terminated = False
-                            truncated = False
-                            step_info: Mapping[str, Any] = {}
-                            post: Mapping[str, Any] | None = None
+                            pass
                         else:
-                            next_raw, reward, terminated, truncated, step_info = step_environment(env, action)
-                            post = telemetry(adapter, env, step_info, phase="post", step=step + 1)
+                            try:
+                                next_raw, reward, terminated, truncated, step_info = step_environment(env, action)
+                                env_step_returned = True
+                                step_context.update(
+                                    {
+                                        "next_raw": _copy(next_raw),
+                                        "reward": _plain(reward),
+                                        "terminated": bool(terminated),
+                                        "truncated": bool(truncated),
+                                        "step_info": _plain(step_info),
+                                        "env_step_returned": True,
+                                    }
+                                )
+                            except Exception as exc:
+                                env_step_error = f"{type(exc).__name__}: {exc}"
+                                step_context["env_step_error"] = env_step_error
+                                step_failure_phase = "env_step"
+                                step_failure_reason = env_step_error
+                            if env_step_returned:
+                                current_phase = "post_telemetry"
+                                post_telemetry_attempted = True
+                                try:
+                                    post = telemetry(adapter, env, step_info, phase="post", step=step + 1)
+                                    step_context["post_telemetry"] = post
+                                except Exception as exc:
+                                    post_telemetry_error = f"{type(exc).__name__}: {exc}"
+                                    step_failure_phase = "post_telemetry"
+                                    step_failure_reason = post_telemetry_error
+                                if post_telemetry_error is None:
+                                    current_phase = "action_decode"
+                                    try:
+                                        decoded_action = decode_action(adapter, action, config=config)
+                                        step_context["decoded_action"] = decoded_action
+                                    except Exception as exc:
+                                        action_decode_error = f"{type(exc).__name__}: {exc}"
+                                        step_failure_phase = "action_decode"
+                                        step_failure_reason = action_decode_error
+                        current_phase = "record"
                         pre_time = telemetry_time(pre, step)
                         post_time = telemetry_time(post, step + 1) if post is not None else None
                         selected_change = _selected_policy_change(
@@ -1619,9 +1791,7 @@ def run_closed_loop(
                             "action": None if abort_intervention else _plain(action),
                             "action_forwarded": None if abort_intervention else _plain(action),
                             "original_action": _plain(original_action),
-                            "decoded_action": (
-                                None if abort_intervention else decode_action(adapter, action, config=config)
-                            ),
+                            "decoded_action": decoded_action,
                             "intervention": intervention_payload,
                             "intervention_scope": pattern_scope,
                             "intervention_on_inapplicable": pattern_on_inapplicable,
@@ -1650,8 +1820,57 @@ def run_closed_loop(
                             "reward": _plain(reward),
                             "terminated": terminated,
                             "truncated": truncated,
-                            "done": bool(terminated or truncated),
-                            "env_step_called": not abort_intervention,
+                            "termination_flags_status": (
+                                "not_observed" if not env_step_returned else "observed"
+                            ),
+                            "done": (
+                                bool(terminated or truncated)
+                                if env_step_returned or abort_intervention
+                                else None
+                            ),
+                            "env_step_attempted": env_step_attempted,
+                            # ``called`` records the invocation itself;
+                            # ``returned`` is the executable-step count.
+                            "env_step_called": env_step_attempted,
+                            "env_step_returned": env_step_returned,
+                            "env_step_status": (
+                                "not_called"
+                                if not env_step_attempted
+                                else "returned"
+                                if env_step_returned
+                                else "raised"
+                            ),
+                            "env_step_error": env_step_error,
+                            "physical_state_unknown": bool(
+                                env_step_attempted and not env_step_returned
+                            ),
+                            "post_telemetry_attempted": post_telemetry_attempted,
+                            "post_telemetry_status": (
+                                "not_attempted"
+                                if not post_telemetry_attempted
+                                else "available"
+                                if post_telemetry_error is None
+                                else "missing"
+                            ),
+                            "post_telemetry_error": post_telemetry_error,
+                            "info_status": (
+                                "not_observed" if not env_step_returned else "observed"
+                            ),
+                            "action_decode_status": (
+                                "not_attempted"
+                                if abort_intervention or not env_step_returned or post_telemetry_error is not None
+                                else "decoded"
+                                if action_decode_error is None
+                                else "missing"
+                            ),
+                            "action_decode_error": action_decode_error,
+                            "phase": (
+                                "intervention_abort"
+                                if abort_intervention
+                                else step_failure_phase or "completed"
+                            ),
+                            "failure_phase": step_failure_phase,
+                            "failure_reason": step_failure_reason,
                             "info": _plain(step_info),
                         }
                         record.update(selected_change)
@@ -1660,9 +1879,12 @@ def run_closed_loop(
                             record["intervention_abort_reason"] = getattr(
                                 intervention, "skip_reason", None
                             )
+                        if step_failure_phase is not None:
+                            record["runtime_failure"] = True
                         observations.append(np.array(original_input, copy=True))
                         modified_observations.append(changed_input)
                         records.append(record)
+                        step_context["record_saved"] = True
                         current_phase = "video"
                         if pattern_video:
                             frame, frame_status = render_frame(
@@ -1690,6 +1912,13 @@ def run_closed_loop(
                             record["terminal_reason"] = terminal_reason
                             done = True
                             continue
+                        if step_failure_phase is not None:
+                            runtime_failure_phase = step_failure_phase
+                            runtime_failure_reason = step_failure_reason
+                            terminal_reason = "runtime_error"
+                            record["terminal_reason"] = terminal_reason
+                            done = True
+                            continue
                         raw_obs = next_raw
                         reset_info = step_info
                         step += 1
@@ -1708,7 +1937,8 @@ def run_closed_loop(
                     metrics = summarize_trajectory(records, terminal_reason=terminal_reason, **thresholds)
                     planned_target_steps = _pattern_target_step_count(config, max_steps)
                     executed_step_count = sum(
-                        bool(record.get("env_step_called")) for record in records
+                        bool(record.get("env_step_returned", record.get("env_step_called")))
+                        for record in records
                     )
                     intervention_count = summarize_intervention_records(
                         records=records,
@@ -1725,7 +1955,7 @@ def run_closed_loop(
                             "executed_env_step_count": int(executed_step_count),
                             "actual_target_step_count": int(executed_step_count),
                             "aborted_before_env_step_count": int(
-                                sum(not bool(record.get("env_step_called")) for record in records)
+                                sum(not bool(record.get("env_step_attempted", record.get("env_step_called"))) for record in records)
                             ),
                             "target_step_count": len(records),
                             "planned_range_complete": (
@@ -1747,11 +1977,15 @@ def run_closed_loop(
                         if item.get("skip_reason")
                     })
                     execution_status = (
-                        "aborted"
+                        "failed"
+                        if runtime_failure_phase is not None
+                        else "aborted"
                         if terminal_reason == "intervention_abort"
                         else "completed"
                     )
-                    if terminal_reason == "intervention_abort":
+                    if runtime_failure_phase is not None:
+                        assessment_status = "not_evaluable_runtime_error"
+                    elif terminal_reason == "intervention_abort":
                         assessment_status = "not_evaluable_intervention_abort"
                     elif identifier == "P00":
                         assessment_status = "control_baseline"
@@ -1788,6 +2022,8 @@ def run_closed_loop(
                         "metrics": metrics,
                         "execution_status": execution_status,
                         "assessment_status": assessment_status,
+                        "failure_phase": runtime_failure_phase,
+                        "failure_reason": runtime_failure_reason,
                         "scope": pattern_scope,
                         "on_inapplicable": pattern_on_inapplicable,
                         "video": {
@@ -1990,6 +2226,144 @@ def run_closed_loop(
                     }:
                         raise
                     failure_reason = f"{type(exc).__name__}: {exc}"
+                    # Materialize the current attempt before building the
+                    # episode-level failure.  This keeps a policy/intermediate
+                    # hook error from silently dropping an already obtained
+                    # pre/modified observation.  A missing intervention result
+                    # is represented explicitly while preserving the current
+                    # observation slot and pre-step telemetry.
+                    if (
+                        not step_context.get("record_saved", False)
+                    ):
+                        partial_original = step_context.get("original_input")
+                        partial_changed = step_context.get("changed_input")
+                        original_missing = partial_original is None
+                        if original_missing:
+                            partial_original_array = np.full(
+                                (schema.dimension,),
+                                np.nan,
+                                dtype=np.float32,
+                            )
+                        else:
+                            partial_original_array = np.array(partial_original, copy=True)
+                        modified_missing = partial_changed is None
+                        if modified_missing:
+                            # Keep the array slot aligned while recording that
+                            # no modified model input was produced.
+                            partial_changed_array = np.array(partial_original_array, copy=True)
+                        else:
+                            partial_changed_array = np.array(partial_changed, copy=True)
+                        partial_intervention = step_context.get("intervention")
+                        try:
+                            partial_intervention_payload = (
+                                partial_intervention.to_dict()
+                                if partial_intervention is not None
+                                else None
+                            )
+                        except Exception:
+                            partial_intervention_payload = None
+                        partial_observation_index = len(observations)
+                        observations.append(partial_original_array)
+                        modified_observations.append(partial_changed_array)
+                        records.append(
+                            {
+                                "pattern_id": identifier,
+                                "episode": episode_index,
+                                "episode_id": f"episode-{episode_index}",
+                                "scenario_seed": episode_seed,
+                                "rl_seed": episode_rl_seed,
+                                "requested_scenario_seed": episode_seed,
+                                "requested_rl_seed": episode_rl_seed,
+                                "actual_scenario_seed": step_context.get("actual_scenario_seed"),
+                                "step": int(step_context.get("step", len(records))),
+                                "observation_index": partial_observation_index,
+                                "observation_missing": original_missing,
+                                "modified_observation_missing": modified_missing,
+                                "observation_hash": (
+                                    _observation_hash(partial_original_array)
+                                    if not original_missing
+                                    else None
+                                ),
+                                "modified_observation_hash": (
+                                    _observation_hash(partial_changed_array)
+                                    if not modified_missing
+                                    else None
+                                ),
+                                "observation_shape": list(partial_original_array.shape),
+                                "observation_dtype": str(partial_original_array.dtype),
+                                "pre_time": telemetry_time(
+                                    step_context.get("pre_telemetry") or {},
+                                    step_context.get("step"),
+                                ),
+                                "post_time": telemetry_time(
+                                    step_context.get("post_telemetry") or {},
+                                    None,
+                                ),
+                                "probabilities": _plain(step_context.get("probabilities")),
+                                "original_probabilities": _plain(
+                                    step_context.get("original_probabilities")
+                                ),
+                                "action": _plain(step_context.get("action")),
+                                "action_forwarded": (
+                                    _plain(step_context.get("action"))
+                                    if step_context.get("env_step_returned", False)
+                                    else None
+                                ),
+                                "original_action": _plain(step_context.get("original_action")),
+                                "decoded_action": _plain(step_context.get("decoded_action")),
+                                "intervention": partial_intervention_payload,
+                                "preprocess": _plain(step_context.get("preprocess_info")),
+                                "pre_telemetry": _plain(step_context.get("pre_telemetry")),
+                                "post_telemetry": _plain(step_context.get("post_telemetry")),
+                                "reward": _plain(step_context.get("reward")),
+                                "terminated": step_context.get("terminated"),
+                                "truncated": step_context.get("truncated"),
+                                "termination_flags_status": (
+                                    "observed"
+                                    if step_context.get("env_step_returned", False)
+                                    else "not_observed"
+                                ),
+                                "done": None,
+                                "env_step_attempted": bool(
+                                    step_context.get("env_step_returned", False)
+                                ),
+                                "env_step_called": bool(
+                                    step_context.get("env_step_returned", False)
+                                ),
+                                "env_step_returned": bool(
+                                    step_context.get("env_step_returned", False)
+                                ),
+                                "env_step_status": (
+                                    "returned"
+                                    if step_context.get("env_step_returned", False)
+                                    else "not_called"
+                                ),
+                                "physical_state_unknown": False,
+                                "post_telemetry_attempted": bool(
+                                    step_context.get("post_telemetry") is not None
+                                ),
+                                "post_telemetry_status": (
+                                    "available"
+                                    if step_context.get("post_telemetry") is not None
+                                    else "not_attempted"
+                                ),
+                                "action_decode_status": (
+                                    "decoded"
+                                    if "decoded_action" in step_context
+                                    else "not_attempted"
+                                ),
+                                "info": _plain(step_context.get("step_info")),
+                                "info_status": (
+                                    "observed"
+                                    if step_context.get("env_step_returned", False)
+                                    else "not_observed"
+                                ),
+                                "phase": current_phase,
+                                "failure_phase": current_phase,
+                                "failure_reason": failure_reason,
+                                "partial_record": True,
+                            }
+                        )
                     intervention_abort_failure = (
                         pattern_scope == "full_episode"
                         and current_phase == "intervention"
@@ -2014,7 +2388,8 @@ def run_closed_loop(
                     )
                     failure_planned_steps = _pattern_target_step_count(config, max_steps)
                     failure_executed_steps = sum(
-                        bool(record.get("env_step_called")) for record in records
+                        bool(record.get("env_step_returned", record.get("env_step_called")))
+                        for record in records
                     )
                     failure_counts = summarize_intervention_records(
                         records=records,
@@ -2031,7 +2406,7 @@ def run_closed_loop(
                             "executed_env_step_count": int(failure_executed_steps),
                             "actual_target_step_count": int(failure_executed_steps),
                             "aborted_before_env_step_count": int(
-                                sum(not bool(record.get("env_step_called")) for record in records)
+                                sum(not bool(record.get("env_step_attempted", record.get("env_step_called"))) for record in records)
                             ),
                             "target_step_count": len(records),
                             "planned_range_complete": False,
@@ -2124,13 +2499,16 @@ def run_closed_loop(
                     "policy parameters/buffers changed during closed-loop analysis"
                 )
         if store:
-            store.write_json("02_closed_loop/summary.json", result.as_dict())
+            summary = result.as_dict()
+            store.write_json("02_closed_loop/summary.json", summary)
             manifest = store.load_manifest() if store.manifest_path.is_file() else build_manifest(config=config, command="closed-loop")
-            manifest["closed_loop"] = result.as_dict()
+            manifest["closed_loop"] = summary
             manifest.setdefault("stages", {})["closed_loop"] = {
                 "patterns": list(result.patterns),
                 "p00_reference_episodes": len(result.baseline_references),
                 "video": bool(video),
+                "status": summary["status"],
+                "counts": summary["counts"],
                 "video_pattern_selector": video_pattern_selector_status,
                 "video_patterns": (
                     None
@@ -2139,7 +2517,13 @@ def run_closed_loop(
                 ),
             }
             store.save_manifest(manifest)
-            store.update_status("closed_loop", "success", patterns=list(result.patterns))
+            store.update_status(
+                "closed_loop",
+                "failed" if summary["counts"]["required_experiment_failed"] else "success",
+                patterns=list(result.patterns),
+                status=summary["status"],
+                counts=summary["counts"],
+            )
         return result
     except Exception as exc:
         if store:

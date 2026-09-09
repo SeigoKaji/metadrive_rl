@@ -55,6 +55,40 @@ python3 -m venv .venv
 
 別のモデルを指定する場合は、`--model models/<model-name>.zip` を追加します。
 
+## 入力帰属解析（`input_attribution`）
+
+入力帰属解析の259次元公式接続は、プロジェクトルートから次の設定を主経路として実行します。
+
+```text
+input_attribution/configs/input_attribution_official_259_variants.toml
+```
+
+この preset は source-confirmed な型付き置換を使う `full_episode` の解析です。新しい run は次のように作成します。
+
+```bash
+PYTHON=/path/to/existing/python
+$PYTHON -m input_attribution run \
+  --config input_attribution/configs/input_attribution_official_259_variants.toml
+```
+
+`full_episode` の主経路を、旧 `input_attribution_official_259.toml` や `input_attribution_official_259_legacy_freeze.toml` の初期参照再現と混同しないでください。旧2設定は過去の初期 reference 条件を再現するために保存しており、既存 run の条件を黙って変更する代替設定ではありません。配置する Python、学習済みモデル、MetaDrive 環境は利用する既存環境で設定し、固定された検証環境の絶対パスを前提にしません。
+
+新 preset の標準 ①-B は15 patternです。速度・操舵・履歴は `P03_speed_reference`、`P03_steering_reference`、`P03_history_group_reference` の reference 版を使います。`P03_speed_fixed_level`、`P03_steering_neutral`、`P03_history_group_neutral` などの定義済み `full_episode` 版は標準 B の対象外で、追加診断として明示的に選択した場合だけ走行します。したがって、標準 preset の B を「259入力すべてを全区間評価済み」と記載しません。実行数を増やさず、追加診断を選ぶ例は次のとおりです。
+
+```bash
+# 新規 run で追加診断を選ぶ
+$PYTHON -m input_attribution run \
+  --config input_attribution/configs/input_attribution_official_259_variants.toml \
+  --patterns P00,P03_speed_fixed_level,P03_steering_neutral,P03_history_group_neutral
+
+# 保存済み run で B の追加診断だけを走らせる
+$PYTHON -m input_attribution closed-loop \
+  --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> \
+  --patterns P00,P03_speed_fixed_level,P03_steering_neutral,P03_history_group_neutral
+```
+
+設定、保存 reference の再利用、`full_episode` と reference の使い分け、レポートの状態表示は [入力帰属解析の実行方法](input_attribution/docs/usage.md) にまとめています。
+
 ## configファイル
 
 設定は TOML で記述します。

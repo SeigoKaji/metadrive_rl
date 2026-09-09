@@ -119,6 +119,12 @@ _SUMMARY_FIELDS = (
     "closed_loop_paired_missing_reasons",
     "closed_loop_assessment_status",
     "closed_loop_execution_status",
+    "closed_loop_failed_episode_count",
+    "closed_loop_aborted_episode_count",
+    "closed_loop_measurement_status",
+    "closed_loop_lane_measurement_detail",
+    "closed_loop_departure_measurement_detail",
+    "closed_loop_low_speed_measurement_detail",
 )
 
 
@@ -1104,7 +1110,24 @@ def _source_priority(row: Mapping[str, Any]) -> int:
     return int(value) if value is not None else 0
 
 
-def _method_status(payload: Mapping[str, Any], method: str, has_rows: bool) -> str:
+def _method_status(
+    payload: Mapping[str, Any],
+    method: str,
+    has_rows: bool,
+    rows: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    if method == "closed_loop":
+        # A legacy stage may still say success while its saved episode rows
+        # contain an explicit runtime failure.  Current stage counts have
+        # priority; raw rows are the fallback for pre-count runs.
+        if _metadata_has_execution_failure_counts(payload):
+            execution_counts = _metadata_execution_failure_counts(payload)
+        else:
+            execution_counts = _closed_execution_failure_counts(
+                [row for row in (rows or ()) if isinstance(row, Mapping)]
+            )
+        if execution_counts["failed"] or execution_counts["aborted"]:
+            return "一部失敗" if execution_counts["completed"] else "失敗"
     stages = payload.get("stages")
     stage_candidates = (method, "ig") if method == "integrated_gradients" else (method,)
     if isinstance(stages, Mapping):
@@ -1181,11 +1204,14 @@ def _classify(path: Path) -> str | None:
 
 
 def _stage_roots(run_dir: Path, metadata: Mapping[str, Any]) -> dict[str, Path | None | bool]:
-    """Resolve the latest successful analysis directory from status.json.
+    """Resolve the explicit analysis directory selected by ``status.json``.
 
     ``None`` means the old flat/canonical layout has no pointer and may be
-    scanned.  ``False`` means a stage explicitly failed/skipped and stale
-    analysis directories must not be mixed into this report.
+    scanned.  ``False`` means a stage has an explicit state but no safe
+    directory pointer.  A failed stage may still contain the diagnostics that
+    explain the failure, so a validated failed pointer is retained.  The
+    caller must never fall back to another analysis directory after a current
+    pointer has been recorded.
     """
 
     stages = metadata.get("stages")
@@ -1196,8 +1222,11 @@ def _stage_roots(run_dir: Path, metadata: Mapping[str, Any]) -> dict[str, Path |
         stage = stages.get(stage_name)
         if not isinstance(stage, Mapping):
             continue
-        state = str(stage.get("state", ""))
-        if state in {"failed", "skipped", "pending", "running"}:
+        # Status values are persisted by different writers/versions; treat
+        # their spelling and case uniformly before deciding whether a stage
+        # may fall back to its legacy canonical directory.
+        state = str(stage.get("state", "")).strip().casefold()
+        if state in {"pending", "running", "skipped"}:
             result[kind] = False
             continue
         relative = stage.get("relative_dir")
@@ -1206,12 +1235,21 @@ def _stage_roots(run_dir: Path, metadata: Mapping[str, Any]) -> dict[str, Path |
             if analysis_id:
                 relative = {"offline": "01_offline", "closed_loop": "02_closed_loop", "ig": "03_ig"}[kind] + "/" + str(analysis_id)
         if relative is None:
-            # A successful legacy stage with no pointer is still readable from
-            # its canonical directory.
+            # A failed stage without a current pointer must not fall back to a
+            # canonical directory that may contain an older successful run.
+            # Successful legacy flat layouts remain readable for compatibility.
+            if state in {"failed", "error"}:
+                result[kind] = False
             continue
-        candidate = (run_dir / str(relative)).resolve()
+        relative_path = Path(str(relative))
+        expected_prefix = {"offline": "01_offline", "closed_loop": "02_closed_loop", "ig": "03_ig"}[kind]
+        if relative_path.is_absolute() or ".." in relative_path.parts or not relative_path.parts or relative_path.parts[0] != expected_prefix:
+            result[kind] = False
+            continue
+        candidate = (run_dir / relative_path).resolve()
         try:
             candidate.relative_to(run_dir.resolve())
+            candidate.relative_to((run_dir / expected_prefix).resolve())
         except ValueError:
             result[kind] = False
             continue
@@ -1975,13 +2013,191 @@ def _direct_metric(mapping: Mapping[str, Any], *names: str) -> float | None:
     return None
 
 
+def _measurement_status(mapping: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    status = str(mapping.get("status", "")).strip().casefold().replace("-", "_")
+    if status in {"partial", "incomplete", "一部未計測"}:
+        return "partial"
+    if status in {"unavailable", "not_available", "not_applicable", "未計測", "n/a"}:
+        return "unavailable"
+    if status in {"complete", "completed", "完了"}:
+        return "complete"
+    missing = _number(mapping.get("missing_count"))
+    expected = _number(mapping.get("expected_count"))
+    if missing is not None and missing > 0:
+        return "partial"
+    if expected is not None and expected > 0 and missing == 0:
+        return "complete"
+    return None
+
+
+def _measurement_fraction(mapping: Mapping[str, Any] | None) -> tuple[int, int] | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    measured = _number(mapping.get("measured_count"))
+    expected = _number(mapping.get("expected_count"))
+    if measured is None:
+        measured = _number(mapping.get("state_measured_count"))
+    if expected is None:
+        expected = _number(mapping.get("state_expected_count"))
+    if measured is None or expected is None:
+        return None
+    return max(0, int(measured)), max(0, int(expected))
+
+
+def _closed_measurement_details(source: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose measurement completeness beside the execution assessment.
+
+    The public trajectory metrics intentionally keep a partial event duration
+    as ``None``.  Reports still need to show what was known, so retain the
+    measured denominator and the known event-time sum in a compact, readable
+    detail string.  The nested raw dictionaries remain available in
+    ``report_details.json`` for full auditing.
+    """
+
+    event_coverage = source.get("event_state_coverage")
+    event_coverage = event_coverage if isinstance(event_coverage, Mapping) else {}
+    departure_state = event_coverage.get("departure")
+    if not isinstance(departure_state, Mapping):
+        departure_state = source.get("departure_state_measurement")
+    low_speed_state = event_coverage.get("low_speed")
+    if not isinstance(low_speed_state, Mapping):
+        low_speed_state = source.get("low_speed_state_measurement")
+    departure_duration = source.get("departure_duration_measurement")
+    departure_duration = departure_duration if isinstance(departure_duration, Mapping) else None
+    low_speed_duration = source.get("low_speed_duration_measurement")
+    low_speed_duration = low_speed_duration if isinstance(low_speed_duration, Mapping) else None
+    lane_measurement = source.get("lane_metric_measurement")
+    if not isinstance(lane_measurement, Mapping):
+        lane_measurement = source.get("lane_rms_measurement")
+    lane_measurement = lane_measurement if isinstance(lane_measurement, Mapping) else None
+
+    statuses = [
+        _measurement_status(value)
+        for value in (
+            departure_state,
+            low_speed_state,
+            departure_duration,
+            low_speed_duration,
+            lane_measurement,
+            source.get("duration_measurement"),
+            source.get("interval_measurement"),
+        )
+    ]
+    statuses = [value for value in statuses if value is not None]
+    if any(value == "partial" for value in statuses):
+        overall = "一部未計測"
+    elif statuses and all(value == "unavailable" for value in statuses):
+        overall = "未計測"
+    elif statuses and all(value == "complete" for value in statuses):
+        overall = "完全計測"
+    else:
+        # A complete clock/interval series beside an unavailable event state,
+        # or a complete state beside an unavailable interval, is still a
+        # partial measurement from the report reader's perspective.
+        overall = "一部未計測"
+
+    lane_detail: str | None = None
+    lane_fraction = _measurement_fraction(lane_measurement)
+    if lane_fraction is not None:
+        measured, expected = lane_fraction
+        lane_value = _number(source.get("lane_rms_m"))
+        value_text = f"、RMS既知値={_fmt(lane_value, suffix=' m')}" if lane_value is not None else ""
+        denominator = _number(source.get("lane_metric_denominator_count"))
+        denominator_text = f"、分母={int(denominator)}" if denominator is not None else ""
+        prefix = "一部未計測; " if _measurement_status(lane_measurement) == "partial" else ""
+        lane_detail = f"{prefix}RMS既知 n={measured}/{expected}{value_text}{denominator_text}"
+
+    def event_detail(
+        state: Mapping[str, Any] | None,
+        duration: Mapping[str, Any] | None,
+        value_name: str,
+    ) -> str | None:
+        fraction = _measurement_fraction(state)
+        if fraction is None and isinstance(duration, Mapping):
+            fraction = _measurement_fraction(
+                {
+                    "state_measured_count": duration.get("state_measured_count"),
+                    "state_expected_count": duration.get("state_expected_count"),
+                }
+            )
+        if fraction is None and not isinstance(duration, Mapping):
+            return None
+        measured, expected = fraction or (0, 0)
+        known = _number(duration.get("known_event_duration_s")) if isinstance(duration, Mapping) else None
+        known_text = f"、既知{value_name}時間={_fmt(known, suffix=' s')}" if known is not None else ""
+        event_statuses = [
+            value
+            for value in (_measurement_status(state), _measurement_status(duration))
+            if value is not None
+        ]
+        if "partial" in event_statuses or (
+            "unavailable" in event_statuses and "complete" in event_statuses
+        ):
+            status = "partial"
+        elif event_statuses and all(value == "unavailable" for value in event_statuses):
+            status = "unavailable"
+        else:
+            status = event_statuses[0] if event_statuses else None
+        prefix = "一部未計測; " if status == "partial" else ""
+        return f"{prefix}状態既知 n={measured}/{expected}{known_text}"
+
+    return {
+        "closed_loop_measurement_status": overall,
+        "closed_loop_lane_measurement_detail": lane_detail,
+        "closed_loop_departure_measurement_detail": event_detail(
+            departure_state, departure_duration, "逸脱"
+        ),
+        "closed_loop_low_speed_measurement_detail": event_detail(
+            low_speed_state, low_speed_duration, "低速"
+        ),
+    }
+
+
+def _combined_measurement_status(items: Sequence[Mapping[str, Any]]) -> str | None:
+    statuses = [
+        str(item.get("closed_loop_measurement_status"))
+        for item in items
+        if item.get("closed_loop_measurement_status") not in (None, "")
+    ]
+    if not statuses:
+        return None
+    if "一部未計測" in statuses:
+        return "一部未計測"
+    if all(value == "未計測" for value in statuses):
+        return "未計測"
+    if all(value == "完全計測" for value in statuses):
+        return "完全計測"
+    return "一部未計測"
+
+
+def _combined_measurement_detail(items: Sequence[Mapping[str, Any]], key: str) -> str | None:
+    values = [
+        str(item[key])
+        for item in items
+        if item.get(key) not in (None, "")
+    ]
+    return " / ".join(dict.fromkeys(values)) if values else None
+
+
 def _closed_assessment_status(item: Mapping[str, Any]) -> str:
-    if _is_baseline_pattern(item.get("pattern_id")):
-        return "対照"
     status = str(item.get("closed_loop_status", "")).strip().lower()
+    failed_count = _number(item.get("closed_loop_failed_episode_count")) or 0.0
+    aborted_count = _number(item.get("closed_loop_aborted_episode_count")) or 0.0
+    interrupted_count = _number(item.get("closed_loop_interrupted_episode_count")) or 0.0
     if status in {"failed", "error", "failure", "実行失敗"}:
         return "実行失敗"
-    interrupted_count = _number(item.get("closed_loop_interrupted_episode_count")) or 0.0
+    if failed_count > 0:
+        natural_count = _number(item.get("closed_loop_natural_episode_count")) or 0.0
+        if natural_count > 0:
+            suffix = f"実行失敗{_int_or_number(failed_count)}episode"
+            if aborted_count > 0:
+                suffix += f"・中断{_int_or_number(aborted_count)}episode"
+            return f"評価対象あり（{suffix}）"
+        return "実行失敗"
+    if _is_baseline_pattern(item.get("pattern_id")) and aborted_count == 0 and interrupted_count == 0:
+        return "対照"
     if interrupted_count > 0:
         natural_count = _number(item.get("closed_loop_natural_episode_count")) or 0.0
         if natural_count > 0:
@@ -2038,16 +2254,29 @@ def _aggregate_closed_steps(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     measured_rows: list[Mapping[str, Any]] = []
     for row in rows:
         env_step_called = _post_bool(row, "env_step_called", "step_called")
+        env_step_returned = _post_bool(row, "env_step_returned", "step_returned")
         post_telemetry = row.get("post_telemetry")
         if env_step_called is False:
             continue
-        if env_step_called is True or isinstance(post_telemetry, Mapping):
+        # ``env_step_called`` records the attempt.  A runtime exception can
+        # therefore leave it true while no post-step telemetry exists.  The
+        # explicit return marker is authoritative whenever present; retain the
+        # old called/telemetry inference only for legacy trajectories.
+        if env_step_returned is False:
+            continue
+        if env_step_returned is True or env_step_called is True or isinstance(post_telemetry, Mapping):
             measured_rows.append(row)
 
     lateral: list[float] = []
     for row in measured_rows:
         target_valid = _post_bool(row, "target_lane_valid", "lane_reference_valid", "target_lane_reference_valid")
-        if target_valid is False:
+        telemetry = row.get("post_telemetry")
+        telemetry = telemetry if isinstance(telemetry, Mapping) else {}
+        validity_names = ("target_lane_valid", "lane_reference_valid", "target_lane_reference_valid")
+        validity_declared = any(name in row or name in telemetry for name in validity_names)
+        # An explicit unknown validity is not a measured target-lane sample.
+        # Legacy rows without any validity key retain the old metric fallback.
+        if validity_declared and target_valid is not True:
             continue
         value = _post_metric(row, "target_lane_lateral_error_m", "target_lane_offset_m", "target_lane_error_m", "signed_target_lane_offset_m")
         if value is not None:
@@ -2066,7 +2295,16 @@ def _aggregate_closed_steps(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         result["closed_loop_lateral_valid_count"] = len(lateral)
         result["closed_loop_valid_count"] = len(lateral)
     result["closed_loop_poststep_count"] = len(measured_rows)
-    if lateral and measured_rows:
+    validity_values: list[bool | None] = []
+    validity_declared = False
+    for row in measured_rows:
+        post = row.get("post_telemetry")
+        post = post if isinstance(post, Mapping) else {}
+        names = ("target_lane_valid", "lane_reference_valid", "target_lane_reference_valid")
+        validity_declared = validity_declared or any(name in row or name in post for name in names)
+        validity_values.append(_post_bool(row, *names))
+    validity_complete = not validity_declared or all(value is not None for value in validity_values)
+    if lateral and measured_rows and validity_complete:
         result["closed_loop_valid_rate"] = len(lateral) / len(measured_rows)
     if speed:
         result["closed_loop_speed_mean_mps"] = sum(speed) / len(speed)
@@ -2126,6 +2364,68 @@ def _closed_episode_id(row: Mapping[str, Any], default: str = "__summary__") -> 
     return str(value)
 
 
+_CLOSED_EPISODE_STATUS_FIELDS = (
+    "status",
+    "execution_status",
+    "closed_loop_execution_status",
+    "assessment_status",
+    "runtime_assessment_status",
+    "closed_loop_runtime_assessment_status",
+    "terminal_reason",
+    "termination_reason",
+    "end_reason",
+    "termination",
+    "failure_phase",
+    "failure_reason",
+    "error",
+)
+
+
+def _closed_single_status(value: Any) -> Any:
+    """Return one aggregate status only when it is unambiguous."""
+
+    if isinstance(value, (list, tuple)):
+        values = [item for item in value if item not in (None, "")]
+        if not values:
+            return _MISSING
+        unique = {str(item).strip().casefold() for item in values}
+        return values[0] if len(unique) == 1 else _MISSING
+    if isinstance(value, Mapping) or value in (None, ""):
+        return _MISSING
+    return value
+
+
+def _closed_metric_source(
+    row: Mapping[str, Any],
+    metric: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep mixed aggregate status arrays from becoming episode metadata."""
+
+    source = dict(row)
+    if metric is not None:
+        source.update(dict(metric))
+    status_unknown = bool(source.get("_closed_episode_status_unknown"))
+    for name in _CLOSED_EPISODE_STATUS_FIELDS:
+        if name not in source:
+            continue
+        value = _closed_single_status(source[name])
+        if value is _MISSING:
+            source.pop(name, None)
+            if name in {
+                "execution_status",
+                "closed_loop_execution_status",
+                "assessment_status",
+                "runtime_assessment_status",
+                "closed_loop_runtime_assessment_status",
+            }:
+                status_unknown = True
+        else:
+            source[name] = value
+    if status_unknown:
+        source["_closed_episode_status_unknown"] = True
+    return source
+
+
 def _closed_metric_rows(row: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any], int]]:
     """Extract explicit episode metrics from summary/trajectory containers."""
 
@@ -2136,13 +2436,13 @@ def _closed_metric_rows(row: Mapping[str, Any]) -> list[tuple[str, Mapping[str, 
             if not isinstance(value, Mapping):
                 continue
             episode = _closed_episode_id(value, _closed_episode_id(row, f"episode-{index}"))
-            result.append((episode, {**dict(row), **dict(value)}, index))
+            result.append((episode, _closed_metric_source(row, value), index))
         return result
     if isinstance(metrics, Mapping):
         episode = _closed_episode_id(metrics, _closed_episode_id(row))
-        return [(episode, {**dict(row), **dict(metrics)}, 0)]
+        return [(episode, _closed_metric_source(row, metrics), 0)]
     if not _closed_is_step(row):
-        return [(_closed_episode_id(row), row, 0)]
+        return [(_closed_episode_id(row), _closed_metric_source(row), 0)]
     return []
 
 
@@ -2245,6 +2545,12 @@ def _closed_pair_evidence(
 def _closed_episode_outcome(merged: Mapping[str, Any], status: str, reason: str) -> tuple[bool, bool, list[str]]:
     """Classify a closed-loop episode while retaining its raw termination."""
 
+    if merged.get("_closed_episode_status_unknown") is True:
+        # A mixed aggregate status list has no episode-to-status mapping.  It
+        # remains unevaluable until an episode-specific trajectory supplies a
+        # scalar status; it must not be promoted to either failure or success.
+        return False, False, []
+
     values = [
         status,
         reason,
@@ -2300,6 +2606,7 @@ def _closed_item_from_metric(
 
     status = _status(merged, "完了")
     reason = _reason(merged)
+    status_unknown = merged.get("_closed_episode_status_unknown") is True
     valid_count = canonical_metric("valid_count")
     if not reason and status.strip().lower() in {"not_available", "unavailable", "na", "n/a"}:
         reason = "target-lane telemetry is unavailable"
@@ -2388,10 +2695,11 @@ def _closed_item_from_metric(
                 canonical_or_fallback(None, "meaningful_changed_count", "meaningful_change_count", "meaningful_changed_element_count")
             ),
             "closed_loop_intervention_skip_reasons": list(intervention_stats["reasons"]),
-            "closed_loop_execution_status": execution_value if execution_present else "completed",
+            "closed_loop_execution_status": execution_value if execution_present else ("unknown" if status_unknown else "completed"),
             "closed_loop_runtime_assessment_status": assessment_value if assessment_present else None,
         }
     )
+    item.update(_closed_measurement_details(merged))
     # Pair status is separate from execution status.  Mark the old explicit
     # object as a legacy source so downstream consumers can distinguish it.
     if not _first_nested(merged, "paired_p00_status", "p00_pair_status", default=None) and p00:
@@ -2445,6 +2753,38 @@ def _mean_numbers(values: Iterable[Any]) -> float | None:
 def _sum_numbers(values: Iterable[Any]) -> float | None:
     numbers = [value for value in (_number(item) for item in values) if value is not None]
     return sum(numbers) if numbers else None
+
+
+def _closed_metric_candidate_key(item: Mapping[str, Any]) -> tuple[int, int, int, int, int]:
+    """Prefer episode-specific metadata over a richer aggregate summary."""
+
+    has_episode_id = any(
+        item.get(name) not in (None, "")
+        for name in ("episode_id", "episode", "episode_index", "episode_number")
+    )
+    has_scalar_execution = any(
+        name in item and _closed_single_status(item.get(name)) is not _MISSING
+        for name in (
+            "execution_status",
+            "closed_loop_execution_status",
+            "assessment_status",
+            "runtime_assessment_status",
+            "closed_loop_runtime_assessment_status",
+            "terminal_reason",
+            "termination_reason",
+            "end_reason",
+            "termination",
+        )
+    )
+    richness = sum(value not in (None, "") for value in item.values())
+    source_priority = _number(item.get("_source_priority"))
+    return (
+        int(has_episode_id),
+        int(has_scalar_execution),
+        int(item.get("_closed_episode_status_unknown") is not True),
+        richness,
+        int(source_priority or 0),
+    )
 
 
 def _normalise_closed(rows: Iterable[Mapping[str, Any]], labels: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
@@ -2513,7 +2853,7 @@ def _normalise_closed(rows: Iterable[Mapping[str, Any]], labels: Mapping[str, st
         episode_items: list[dict[str, Any]] = []
         for episode in episode_ids:
             candidates = metric_groups.get(episode, [])
-            source = max(candidates, key=lambda item: sum(value is not None for value in item.values())) if candidates else {"pattern_id": identifier}
+            source = max(candidates, key=_closed_metric_candidate_key) if candidates else {"pattern_id": identifier}
             episode_items.append(
                 _closed_item_from_metric(
                     identifier,
@@ -2527,6 +2867,33 @@ def _normalise_closed(rows: Iterable[Mapping[str, Any]], labels: Mapping[str, st
         natural_items = [item for item in episode_items if item.get("closed_loop_episode_natural") is True and item.get("closed_loop_episode_interrupted") is not True]
         interrupted_items = [item for item in episode_items if item.get("closed_loop_episode_interrupted") is True]
         unevaluable_items = [item for item in episode_items if item.get("closed_loop_episode_natural") is not True and item.get("closed_loop_episode_interrupted") is not True]
+        failed_items = [
+            item
+            for item in episode_items
+            if any(
+                _execution_failure_kind(item.get(key)) == "failed"
+                for key in (
+                    "closed_loop_execution_status",
+                    "closed_loop_runtime_assessment_status",
+                )
+            )
+            or str(item.get("closed_loop_termination", "")).strip().casefold() == "runtime_error"
+        ]
+        aborted_items = [
+            item
+            for item in interrupted_items
+            if item not in failed_items
+            and (
+                any(
+                    _execution_failure_kind(item.get(key)) == "aborted"
+                    for key in (
+                        "closed_loop_execution_status",
+                        "closed_loop_runtime_assessment_status",
+                    )
+                )
+                or str(item.get("closed_loop_termination", "")).strip().casefold() == "intervention_abort"
+            )
+        ]
         # Preserve the episode-level rows even when every run was interrupted;
         # only natural/comparable runs contribute to the main performance
         # aggregates below.
@@ -2582,6 +2949,18 @@ def _normalise_closed(rows: Iterable[Mapping[str, Any]], labels: Mapping[str, st
             "closed_loop_evaluable_episode_count": len(natural_items),
             "closed_loop_interrupted_episode_count": len(interrupted_items),
             "closed_loop_unevaluable_episode_count": len(unevaluable_items),
+            "closed_loop_failed_episode_count": len(failed_items),
+            "closed_loop_aborted_episode_count": len(aborted_items),
+            "closed_loop_measurement_status": _combined_measurement_status(episode_items),
+            "closed_loop_lane_measurement_detail": _combined_measurement_detail(
+                episode_items, "closed_loop_lane_measurement_detail"
+            ),
+            "closed_loop_departure_measurement_detail": _combined_measurement_detail(
+                episode_items, "closed_loop_departure_measurement_detail"
+            ),
+            "closed_loop_low_speed_measurement_detail": _combined_measurement_detail(
+                episode_items, "closed_loop_low_speed_measurement_detail"
+            ),
             "closed_loop_interrupted_reasons": list(dict.fromkeys(reason for episode in interrupted_items for reason in episode.get("closed_loop_interruption_reasons", []) if reason)),
             "closed_loop_lane_rms_m": _mean_numbers(item.get("closed_loop_lane_rms_m") for item in aggregate_items),
             "closed_loop_lane_max_abs_m": max((value for value in (_number(item.get("closed_loop_lane_max_abs_m")) for item in aggregate_items) if value is not None), default=None),
@@ -3224,12 +3603,20 @@ def _closed_main_value(row: Mapping[str, Any], key: str) -> str:
             episodes = _number(row.get("closed_loop_evaluable_episode_count"))
             arrival_count = None if arrived is None or episodes is None else arrived * episodes
             arrival_episodes = episodes
-        arrival_text = _pair_text(_int_or_number(arrival_count), arrival_episodes)
+        arrival_text = (
+            _NA
+            if arrival_episodes is None or _number(arrival_episodes) == 0
+            else _pair_text(_int_or_number(arrival_count), arrival_episodes)
+        )
         interrupted = _number(row.get("closed_loop_interrupted_episode_count")) or 0.0
         suffix = f"・中断{_int_or_number(interrupted)}" if interrupted else ""
         return f"{arrival_text}・{row.get('closed_loop_termination') or _NA}{suffix}"
     if key == "closed_loop_lane_summary":
         rms = _fmt(row.get("closed_loop_lane_rms_m"), suffix=" m")
+        if row.get("closed_loop_measurement_status") == "一部未計測":
+            detail = row.get("closed_loop_lane_measurement_detail")
+            if detail:
+                rms += f"（{detail}）"
         verified_episode_count = _number(row.get("closed_loop_paired_episode_count"))
         if row.get("closed_loop_paired_p00_verified") is True or (verified_episode_count is not None and verified_episode_count > 0):
             delta = _fmt(row.get("p00_delta_lane_rms_m"), suffix=" m")
@@ -3239,13 +3626,21 @@ def _closed_main_value(row: Mapping[str, Any], key: str) -> str:
             delta = _NA
         return f"RMS {rms}; P00差 {delta}"
     if key == "closed_loop_departure_time_s":
-        return _fmt(row.get(key), suffix=" s")
+        value = _fmt(row.get(key), suffix=" s")
+        if row.get("closed_loop_measurement_status") == "一部未計測":
+            detail = row.get("closed_loop_departure_measurement_detail")
+            if detail:
+                value += f"（{detail}）"
+        return value
     if key == "closed_loop_progress":
         return _fmt(row.get(key), suffix=" m")
     if key == "closed_loop_duration_s":
         return _fmt(row.get(key), suffix=" s")
     if key == "closed_loop_assessment_status":
-        return str(row.get(key) or _NA)
+        value = str(row.get(key) or _NA)
+        if row.get("closed_loop_measurement_status") == "一部未計測" and "一部未計測" not in value:
+            value += "・一部未計測"
+        return value
     return _fmt(row.get(key))
 
 
@@ -3531,6 +3926,11 @@ def _closed_detail_records(step_records: Sequence[Mapping[str, Any]]) -> list[di
                 "clip_count": _first(row, "clip_count", "clipped_count", default=_first(intervention, "clip_count", "clipped_count", default=None)),
                 "meaningful_changed": _first(row, "meaningful_changed", "meaningful_change", default=_first(intervention, "meaningful_changed", "meaningful_change", default=None)),
                 "meaningful_changed_count": _first(row, "meaningful_changed_count", "meaningful_change_count", default=_first(intervention, "meaningful_changed_count", "meaningful_change_count", default=None)),
+                "execution_status": _first(row, "execution_status", "closed_loop_execution_status", default=None),
+                "assessment_status": _first(row, "assessment_status", "closed_loop_runtime_assessment_status", default=None),
+                "failure_phase": _first(row, "failure_phase", "runtime_failure_phase", default=None),
+                "failure_reason": _first(row, "failure_reason", "runtime_failure_reason", default=None),
+                "terminal_reason": _first(row, "terminal_reason", "termination_reason", default=None),
                 "selected_probability_delta": selected_probability,
                 "selected_probability_delta_pp": selected_probability_pp,
                 "action": _first(row, "action_forwarded", "action", default=None),
@@ -3678,6 +4078,32 @@ def _details_markdown(
         "IG未実行の場合、IGに関する詳細は1行の未実行表示だけで、①-A/①-Bの結果や順位へ混ぜていません。",
         "",
     ]
+    measurement_rows = [
+        row
+        for row in rows
+        if row.get("closed_loop_measurement_status") in {"一部未計測", "未計測"}
+    ]
+    if measurement_rows:
+        lines.extend(
+            [
+                "## ①-B 計測完全性",
+                "",
+                "execution/assessment の状態と物理テレメトリの計測完全性は別に表示しています。N/A（一部未計測）は未知区間を0へ補完せず、既知の値と分母だけを併記します。",
+                "",
+            ]
+        )
+        for row in measurement_rows:
+            details = [
+                row.get("closed_loop_lane_measurement_detail"),
+                row.get("closed_loop_departure_measurement_detail"),
+                row.get("closed_loop_low_speed_measurement_detail"),
+            ]
+            details = [str(value) for value in details if value not in (None, "")]
+            lines.append(
+                f"- {row.get('pattern_id', _NA)}: {row.get('closed_loop_measurement_status')}"
+                + ("; " + " / ".join(details) if details else "")
+            )
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -4435,7 +4861,160 @@ def _video_reason_lines(
     ]
 
 
+def _execution_failure_kind(value: Any) -> str | None:
+    """Classify a saved episode's execution state for the report headline.
+
+    ``execution_status`` and ``assessment_status`` are deliberately separate
+    fields.  A natural terminal outcome (collision, road departure, arrival,
+    or horizon) is therefore not classified from its terminal reason alone.
+    Only an explicit runtime error or intervention abort contributes here.
+    """
+
+    token = str(value or "").strip().casefold().replace("-", "_")
+    if not token:
+        return None
+    if token in {
+        "failed",
+        "failure",
+        "error",
+        "runtime_error",
+        "runtime_failure",
+        "runtime_failed",
+        "not_evaluable_runtime_error",
+        "実行失敗",
+    }:
+        return "failed"
+    if token in {
+        "aborted",
+        "abort",
+        "interrupted",
+        "intervention_abort",
+        "not_evaluable_intervention_abort",
+        "実行失敗／中断",
+        "中断",
+    }:
+        return "aborted"
+    return None
+
+
+def _closed_execution_failure_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """Count explicit failed/aborted episodes without treating outcomes as errors."""
+
+    failed = 0
+    aborted = 0
+    completed = 0
+    for row in rows:
+        episode_rows = row.get("closed_loop_episode_rows")
+        candidates = [item for item in episode_rows if isinstance(item, Mapping)] if isinstance(episode_rows, list) else [row]
+        if not candidates:
+            candidates = [row]
+        for episode in candidates:
+            kind = None
+            for key in (
+                "closed_loop_execution_status",
+                "execution_status",
+                "closed_loop_runtime_assessment_status",
+                "assessment_status",
+            ):
+                kind = _execution_failure_kind(episode.get(key))
+                if kind:
+                    break
+            if kind is None:
+                terminal = str(
+                    episode.get("closed_loop_termination", episode.get("terminal_reason", "")) or ""
+                ).strip().casefold().replace("-", "_")
+                if terminal == "runtime_error":
+                    kind = "failed"
+                elif terminal == "intervention_abort":
+                    kind = "aborted"
+            if kind == "failed":
+                failed += 1
+            elif kind == "aborted":
+                aborted += 1
+            elif str(episode.get("closed_loop_execution_status", episode.get("execution_status", ""))).casefold() == "completed":
+                completed += 1
+    return {"failed": failed, "aborted": aborted, "completed": completed}
+
+
+def _metadata_execution_failure_counts(metadata: Mapping[str, Any]) -> dict[str, int]:
+    """Read optional status counts when a report has no episode rows."""
+
+    failed = 0
+    aborted = 0
+    completed = 0
+    stages = metadata.get("stages")
+    stage = stages.get("closed_loop") if isinstance(stages, Mapping) else None
+    if not isinstance(stage, Mapping):
+        return {"failed": 0, "aborted": 0, "completed": 0}
+    source = stage.get("counts") if isinstance(stage.get("counts"), Mapping) else stage
+    for key in ("failed_episode_count", "failed_count"):
+        number = _number(source.get(key))
+        if number is not None:
+            failed = int(number)
+            break
+    for key in ("aborted_episode_count", "aborted_count"):
+        number = _number(source.get(key))
+        if number is not None:
+            aborted = int(number)
+            break
+    number = _number(source.get("completed_episode_count"))
+    if number is not None:
+        completed = int(number)
+    return {"failed": failed, "aborted": aborted, "completed": completed}
+
+
+def _metadata_has_execution_failure_counts(metadata: Mapping[str, Any]) -> bool:
+    """Whether the current closed-loop stage declares authoritative counts."""
+
+    stages = metadata.get("stages")
+    stage = stages.get("closed_loop") if isinstance(stages, Mapping) else None
+    if not isinstance(stage, Mapping):
+        return False
+    source = stage.get("counts") if isinstance(stage.get("counts"), Mapping) else stage
+    return isinstance(source, Mapping) and any(
+        key in source
+        for key in (
+            "completed_episode_count",
+            "failed_episode_count",
+            "aborted_episode_count",
+            "runtime_failure_count",
+            "execution_failure_count",
+        )
+    )
+
+
+def _report_execution_counts(
+    metadata: Mapping[str, Any],
+    closed: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, int], bool]:
+    """Return one count set for the report header and whether it is known."""
+
+    if _metadata_has_execution_failure_counts(metadata):
+        return _metadata_execution_failure_counts(metadata), True
+    if closed:
+        return _closed_execution_failure_counts(
+            [row for row in closed if isinstance(row, Mapping)]
+        ), True
+    return {"failed": 0, "aborted": 0, "completed": 0}, False
+
+
 def _status_text(metadata: Mapping[str, Any], *, offline: Sequence[Any], closed: Sequence[Any], ig: Sequence[Any]) -> str:
+    # The current closed-loop stage stores one authoritative count set.  Use
+    # raw normalized episode rows only for old runs that predate that contract;
+    # summing both would double-count the current stage and could mix an old
+    # successful analysis directory into a failed run's headline.
+    execution_failures, _known = _report_execution_counts(
+        metadata,
+        [row for row in closed if isinstance(row, Mapping)],
+    )
+    if execution_failures["failed"] or execution_failures["aborted"]:
+        details = [
+            f"completed={execution_failures['completed']}",
+            f"failed={execution_failures['failed']}",
+            f"aborted={execution_failures['aborted']}",
+        ]
+        prefix = "一部失敗" if execution_failures["completed"] else "失敗"
+        return prefix + "（" + "、".join(details) + "）"
     direct = metadata.get("status")
     if isinstance(direct, Mapping):
         direct = direct.get("overall", direct.get("status"))
@@ -4463,7 +5042,12 @@ def _status_text(metadata: Mapping[str, Any], *, offline: Sequence[Any], closed:
         if optional_ig_failed and str(direct).lower() in {"failed", "error"} and not any(state in {"failed", "error"} for state in states):
             direct = None
     if direct:
-        return str(direct)
+        direct_text = str(direct)
+        if direct_text.strip().casefold() in {"partial_failure", "partial_failed", "degraded"}:
+            return "一部失敗"
+        if direct_text.strip().casefold() in {"failed", "failure", "error"}:
+            return "失敗"
+        return direct_text
     if not offline and not closed:
         return "未完了／結果未記録"
     return "完了（③ IGは任意）"
@@ -4580,6 +5164,8 @@ def _findings(rows: Sequence[Mapping[str, Any]], *, closed: Sequence[Mapping[str
     def lane_is_comparable(row: Mapping[str, Any]) -> bool:
         if row.get("closed_loop_assessment_status") in {"評価不能：変更なし", "評価不能：適用なし", "適用件数未記録", "実行失敗／中断", "実行失敗"}:
             return False
+        if row.get("closed_loop_measurement_status") in {"一部未計測", "未計測"}:
+            return False
         # A small lateral RMS during a stop or an interrupted/collided run is
         # an execution outcome, not evidence that the intervention preserved
         # lane keeping.  Keep the raw value in the tables/details while
@@ -4677,11 +5263,12 @@ def _markdown(
     conclusion_lines = _conclusion_lines(rows=rows, offline=offline, closed=closed)
     p00_sentence = _p00_reference_sentence(rows)
     display_status = status if ig or "③ IG" not in status else status.split("（③ IG", 1)[0]
+    execution_counts, execution_counts_known = _report_execution_counts(metadata, closed)
     intro = (
         "このレポートは保存済み観測・方策比較・走行テレメトリから生成しました。①-A は同じ観測の対象入力だけを置換した判断比較、①-B は置換後の方策で走り直した paired closed-loop 比較です。"
         + (" ③ Integrated Gradients は任意の補足です。" if ig else "")
     )
-    method_state = f"- ①-A状態: {_method_status(metadata, 'offline', bool(offline))} / ①-B状態: {_method_status(metadata, 'closed_loop', bool(closed))}"
+    method_state = f"- ①-A状態: {_method_status(metadata, 'offline', bool(offline))} / ①-B状態: {_method_status(metadata, 'closed_loop', bool(closed), closed)}"
     if ig:
         method_state += f" / ③状態: {_method_status(metadata, 'integrated_gradients', bool(ig))}"
     model = metadata.get("model")
@@ -4701,6 +5288,13 @@ def _markdown(
         "",
         f"- 実行ディレクトリ: `{run_dir}`",
         f"- 状態: **{display_status}**",
+        *(
+            [
+                f"- 実行件数: completed={execution_counts['completed']} / failed={execution_counts['failed']} / aborted={execution_counts['aborted']}",
+            ]
+            if execution_counts_known
+            else []
+        ),
         method_state,
         f"- 対象: model={model or _NA} / 実観測次元={dimension or _NA} / scenario={scenario or _NA} / {scope_line} / version={package_version or _NA}",
         "- 解釈: 数値はこのモデル・対象シナリオ・指定置換条件における観測結果です。因果的な必要性や一般化を自動断定しません。",
@@ -4864,6 +5458,12 @@ def _html(*, markdown: str, rows: Sequence[Mapping[str, Any]], status: str, svgs
     )
     p00_sentence = escape(_p00_reference_sentence(rows))
     display_status = status if ig or "③ IG" not in status else status.split("（③ IG", 1)[0]
+    execution_counts, execution_counts_known = _report_execution_counts(metadata or {}, closed)
+    execution_html = (
+        f"<p>実行件数: completed={execution_counts['completed']} / failed={execution_counts['failed']} / aborted={execution_counts['aborted']}</p>"
+        if execution_counts_known
+        else ""
+    )
     intro = "①-A は同一観測の入力置換による判断比較、①-B はその入力で走り直した性能比較です。" + (" ③ Integrated Gradients は任意の補足です。" if ig else "")
     coverage_links = (
         '<a href="report_offline_coverage.svg">①-A SVG</a> / '
@@ -4894,7 +5494,7 @@ body{{font-family:{font_family or _detect_font_family()};line-height:1.6;color:#
 table{{border-collapse:collapse;width:100%;font-size:.9rem;margin:.5rem 0 1.2rem}}th,td{{border:1px solid #ccd6e0;padding:.35rem .45rem;text-align:left;vertical-align:top}}th{{background:#eef3f7}}
 .status{{padding:.6rem .8rem;border-left:5px solid #3b82b6;background:#f4f8fb}}.figures{{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:1rem}}figure{{margin:0;border:1px solid #ccd6e0;padding:.5rem;background:#fafafa}}figure svg{{width:100%;height:auto}}small{{color:#5e6b76}}
 </style></head><body><h1>入力依存度分析レポート</h1>
-<p class="status">状態: <strong>{escape(display_status)}</strong></p>
+<p class="status">状態: <strong>{escape(display_status)}</strong></p>{execution_html}
 <p>{escape(intro)} N/A は未実行・欠測を表し、0 とは解釈していません。</p>
 <p>対象範囲: {scope_line}</p>
 <h2>結論と成立範囲</h2><p>実変更、変更なし、部分適用、適用不能、未実行を分けています。実変更0件は入力重要度の順位候補にしていません。到達・レーン維持・衝突・停止・中断も別状態です。</p><ul>{conclusion_html}<li>件数の軸: 一部適用は実変更あり・変更なしの分類と重複するため、各件数の合計をパターン総数とは解釈しません。</li></ul>
@@ -5079,7 +5679,7 @@ def generate_report(run_dir: str | os.PathLike[str], *, output_dir: str | os.Pat
         "source_run_dir": str(root),
         "sections": {
             "offline": {"status": _method_status(metadata, "offline", bool(offline)), "rows": len(offline)},
-            "closed_loop": {"status": _method_status(metadata, "closed_loop", bool(closed)), "rows": len(closed)},
+            "closed_loop": {"status": _method_status(metadata, "closed_loop", bool(closed), closed), "rows": len(closed)},
             "integrated_gradients": {"status": _method_status(metadata, "integrated_gradients", bool(ig)), "rows": len(ig), "quality": _ig_quality(ig), "contexts": _ig_context_rows(ig)},
         },
         "media": media,

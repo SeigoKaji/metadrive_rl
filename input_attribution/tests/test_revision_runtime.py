@@ -266,7 +266,15 @@ def test_closed_loop_full_episode_intervention_exception_is_saved_as_pattern_abo
     assert episode["terminal_reason"] == "intervention_abort"
     assert episode["failure_phase"] == "intervention"
     assert "unexpected confirmed intervention condition" in episode["failure_reason"]
-    assert episode["records"] == []
+    assert len(episode["records"]) == 1
+    record = episode["records"][0]
+    assert record["phase"] == "intervention"
+    assert record["intervention"] is None
+    assert record["observation_missing"] is False
+    assert record["modified_observation_missing"] is True
+    assert record["action_forwarded"] is None
+    assert record["env_step_called"] is False
+    assert record["observation_index"] == 0
     assert adapter.created[-1].step_count == 0
 
 
@@ -738,7 +746,10 @@ def test_closed_loop_summary_separates_natural_and_partial_episode_groups():
         },
     )
     summary = result.as_dict()["patterns"]["P01"]
-    assert summary["metric_summary"]["counts"]["episodes"] == 3
+    assert summary["metric_summary"]["counts"]["episodes"] == 1
+    assert summary["diagnostic_metric_summary"]["counts"]["episodes"] == 3
+    assert summary["metric_summary_scope"] == "natural_completion"
+    assert summary["primary_metric_episode_indices"] == [0]
     assert summary["execution_group_counts"] == {
         "natural_completion": 1,
         "partial_or_interrupted": 2,

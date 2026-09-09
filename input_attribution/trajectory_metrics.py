@@ -167,6 +167,41 @@ def _action(record: Mapping[str, Any]) -> Any:
     return record.get("action", _MISSING)
 
 
+def _env_step_returned(record: Mapping[str, Any]) -> bool:
+    """Return whether a record represents a physically returned env step.
+
+    New closed-loop records carry ``env_step_returned`` and it is authoritative:
+    a called step that raised must not become a post-step observation.  Older
+    saved records only carry ``env_step_called``; retain that legacy fallback.
+    Records with neither marker predate the distinction and remain physical
+    rows for backward compatibility.
+    """
+
+    if "env_step_returned" in record:
+        return _boolean(record.get("env_step_returned")) is True
+    if "env_step_called" in record:
+        return _boolean(record.get("env_step_called")) is True
+    return True
+
+
+def _env_step_attempted(record: Mapping[str, Any]) -> bool:
+    """Return whether execution attempted to invoke the environment."""
+
+    if "env_step_attempted" in record:
+        return _boolean(record.get("env_step_attempted")) is True
+    if "env_step_called" in record:
+        return _boolean(record.get("env_step_called")) is True
+    if "env_step_returned" in record:
+        returned = _boolean(record.get("env_step_returned"))
+        # A standalone false return marker is the legacy/minimal encoding of
+        # an env.step exception.  New policy-abort records also carry
+        # ``env_step_attempted=False`` and are handled by the first branch.
+        return returned is not None
+    # Legacy records have no execution marker; they are already persisted as
+    # completed post-step rows and count as attempted physical steps.
+    return True
+
+
 def _pre_time(record: Mapping[str, Any], telemetry: Mapping[str, Any], fallback: float | None = None) -> float | None:
     value = _first(
         telemetry,
@@ -265,6 +300,53 @@ def _measurement_info(
     }
 
 
+def _state_measurement(
+    values: Sequence[bool | None],
+    times: Sequence[float | None],
+) -> dict[str, Any]:
+    """Describe a tri-state event series without treating unknown as false.
+
+    Event metrics need two independent kinds of coverage.  ``values`` tells us
+    whether the event state was observed at each step, while the interval
+    measurement (computed separately from timestamps) tells us how long that
+    state lasted.  Keep both the known true/false samples and unknown samples
+    here so an empty list of true samples cannot be mistaken for a confirmed
+    absence of the event.
+    """
+
+    info = _measurement_info(values, times)
+    true_indices = [index for index, value in enumerate(values) if value is True]
+    false_indices = [index for index, value in enumerate(values) if value is False]
+    missing_indices = [index for index, value in enumerate(values) if value is None]
+    expected_count = len(values)
+    if expected_count == 0:
+        status = "not_applicable"
+    elif missing_indices and (true_indices or false_indices):
+        status = "partial"
+    elif missing_indices:
+        status = "unavailable"
+    else:
+        status = "complete"
+    info.update(
+        {
+            "status": status,
+            "true_count": len(true_indices),
+            "false_count": len(false_indices),
+            "known_true_indices": true_indices,
+            "known_false_indices": false_indices,
+            "missing_indices": missing_indices,
+            "ever_true": (
+                True
+                if true_indices
+                else None
+                if missing_indices
+                else False
+            ),
+        }
+    )
+    return info
+
+
 def _event_duration_measurement(
     event_indices: Sequence[int],
     deltas: Sequence[float | None],
@@ -311,6 +393,68 @@ def _event_duration_measurement(
     }
 
 
+def _event_measurement(
+    event_indices: Sequence[int],
+    deltas: Sequence[float | None],
+    state_measurement: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Combine event-interval and event-state coverage.
+
+    A duration can be fully measured for the observed true samples while the
+    event state is still unknown at another step.  In that case retain the
+    observed duration as a diagnostic, but mark the public measurement
+    partial so callers do not present it as the episode total.
+    """
+
+    result = _event_duration_measurement(event_indices, deltas)
+    known_state_indices = [
+        *state_measurement["known_true_indices"],
+        *state_measurement["known_false_indices"],
+    ]
+    known_state_deltas = [
+        deltas[index]
+        for index in known_state_indices
+        if index < len(deltas) and deltas[index] is not None
+    ]
+    known_event_duration = result["measured_duration_s"]
+    if not event_indices and state_measurement["false_count"]:
+        # No observed event samples is a measured zero only when at least one
+        # state was explicitly observed as false.  Keep this diagnostic
+        # separate from the public total, which remains N/A if another state
+        # is unknown.
+        known_event_duration = 0.0
+    result.update(
+        {
+            "state_status": state_measurement["status"],
+            "state_measured_count": state_measurement["measured_count"],
+            "state_expected_count": state_measurement["expected_count"],
+            "state_missing_count": state_measurement["missing_count"],
+            "state_coverage_rate": state_measurement["coverage_rate"],
+            "state_missing_indices": state_measurement["missing_indices"],
+            "state_known_interval_count": len(known_state_deltas),
+            "state_expected_interval_count": state_measurement["expected_count"],
+            "state_missing_interval_count": max(
+                0,
+                state_measurement["expected_count"] - len(known_state_deltas),
+            ),
+            "state_known_duration_s": (
+                float(sum(float(value) for value in known_state_deltas))
+                if known_state_deltas
+                else None
+            ),
+            "known_event_duration_s": known_event_duration,
+        }
+    )
+    if state_measurement["missing_count"]:
+        if result["status"] in {"complete", "not_applicable"}:
+            result["status"] = "partial"
+        if result["reason"] is None or result["reason"] == "no_events":
+            result["reason"] = "missing_event_state"
+        else:
+            result["reason"] = "missing_event_state_and_interval"
+    return result
+
+
 def summarize_trajectory(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -321,12 +465,25 @@ def summarize_trajectory(
 ) -> dict[str, Any]:
     """Return physical metrics for one closed-loop episode.
 
+    Only records whose environment step returned are included in physical
+    post-step metrics.  Non-returned attempts remain in the execution counts
+    so a runtime failure cannot be mistaken for a telemetry sample.
     RMS uses only valid post-step target-lane samples as its denominator. The
     ``valid_rate`` is time-weighted when timestamps exist; ``valid_count`` and
     ``poststep_count`` remain available so a reader can inspect sample coverage.
     """
 
-    rows = [dict(record) for record in records]
+    raw_rows = [dict(record) for record in records]
+    returned_mask = [_env_step_returned(record) for record in raw_rows]
+    attempted_mask = [_env_step_attempted(record) for record in raw_rows]
+    rows = [record for record, returned in zip(raw_rows, returned_mask, strict=False) if returned]
+    record_count = len(raw_rows)
+    attempted_step_count = int(sum(attempted_mask))
+    env_step_returned_count = int(sum(returned_mask))
+    nonreturned_step_count = int(
+        sum(attempted and not returned for attempted, returned in zip(attempted_mask, returned_mask, strict=False))
+    )
+    excluded_step_count = record_count - len(rows)
     telemetry_rows = [_telemetry(record) for record in rows]
     times = [_time(record, telemetry_rows[index], None) for index, record in enumerate(rows)]
     deltas = _step_durations(rows, times)
@@ -374,15 +531,20 @@ def summarize_trajectory(
     interval_expected = len(rows)
     duration_complete = bool(interval_expected) and verified_time_interval_count == interval_expected
     total_duration = measured_duration if duration_complete else None
-    valid_durations = [
-        delta for delta, valid in zip(deltas, valid_mask, strict=False)
-        if valid and delta is not None
+    lane_validity_state_measurement = _state_measurement(lane_validity, times)
+    lane_validity_complete = bool(lane_validity) and lane_validity_state_measurement["missing_count"] == 0
+    known_valid_durations = [
+        delta for delta, valid in zip(deltas, lane_validity, strict=False)
+        if valid is True and delta is not None
     ]
-    valid_time = (
-        sum(valid_durations)
-        if duration_complete and known_deltas and (valid_durations or valid_count == 0)
+    known_valid_time = (
+        float(sum(known_valid_durations))
+        if known_valid_durations
+        else 0.0
+        if lane_validity_state_measurement["false_count"]
         else None
     )
+    valid_time = known_valid_time if duration_complete else None
     sample_valid_rate = (
         valid_count / poststep_count
         if lane_reference_known and poststep_count
@@ -391,6 +553,16 @@ def summarize_trajectory(
     valid_rate = (
         valid_time / total_duration
         if valid_time is not None and total_duration is not None and total_duration > 0
+        else None
+    )
+    public_valid_time = (
+        valid_time
+        if lane_reference_known and lane_validity_complete
+        else None
+    )
+    public_valid_rate = (
+        valid_rate
+        if lane_reference_known and lane_validity_complete
         else None
     )
 
@@ -457,7 +629,49 @@ def summarize_trajectory(
         "progress_m": _measurement_info(progress_values, times),
         "clock": _measurement_info(times, times),
     }
+    known_state_interval_count = sum(
+        delta is not None
+        for delta, state in zip(deltas, lane_validity, strict=False)
+        if state is not None
+    )
+    valid_time_measurement = {
+        "status": (
+            "unavailable"
+            if not rows or lane_validity_state_measurement["measured_count"] == 0
+            else "complete"
+            if lane_validity_complete and duration_complete
+            else "partial"
+        ),
+        "known_valid_time_s": known_valid_time,
+        "known_duration_s": measured_duration,
+        "known_valid_rate": (
+            known_valid_time / measured_duration
+            if known_valid_time is not None
+            and measured_duration is not None
+            and measured_duration > 0
+            else None
+        ),
+        "known_valid_interval_count": len(known_valid_durations),
+        "known_state_interval_count": known_state_interval_count,
+        "expected_interval_count": len(rows),
+        "missing_interval_count": max(0, len(rows) - known_state_interval_count),
+        "state_measured_count": lane_validity_state_measurement["measured_count"],
+        "state_expected_count": lane_validity_state_measurement["expected_count"],
+        "state_missing_count": lane_validity_state_measurement["missing_count"],
+        "state_coverage_rate": lane_validity_state_measurement["coverage_rate"],
+        "interval_coverage_rate": interval_coverage,
+        "reason": (
+            "no_records"
+            if not rows
+            else "missing_lane_validity_state"
+            if not lane_validity_complete
+            else "missing_pre_or_post_time"
+            if not duration_complete
+            else None
+        ),
+    }
 
+    departure_state_measurement = _state_measurement(departures, times)
     departure_events: list[int] = []
     consecutive = max(1, int(departure_consecutive_steps))
     index = 0
@@ -471,47 +685,80 @@ def summarize_trajectory(
         if index - start >= consecutive:
             departure_events.append(start)
     departure_event_indices = [index for index, value in enumerate(departures) if value is True]
-    departure_duration_measurement = _event_duration_measurement(
+    departure_duration_measurement = _event_measurement(
         departure_event_indices,
         deltas,
+        departure_state_measurement,
     )
     departure_observations = departure_event_indices
+    departure_state_complete = bool(departures) and departure_state_measurement["missing_count"] == 0
     departure_time = (
-        departure_duration_measurement["measured_duration_s"]
+        None
+        if not departures
+        else None
+        if not departure_state_complete
+        else departure_duration_measurement["measured_duration_s"]
         if departure_observations and departure_duration_measurement["status"] == "complete"
         else None
         if departure_observations
         else 0.0
-        if known_deltas
+        if departure_state_complete
         else None
     )
+    first_departure_index = departure_events[0] if departure_events else None
+    first_departure_has_unknown_prefix = bool(
+        first_departure_index is not None
+        and any(value is None for value in departures[:first_departure_index])
+    )
     first_departure_time = (
-        times[departure_events[0]]
-        if departure_events and known_deltas
+        times[first_departure_index]
+        if first_departure_index is not None
+        and not first_departure_has_unknown_prefix
+        and times[first_departure_index] is not None
         else None
     )
 
     speeds_for_low = [_speed_m_s(telemetry) for telemetry in telemetry_rows]
+    low_speed_state_values = [
+        None if speed is None else speed < float(low_speed_m_s)
+        for speed in speeds_for_low
+    ]
+    low_speed_state_measurement = _state_measurement(low_speed_state_values, times)
     low_speed_observations = [
         speed for speed in speeds_for_low
         if speed is not None and speed < float(low_speed_m_s)
     ]
     low_speed_event_indices = [
         index
-        for index, speed in enumerate(speeds_for_low)
-        if speed is not None and speed < float(low_speed_m_s)
+        for index, value in enumerate(low_speed_state_values)
+        if value is True
     ]
-    low_speed_duration_measurement = _event_duration_measurement(
+    low_speed_events: list[int] = []
+    index = 0
+    while index < len(low_speed_state_values):
+        if low_speed_state_values[index] is not True:
+            index += 1
+            continue
+        low_speed_events.append(index)
+        while index < len(low_speed_state_values) and low_speed_state_values[index] is True:
+            index += 1
+    low_speed_duration_measurement = _event_measurement(
         low_speed_event_indices,
         deltas,
+        low_speed_state_measurement,
     )
+    low_speed_state_complete = bool(low_speed_state_values) and low_speed_state_measurement["missing_count"] == 0
     low_speed_duration = (
-        low_speed_duration_measurement["measured_duration_s"]
+        None
+        if not low_speed_state_values
+        else None
+        if not low_speed_state_complete
+        else low_speed_duration_measurement["measured_duration_s"]
         if low_speed_observations and low_speed_duration_measurement["status"] == "complete"
         else None
         if low_speed_observations
         else 0.0
-        if known_deltas
+        if low_speed_state_complete
         else None
     )
 
@@ -553,6 +800,56 @@ def summarize_trajectory(
 
     metric_status = "available" if valid_count else "not_available"
     progress_value = progress[-1] if progress else None
+    lane_rms = float(np.sqrt(np.mean(np.square(errors)))) if errors else None
+    lane_max_abs = float(np.max(np.abs(errors))) if errors else None
+    lane_rms_measurement = {
+        "status": (
+            "unavailable"
+            if valid_count == 0
+            else "complete"
+            if valid_count == poststep_count
+            else "partial"
+        ),
+        "measured_count": valid_count,
+        "expected_count": poststep_count,
+        "missing_count": max(0, poststep_count - valid_count),
+        "coverage_rate": (valid_count / poststep_count) if poststep_count else None,
+        "denominator": valid_count,
+        "reason": "no_valid_target_lane_samples" if valid_count == 0 else None,
+    }
+    ever_departed = (
+        None
+        if not departures
+        else True
+        if departure_events
+        else None
+        if departure_state_measurement["missing_count"]
+        else False
+    )
+    ever_departed_observed = (
+        departure_state_measurement["ever_true"]
+        if departures
+        else None
+    )
+    ever_low_speed = (
+        None
+        if not low_speed_state_values
+        else True
+        if low_speed_state_measurement["true_count"]
+        else None
+        if low_speed_state_measurement["missing_count"]
+        else False
+    )
+    departure_count = (
+        len(departure_events)
+        if departures and departure_state_measurement["missing_count"] == 0
+        else None
+    )
+    low_speed_count = (
+        len(low_speed_events)
+        if low_speed_state_values and low_speed_state_measurement["missing_count"] == 0
+        else None
+    )
     result: dict[str, Any] = {
         "status": metric_status,
         "telemetry_status": (
@@ -567,14 +864,32 @@ def summarize_trajectory(
             else "complete"
         ),
         "poststep_count": poststep_count,
+        "record_count": record_count,
+        "attempted_step_count": attempted_step_count,
+        "executed_step_count": poststep_count,
+        "env_step_returned_count": env_step_returned_count,
+        "nonreturned_step_count": nonreturned_step_count,
+        "not_returned_step_count": nonreturned_step_count,
+        "physical_state_unknown_count": nonreturned_step_count,
+        "excluded_step_count": excluded_step_count,
         "valid_count": valid_count,
         "valid_poststep_count": valid_count,
         "verified_time_interval_count": verified_time_interval_count,
         "duration_measurement": duration_measurement,
+        "interval_measurement": duration_measurement,
+        "interval_coverage_rate": interval_coverage,
         "departure_duration_measurement": departure_duration_measurement,
         "low_speed_duration_measurement": low_speed_duration_measurement,
+        "departure_state_measurement": departure_state_measurement,
+        "low_speed_state_measurement": low_speed_state_measurement,
+        "event_state_coverage": {
+            "departure": departure_state_measurement,
+            "low_speed": low_speed_state_measurement,
+        },
         "measurement_range": measurement_range,
         "telemetry_measurement_range": measurement_range,
+        "valid_time_measurement": valid_time_measurement,
+        "lane_validity_state_measurement": lane_validity_state_measurement,
         "measured_time_span_s": measurement_range["span_s"],
         "measured_first_time_s": measurement_range["first_time_s"],
         "measured_last_time_s": measurement_range["last_time_s"],
@@ -593,27 +908,33 @@ def summarize_trajectory(
             "progress_m": int(sum(value is not None for value in progress_values)),
             "clock": len(known_times),
         },
-        "valid_time_s": valid_time if lane_reference_known else None,
-        "valid_time_seconds": valid_time if lane_reference_known else None,
-        "valid_time": valid_time if lane_reference_known else None,
-        "valid_poststep_time_s": valid_time if lane_reference_known else None,
-        "valid_rate": valid_rate if lane_reference_known else None,
+        "valid_time_s": public_valid_time,
+        "valid_time_seconds": public_valid_time,
+        "valid_time": public_valid_time,
+        "valid_poststep_time_s": public_valid_time,
+        "valid_rate": public_valid_rate,
         "sample_valid_rate": sample_valid_rate,
         "valid_poststep_rate": sample_valid_rate,
         "lane_metric_denominator": "valid_poststep_target_lane_samples",
-        "lane_rms_m": float(np.sqrt(np.mean(np.square(errors)))) if errors else None,
-        "lane_max_abs_m": float(np.max(np.abs(errors))) if errors else None,
-        "lane_error_rms_m": float(np.sqrt(np.mean(np.square(errors)))) if errors else None,
-        "lane_error_max_abs_m": float(np.max(np.abs(errors))) if errors else None,
-        "target_lane_rms_m": float(np.sqrt(np.mean(np.square(errors)))) if errors else None,
-        "target_lane_max_abs_m": float(np.max(np.abs(errors))) if errors else None,
-        "departure_count": len(departure_events) if any(value is not None for value in departures) else None,
-        "departure_time_s": departure_time if any(value is not None for value in departures) else None,
+        "lane_metric_denominator_count": valid_count,
+        "lane_metric_measurement": lane_rms_measurement,
+        "lane_rms_measurement": lane_rms_measurement,
+        "lane_rms_m": lane_rms,
+        "lane_max_abs_m": lane_max_abs,
+        "lane_error_rms_m": lane_rms,
+        "lane_error_max_abs_m": lane_max_abs,
+        "target_lane_rms_m": lane_rms,
+        "target_lane_max_abs_m": lane_max_abs,
+        "departure_count": departure_count,
+        "departure_observed_count": len(departure_events),
+        "departure_time_s": departure_time,
         "first_departure_time_s": first_departure_time,
         "departure_tolerance_ratio": float(departure_tolerance_ratio),
         "departure_consecutive_steps": consecutive,
-        "ever_departed": bool(departure_events) if any(value is not None for value in departures) else None,
-        "ever_departed_target_lane": bool(departure_events) if any(value is not None for value in departures) else None,
+        "ever_departed": ever_departed,
+        "ever_departed_target_lane": ever_departed,
+        "ever_departed_observed": ever_departed_observed,
+        "ever_departed_raw": ever_departed_observed,
         "arrived": flags["arrived"],
         "arrival": flags["arrived"],
         "wrong_lane_arrival": flags["wrong_lane_arrival"],
@@ -624,7 +945,10 @@ def summarize_trajectory(
         "speed_mean_m_s": float(np.mean(speeds)) if speeds else None,
         "speed_mean_mps": float(np.mean(speeds)) if speeds else None,
         "low_speed_threshold_m_s": float(low_speed_m_s),
-        "low_speed_duration_s": low_speed_duration if any(speed is not None for speed in speeds_for_low) else None,
+        "low_speed_count": low_speed_count,
+        "low_speed_observed_count": len(low_speed_events),
+        "ever_low_speed": ever_low_speed,
+        "low_speed_duration_s": low_speed_duration,
         "road_out": flags["road_out"],
         "crash": flags["crash"],
         "termination_reason": terminal_text,

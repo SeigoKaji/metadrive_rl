@@ -592,45 +592,12 @@ def _fixed_value_confirmation(
     if declared.get("confirmed") is False or declared.get("status") in {"unset", "unknown", "unconfirmed"}:
         return "schema replacement value is not confirmed"
     if allow_invalid_variant:
-        if pattern.metadata.get("invalid_joint_confirmed") is not True:
-            return "invalid replacement requires metadata.invalid_joint_confirmed=true"
-        if "invalid_value" not in declared:
-            evidence = pattern.metadata.get("invalid_joint_evidence")
-            if isinstance(evidence, Mapping):
-                entry = _invalid_joint_evidence_entry(evidence, schema, index)
-                if isinstance(entry, Mapping):
-                    expected = entry.get("invalid_value", entry.get("value"))
-                    if (
-                        entry.get("confirmed") is True
-                        and isinstance(
-                            entry.get(
-                                "evidence",
-                                entry.get("source", entry.get("provenance")),
-                            ),
-                            str,
-                        )
-                        and str(
-                            entry.get(
-                                "evidence",
-                                entry.get("source", entry.get("provenance")),
-                            )
-                        ).strip()
-                        and expected is not None
-                        and _values_equal(expected, value)
-                    ):
-                        return None
-            return (
-                f"input {index} has no source-confirmed invalid_value for the "
-                "invalid coupled replacement"
-            )
-        if declared.get("confirmed") is not True:
-            return f"input {index} invalid_value is not source-confirmed"
-        invalid_value = declared["invalid_value"]
-        if not _values_equal(invalid_value, value):
-            return (
-                f"input {index} differs from schema-confirmed invalid_value "
-                f"{invalid_value!r}"
-            )
+        # The complete joint, including dtype conversion and clipping, is
+        # checked once the final values have been assigned.  Do not compare a
+        # pre-clip value here: an explicit ``clip=True`` may intentionally
+        # produce the confirmed sentinel.  Returning here also permits every
+        # member of the joint to pass this legacy fixed-value check; the
+        # post-assignment joint validator then rejects any member mismatch.
         return None
     if "value" in declared or "fixed_value" in declared:
         expected = declared.get("value", declared.get("fixed_value"))
@@ -1145,11 +1112,110 @@ def _invalid_joint_evidence_reason(
     return ""
 
 
+def _invalid_value_provenance(spec: Any, declared: Mapping[str, Any]) -> str | None:
+    """Return one explicit source string for a schema invalid sentinel."""
+
+    for key in ("evidence", "source", "provenance", "reference"):
+        value = declared.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # Existing portable schemas keep the source citation on the input row
+    # rather than repeating it inside ``replacement``.  Keep that format
+    # valid while still rejecting a bare ``confirmed`` boolean with no source
+    # anywhere in the row.
+    for key in ("source", "reference"):
+        value = getattr(spec, key, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _invalid_joint_member_reason(
+    pattern: InterventionPattern,
+    replacement_values: Mapping[int, Any],
+    member: int,
+    schema: InputSchema,
+) -> str | None:
+    """Validate one final member against an explicit invalid-state source."""
+
+    spec = schema.spec(member)
+    declared = spec.replacement
+    if isinstance(declared, Mapping) and "invalid_value" in declared:
+        if declared.get("confirmed") is not True:
+            return f"invalid flag/value group has unconfirmed invalid_value at input {member}"
+        if _invalid_value_provenance(spec, declared) is None:
+            return f"invalid flag/value group lacks evidence provenance for input {member}"
+        expected = declared["invalid_value"]
+        if not _values_equal(replacement_values.get(member), expected):
+            return (
+                f"invalid flag/value group has an invalid sentinel mismatch at input {member}: "
+                f"expected {expected!r}"
+            )
+        return None
+
+    raw = pattern.metadata.get("invalid_joint_evidence")
+    if isinstance(raw, Mapping):
+        entry = _invalid_joint_evidence_entry(raw, schema, member)
+        if entry is None:
+            return f"invalid flag/value group lacks explicit confirmed evidence for input {member}"
+        if entry.get("confirmed") is not True:
+            return f"invalid flag/value group has unconfirmed evidence for input {member}"
+        provenance = entry.get(
+            "evidence",
+            entry.get("source", entry.get("provenance")),
+        )
+        if not isinstance(provenance, str) or not provenance.strip():
+            return f"invalid flag/value group lacks evidence provenance for input {member}"
+        expected = entry.get("invalid_value", entry.get("value"))
+        if expected is None:
+            return f"invalid flag/value group evidence lacks a value for input {member}"
+        if not _values_equal(replacement_values.get(member), expected):
+            return (
+                f"invalid flag/value group evidence value mismatch at input {member}: "
+                f"expected {expected!r}"
+            )
+        return None
+    return (
+        f"invalid flag/value group at input {member} requires a source-confirmed "
+        "invalid_value or explicit confirmed evidence"
+    )
+
+
+def _invalid_flag_candidate(
+    pattern: InterventionPattern,
+    spec: Any,
+    value: Any,
+) -> bool:
+    """Recognize an invalid flag after an explicitly requested clip."""
+
+    if _flag_is_invalid(value):
+        return True
+    if not (pattern.clip or bool(pattern.metadata.get("clip", False))):
+        return False
+    value_range = getattr(spec, "value_range", None)
+    if value_range is None or not isinstance(value, (int, float, np.integer, np.floating)):
+        return False
+    candidate = float(value)
+    if not np.isfinite(candidate):
+        return False
+    minimum, maximum = value_range
+    outside = (minimum is not None and candidate < minimum) or (
+        maximum is not None and candidate > maximum
+    )
+    if not outside:
+        return False
+    low = -np.inf if minimum is None else minimum
+    high = np.inf if maximum is None else maximum
+    return _flag_is_invalid(float(np.clip(candidate, low, high)))
+
+
 def _invalid_joint_reason(
     pattern: InterventionPattern,
     replacement_values: Mapping[int, Any],
     indices: tuple[int, ...],
     schema: InputSchema,
+    *,
+    validate_values: bool = True,
 ) -> str | None:
     """Require explicit confirmation before creating a flag-invalid joint state."""
 
@@ -1158,66 +1224,25 @@ def _invalid_joint_reason(
         if spec.value_type not in {"bool", "boolean"}:
             continue
         value = replacement_values.get(index)
-        is_invalid = _flag_is_invalid(value)
+        is_invalid = _invalid_flag_candidate(pattern, spec, value)
         related_values = _related_value_indices(schema, index)
         if not is_invalid or not related_values:
             continue
-        missing_values = sorted(related_values - set(indices))
+        group = _coupled_group(schema, index)
+        missing_values = sorted(group - set(indices))
         if missing_values:
             return (
                 f"invalid flag/value group at input {index} is missing related "
                 f"values {missing_values}"
             )
-        invalid_joint_confirmed = pattern.metadata.get("invalid_joint_confirmed") is True
-        if invalid_joint_confirmed:
-            group = related_values | {index}
-            source_failure: str | None = None
-            source_confirmed = True
-            for member in sorted(group):
-                declared = schema.spec(member).replacement
-                if not isinstance(declared, Mapping) or "invalid_value" not in declared:
-                    source_confirmed = False
-                    source_failure = (
-                        f"invalid flag/value group at input {index} lacks a "
-                        f"source-confirmed invalid_value for input {member}"
-                    )
-                    continue
-                if declared.get("confirmed") is not True:
-                    source_confirmed = False
-                    source_failure = (
-                        f"invalid flag/value group at input {index} has an "
-                        f"unconfirmed invalid_value at input {member}"
-                    )
-                    continue
-                expected = declared["invalid_value"]
-                if not _values_equal(replacement_values.get(member), expected):
-                    return (
-                        f"invalid flag/value group at input {index} has an "
-                        f"invalid sentinel mismatch at input {member}: "
-                        f"expected {expected!r}"
-                    )
-            if source_confirmed:
-                continue
-            evidence_reason = _invalid_joint_evidence_reason(
-                pattern, replacement_values, group, schema
+        if not validate_values:
+            continue
+        for member in sorted(group):
+            reason = _invalid_joint_member_reason(
+                pattern, replacement_values, member, schema
             )
-            if evidence_reason == "":
-                continue
-            return source_failure or evidence_reason or (
-                f"invalid flag/value group at input {index} requires "
-                "source-confirmed invalid_value or explicit confirmed evidence"
-            )
-        all_declared_confirmed = True
-        for coupled_index in related_values | {index}:
-            declared = schema.spec(coupled_index).replacement
-            if not isinstance(declared, Mapping) or declared.get("confirmed") is not True:
-                all_declared_confirmed = False
-                break
-        if not all_declared_confirmed:
-            return (
-                f"invalid flag/value group at input {index} requires "
-                "metadata.invalid_joint_confirmed=true or source-confirmed group replacements"
-            )
+            if reason is not None:
+                return reason
     return None
 
 
@@ -1353,27 +1378,28 @@ def apply_intervention(
                 f"pattern {pattern.pattern_id} has no replacement value for indices {missing}"
             )
 
-    invalid_joint_reason = _invalid_joint_reason(pattern, replacement_values, indices, schema)
+    # Check group membership before any assignment.  Value equality is checked
+    # again below against the values the model actually receives, after dtype
+    # conversion and optional clipping.
+    invalid_joint_reason = _invalid_joint_reason(
+        pattern,
+        replacement_values,
+        indices,
+        schema,
+        validate_values=False,
+    )
     if invalid_joint_reason is not None:
         if strict:
             raise InterventionError(invalid_joint_reason)
         return _skipped_result(source, pattern, indices, invalid_joint_reason)
 
     invalid_variant_indices: set[int] = set()
-    if pattern.metadata.get("invalid_joint_confirmed") is True:
-        for index in indices:
-            spec = schema.spec(index)
-            value = replacement_values.get(index)
-            is_invalid_flag = _is_bool_spec(spec) and _flag_is_invalid(value)
-            if not is_invalid_flag:
-                continue
-            group = _related_value_indices(schema, index) | {index}
-            if any(
-                isinstance(schema.spec(member).replacement, Mapping)
-                and "invalid_value" in schema.spec(member).replacement
-                for member in group
-            ) or isinstance(pattern.metadata.get("invalid_joint_evidence"), Mapping):
-                invalid_variant_indices.update(group)
+    for index in indices:
+        spec = schema.spec(index)
+        value = replacement_values.get(index)
+        is_invalid_flag = _is_bool_spec(spec) and _invalid_flag_candidate(pattern, spec, value)
+        if is_invalid_flag:
+            invalid_variant_indices.update(_coupled_group(schema, index) & set(indices))
 
     tolerance = _tolerance_map(pattern, indices)
     result = np.array(source, copy=True)
@@ -1460,6 +1486,16 @@ def apply_intervention(
                 meaningful_changed.append(index)
         else:
             no_op.append(index)
+    invalid_joint_reason = _invalid_joint_reason(
+        pattern,
+        applied_values,
+        indices,
+        schema,
+    )
+    if invalid_joint_reason is not None:
+        if strict:
+            raise InterventionError(invalid_joint_reason)
+        return _skipped_result(source, pattern, indices, invalid_joint_reason)
     return InterventionResult(
         observation=result,
         requested_indices=indices,

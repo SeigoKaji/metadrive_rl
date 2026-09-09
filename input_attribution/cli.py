@@ -393,6 +393,142 @@ def _reference_map(store: Any) -> dict[str, np.ndarray]:
     return _references(store)[0]
 
 
+def _runtime_failure_kind(value: Any) -> str | None:
+    """Classify explicit closed-loop execution failures for CLI assessment."""
+
+    token = str(value or "").strip().casefold().replace("-", "_")
+    if token in {
+        "failed",
+        "failure",
+        "error",
+        "runtime_error",
+        "runtime_failure",
+        "runtime_failed",
+        "not_evaluable_runtime_error",
+        "実行失敗",
+    }:
+        return "failed"
+    if token in {
+        "aborted",
+        "abort",
+        "interrupted",
+        "intervention_abort",
+        "not_evaluable_intervention_abort",
+        "実行失敗／中断",
+        "中断",
+    }:
+        return "aborted"
+    return None
+
+
+def _closed_loop_runtime_diagnostics(result: Any) -> dict[str, Any]:
+    """Return execution/assessment counts without judging natural outcomes.
+
+    The current worker exposes authoritative counts from ``as_dict``.  The
+    raw ``patterns`` episode list is retained only for a small legacy test
+    double; summary lists of unique states are deliberately not expanded into
+    invented episodes.
+    Natural terminal reasons (arrival, collision, road departure, horizon)
+    are never failures unless the saved execution/assessment status says so.
+    """
+
+    episodes: list[Mapping[str, Any]] = []
+    candidate = result.as_dict() if callable(getattr(result, "as_dict", None)) else result
+    payload: Mapping[str, Any] | None = candidate if isinstance(candidate, Mapping) else None
+    declared_counts = payload.get("counts") if isinstance(payload, Mapping) else None
+    if isinstance(declared_counts, Mapping) and any(
+        key in declared_counts
+        for key in ("failed_episode_count", "aborted_episode_count", "runtime_failure_count")
+    ):
+        def count(name: str) -> int:
+            try:
+                return max(0, int(declared_counts.get(name, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        failed = count("failed_episode_count")
+        aborted = count("aborted_episode_count")
+        completed = count("completed_episode_count")
+        return {
+            "episode_count": count("episode_count"),
+            "completed_episode_count": completed,
+            "failed_episode_count": failed,
+            "aborted_episode_count": aborted,
+            "runtime_failure_count": failed + aborted,
+            "execution_failure_count": count("execution_failure_count") or failed + aborted,
+            "unexpected_interruption_count": count("unexpected_interruption_count") or aborted,
+            "execution_status_counts": dict(payload.get("execution_status_counts", {}))
+            if isinstance(payload.get("execution_status_counts"), Mapping)
+            else {},
+            "assessment_status_counts": dict(payload.get("assessment_status_counts", {}))
+            if isinstance(payload.get("assessment_status_counts"), Mapping)
+            else {},
+            "assessment_status": "runtime_failure" if failed else "aborted" if aborted else "completed",
+            "counts": dict(declared_counts),
+        }
+    raw_patterns = getattr(result, "patterns", None)
+    if isinstance(raw_patterns, Mapping):
+        for values in raw_patterns.values():
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes, Mapping)):
+                episodes.extend(item for item in values if isinstance(item, Mapping))
+
+    failed = 0
+    aborted = 0
+    completed = 0
+    status_counts: dict[str, int] = {}
+    assessment_counts: dict[str, int] = {}
+    for episode in episodes:
+        execution = str(episode.get("execution_status") or "unknown")
+        assessment = str(episode.get("assessment_status") or "unknown")
+        status_counts[execution] = status_counts.get(execution, 0) + 1
+        assessment_counts[assessment] = assessment_counts.get(assessment, 0) + 1
+        kind = _runtime_failure_kind(episode.get("execution_status"))
+        if kind is None:
+            kind = _runtime_failure_kind(episode.get("assessment_status"))
+        if kind is None:
+            terminal = str(episode.get("terminal_reason") or "").strip().casefold().replace("-", "_")
+            if terminal == "runtime_error":
+                kind = "failed"
+            elif terminal == "intervention_abort":
+                kind = "aborted"
+        if kind == "failed":
+            failed += 1
+        elif kind == "aborted":
+            aborted += 1
+        elif str(episode.get("execution_status") or "").casefold() == "completed":
+            completed += 1
+
+    return {
+        "episode_count": len(episodes),
+        "completed_episode_count": completed,
+        "failed_episode_count": failed,
+        "aborted_episode_count": aborted,
+        "runtime_failure_count": failed + aborted,
+        "execution_status_counts": status_counts,
+        "assessment_status_counts": assessment_counts,
+        "assessment_status": "runtime_failure" if failed else "aborted" if aborted else "completed",
+        "counts": {
+            "episode_count": len(episodes),
+            "completed_episode_count": completed,
+            "failed_episode_count": failed,
+            "aborted_episode_count": aborted,
+            "runtime_failure_count": failed + aborted,
+            "required_experiment_failed": bool(failed + aborted),
+        },
+    }
+
+
+def _closed_loop_counts_line(diagnostics: Mapping[str, Any]) -> str:
+    """Render one stable machine-readable count line before a run path."""
+
+    return (
+        "closed-loop counts: "
+        f"completed={int(diagnostics.get('completed_episode_count', 0) or 0)}, "
+        f"failed={int(diagnostics.get('failed_episode_count', 0) or 0)}, "
+        f"aborted={int(diagnostics.get('aborted_episode_count', 0) or 0)}"
+    )
+
+
 def _run_closed_loop(
     store: Any,
     config: AnalysisConfig,
@@ -424,6 +560,44 @@ def _run_closed_loop(
         reference_contexts=contexts,
         reference_records=records,
     )
+    diagnostics = _closed_loop_runtime_diagnostics(result)
+    if diagnostics["runtime_failure_count"]:
+        failure_kind = "runtime failure" if diagnostics["failed_episode_count"] else "aborted execution"
+        message = (
+            f"closed-loop {failure_kind}: "
+            f"failed={diagnostics['failed_episode_count']}, "
+            f"aborted={diagnostics['aborted_episode_count']}, "
+            f"completed={diagnostics['completed_episode_count']}"
+        )
+        # Keep the saved analysis pointer and diagnostics, while separating
+        # execution state (failed) from the assessment label (runtime_failure
+        # or aborted).  A newer runtime may already have written a rich
+        # failed stage entry; preserve its counts/pattern pointer instead of
+        # replacing that evidence with a smaller CLI-shaped entry.
+        try:
+            current_status = analysis.read_json("status.json")
+        except (FileNotFoundError, OSError, ValueError):
+            current_status = {}
+        current_stage = current_status.get("stages", {}).get("closed_loop", {}) if isinstance(current_status, Mapping) else {}
+        if not isinstance(current_stage, Mapping) or str(current_stage.get("state", "")).casefold() != "failed":
+            result_payload = result.as_dict() if callable(getattr(result, "as_dict", None)) else {}
+            detail_counts = result_payload.get("counts") if isinstance(result_payload, Mapping) else None
+            status_details = dict(diagnostics)
+            status_details.update(
+                status=(result_payload.get("status") if isinstance(result_payload, Mapping) else None) or "partial_failure",
+                patterns=list(getattr(result, "patterns", {}) or {}),
+                counts=detail_counts if isinstance(detail_counts, Mapping) else diagnostics,
+            )
+            analysis.update_status(
+                "closed_loop",
+                "failed",
+                error=message,
+                execution_status="failed" if diagnostics["failed_episode_count"] else "aborted",
+                **status_details,
+            )
+        failure = CLIError(message)
+        failure.diagnostics = diagnostics
+        raise failure
     return result
 
 
@@ -450,6 +624,7 @@ def command_run(args: argparse.Namespace) -> int:
         return 1
     store = _new_store(config, "run", adapter, policy, schema, check_result)
     store.write_json("check.json", check_result.as_dict())
+    closed_loop_result: Any | None = None
     try:
         collect_reference(
             policy,
@@ -465,23 +640,41 @@ def command_run(args: argparse.Namespace) -> int:
         seal_reference(store)
         _run_offline(store, config, policy, schema)
         if config.closed_loop.get("enabled", True):
-            _run_closed_loop(store, config, adapter, policy, schema, args.patterns)
+            closed_loop_result = _run_closed_loop(store, config, adapter, policy, schema, args.patterns)
         from .reporting import generate_report
 
-        store.update_status("run", "success")
+        run_details: dict[str, Any] = {}
+        if closed_loop_result is not None:
+            closed_diagnostics = _closed_loop_runtime_diagnostics(closed_loop_result)
+            run_details.update(
+                status="success",
+                counts=closed_diagnostics.get("counts", closed_diagnostics),
+                closed_loop_assessment_status=closed_diagnostics.get("assessment_status"),
+            )
+        store.update_status("run", "success", **run_details)
         report = generate_report(store.run_dir)
         store.update_status("report", "success", files=[str(path) for path in report.files])
-        store.update_status("run", "success")
+        if closed_loop_result is not None:
+            print(_closed_loop_counts_line(_closed_loop_runtime_diagnostics(closed_loop_result)))
         print(store.run_dir)
         return 0
     except Exception as exc:
-        store.update_status("run", "failed", error=f"{type(exc).__name__}: {exc}")
+        failure_details: dict[str, Any] = {}
+        diagnostics = getattr(exc, "diagnostics", None)
+        if isinstance(diagnostics, Mapping):
+            failure_details.update(
+                counts=diagnostics.get("counts", diagnostics),
+                closed_loop_assessment_status=diagnostics.get("assessment_status"),
+            )
+        store.update_status("run", "failed", error=f"{type(exc).__name__}: {exc}", **failure_details)
         try:
             from .reporting import generate_report
             report = generate_report(store.run_dir)
             store.update_status("report", "success", files=[str(path) for path in report.files], partial=True)
         except Exception as report_exc:
             store.update_status("report", "failed", error=f"{type(report_exc).__name__}: {report_exc}")
+        if isinstance(diagnostics, Mapping):
+            print(_closed_loop_counts_line(diagnostics), file=sys.stderr)
         print(f"run failed: {type(exc).__name__}: {exc}; saved results: {store.run_dir}", file=sys.stderr)
         return 1
 
@@ -868,10 +1061,14 @@ def command_offline(args: argparse.Namespace) -> int:
 def command_closed_loop(args: argparse.Namespace) -> int:
     try:
         store, config, adapter, policy, schema = _load_existing(args)
-        _run_closed_loop(store, config, adapter, policy, schema, args.patterns)
+        result = _run_closed_loop(store, config, adapter, policy, schema, args.patterns)
+        print(_closed_loop_counts_line(_closed_loop_runtime_diagnostics(result)))
         print(store.run_dir)
         return 0
     except Exception as exc:
+        diagnostics = getattr(exc, "diagnostics", None)
+        if isinstance(diagnostics, Mapping):
+            print(_closed_loop_counts_line(diagnostics), file=sys.stderr)
         print(f"closed-loop failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
@@ -882,10 +1079,10 @@ def command_report(args: argparse.Namespace) -> int:
         from .reporting import generate_report
 
         result = generate_report(store.run_dir, output_dir=args.output_dir)
-        # An explicitly separate output is a read-only view of the old run;
-        # do not update its status or any other file in that run.
-        if args.output_dir is None:
-            store.update_status("report", "success", files=[str(path) for path in result.files])
+        # Report regeneration is a read-only view of the saved run even when
+        # the destination is the versioned ``reports/<id>`` directory chosen
+        # by the renderer.  The original status is evidence for this report
+        # and must not be rewritten as a side effect of reading it.
         print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2, default=str))
         return 0
     except Exception as exc:

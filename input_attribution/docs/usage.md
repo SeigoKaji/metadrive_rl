@@ -1,13 +1,13 @@
 # 実行方法
 
-解析用設定は学習用 TOML へ追加せず、`input_attribution/configs/` の解析設定として管理します。既存の仮想環境の Python を使い、SB3、PyTorch、MetaDrive を無条件に更新しません。現在の実走行確認用環境は `/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3`、この repository に保存した公式モデルは `/home/seigo/workspace/metadrive_rl/metadrive-rl-input-attribution/models/official_baseline.zip`（SHA256: `0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`）です。259 の公式接続では実モデルと実環境が必要です。MetaDriveなしの fake adapter では接続契約と保存形式だけを検証します。
+解析用設定は学習用 TOML へ追加せず、`input_attribution/configs/` の解析設定として管理します。既存の仮想環境の Python を使い、SB3、PyTorch、MetaDrive を無条件に更新しません。一般手順では利用する環境の Python を `PYTHON` に設定し、設定の `[model].path` を手元の学習済みモデルへ合わせます。259 の公式接続では実モデルと実環境が必要です。MetaDriveなしの fake adapter では接続契約と保存形式だけを検証します。`/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3` と `/home/seigo/workspace/metadrive_rl/metadrive-rl-input-attribution/models/official_baseline.zip`（SHA256: `0af58466f690f97c8e140261a5e1c8aa69a888eb0ec69c20425e551341c235db`）は過去の実走行検証環境を記録した値で、一般手順の固定パスではありません。
 
 ## 最短の実行
 
 Linux/Ubuntu（既存環境をそのまま使用）:
 
 ```bash
-PYTHON=/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3
+PYTHON=/path/to/existing/python
 $PYTHON -m input_attribution check --config input_attribution/configs/input_attribution_official_259_variants.toml
 $PYTHON -m input_attribution run --config input_attribution/configs/input_attribution_official_259_variants.toml
 ```
@@ -21,11 +21,19 @@ PowerShell:
 
 `run` は check、通常走行収集、①-A、設定で指定した①-B、主レポート生成を順に行います。`run` では③ IG は常に未実行（skipped）として残ります。設定の `[ig].enabled` は Captum 依存の利用可否を check するためだけの項目で、実際の IG は下記の `ig` サブコマンドを対象 episode/step と baseline とともに明示して実行します。check はモデル、設定、adapter、schema、入力次元・dtype・範囲・全 index の被覆、離散 Action、前処理、代表確率再現、対象レーン、パターンの解決状態を人間向けと JSON で出します。`input_attribution/schemas/custom_262_template.json` に未確定フィールドが残る設定は成功扱いにしません。
 
+## 終了コードと失敗の扱い
+
+CLIの終了コードは、0を要求した処理が完了した状態、1を必要な実験または検証が失敗した状態、2をparserの構文・引数エラー（またはトップレベルで分類できないCLIエラー）として扱います。`run` と `closed-loop` は標準出力・標準エラーと `status.json` に `completed`、`failed`、`aborted`、`runtime_failure` の件数を残します。pattern内の runtime failure は終了コード1になり、他のpatternで保存できた結果と失敗phase・理由・途中件数は同じrunへ保存されます。
+
+到達、衝突、道路逸脱、環境仕様上の自然終了は、実行が正常に進んだ記録として `completed` に含めます。no-op と明示条件外のskipもruntime failureには数えません。主要なmetric summaryは自然終了したepisodeだけを母数にし、failed・aborted・budget-censored episodeの値と実行状態は `diagnostic_metric_summary` と `execution_groups` に分けて保持します。missing telemetryやpartial measurementは0へ補完せず、failure phase、既知の測定件数、全体のunknown/partialとともに表示します。任意のIGが未実行でも、成功したA/Bの結果や終了状態は変更しません。
+
+`report` は保存済みrunを読むだけの再生成です。`--output-dir` の有無にかかわらず、元runの `status.json`、manifest、生データを更新せず、生成先へreport成果物だけを書き出します。失敗したstageの診断を表示するときも、同じrunの古い成功stageへ置き換えません。
+
 ## 部分実行と保存結果からの再解析
 
 ```bash
 # Linux（保存済み通常観測を使うコマンドは環境を起動しない）
-PYTHON=/home/seigo/workspace/metadrive_rl/metadrive-rl/.venv/bin/python3
+PYTHON=/path/to/existing/python
 $PYTHON -m input_attribution collect --config input_attribution/configs/input_attribution_official_259_variants.toml
 $PYTHON -m input_attribution offline --run-dir outputs/input_attribution/<experiment>/<model>/<run_id>
 $PYTHON -m input_attribution closed-loop --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> --patterns P00,P02_heading_neutral
@@ -43,6 +51,28 @@ $PYTHON -m input_attribution closed-loop --run-dir outputs/input_attribution/<ex
 # 任意 IG（Captum が利用可能な環境だけ）
 $PYTHON -m input_attribution ig --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> --episode 0 --steps 12,20 --baseline episode-0:0
 ```
+
+## 259 preset の主経路と B の選択
+
+新しい259次元の主経路は `input_attribution/configs/input_attribution_official_259_variants.toml` です。source-confirmed な型付き置換を `full_episode` へ適用します。旧 `input_attribution/configs/input_attribution_official_259.toml` と `input_attribution/configs/input_attribution_official_259_legacy_freeze.toml` は、初期 saved-reference 条件を再現するための過去設定です。旧設定を新 preset と同じ条件として扱ったり、既存 run の条件を上書きしたりしません。
+
+新 preset の標準 ①-B は15 patternで、速度・操舵・履歴はそれぞれ `P03_speed_reference`、`P03_steering_reference`、`P03_history_group_reference` を使います。`P03_speed_fixed_level`、`P03_steering_neutral`、`P03_history_group_neutral` などの `full_episode` 版は標準 B には含めず、追加診断として選択した場合だけ実行します。標準 B を259入力すべての全区間評価済みとは解釈しません。
+
+定義済み pattern の実行数を変更せず、追加診断を明示的に選択する例です。
+
+```bash
+# 新しい run を作り、選択した B を実行
+$PYTHON -m input_attribution run \
+  --config input_attribution/configs/input_attribution_official_259_variants.toml \
+  --patterns P00,P03_speed_fixed_level,P03_steering_neutral,P03_history_group_neutral
+
+# 保存済み run で選択した B だけを実行
+$PYTHON -m input_attribution closed-loop \
+  --run-dir outputs/input_attribution/<experiment>/<model>/<run_id> \
+  --patterns P00,P03_speed_fixed_level,P03_steering_neutral,P03_history_group_neutral
+```
+
+`run --patterns` と `closed-loop --patterns` は実行対象 B の選択です。動画の対象は `[video].patterns` で別に指定します。
 
 PowerShell では `.venv\Scripts\python.exe` と Windows のパス区切りを使います。IG の baseline 指定形式は設定と `--help` の表示を優先します。Captumを追加する場合も、既存環境へ無条件に更新せず、同梱の任意 requirements-ig と独立した仮想環境/一時 wheel を使って互換性を確認します。
 
@@ -68,7 +98,7 @@ outputs/input_attribution/<experiment>/<model>/<run_id>/
 
 動画を作る場合は設定の `video.enabled = true` と `video.patterns = ["P00", "P02_heading_neutral"]` を指定します。`video.patterns` は config に宣言した pattern ID のうち動画を保存するものだけを選ぶ配列で、未指定なら実行対象の全 pattern です。動画を全て無効にする場合は `video.enabled = false` とします。`closed-loop --patterns P00,P02_heading_neutral` は走行する介入 pattern の選択であり、動画選択とは別です。個別LiDAR全件などを動画の既定対象にしません。
 
-旧初期参照を再現する場合の設定例は `input_attribution/configs/input_attribution_official_259_legacy_freeze.toml` です。新しい全域variant設定 `input_attribution_official_259_variants.toml` と同じpattern条件として扱わず、レポートでも条件付き試験として区別します。
+旧初期参照を再現する場合は `input_attribution/configs/input_attribution_official_259.toml` または `input_attribution/configs/input_attribution_official_259_legacy_freeze.toml` を明示的に選びます。前者は旧公式構成、後者は初期 reference 条件を凍結した構成です。どちらも新しい全域variant設定 `input_attribution_official_259_variants.toml` と同じ pattern 条件として扱わず、レポートでも条件付き試験として区別します。
 
 ## レポートの読み方
 
