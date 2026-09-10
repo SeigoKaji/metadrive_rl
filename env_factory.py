@@ -13,8 +13,12 @@ if TYPE_CHECKING:
     from metadrive.envs import MetaDriveEnv
 
 
-def make_env(env_config: Mapping[str, object]) -> MetaDriveEnv:
-    """指定設定を適用した、wrapperなしのMetaDrive環境を返す。
+def make_env(
+    env_config: Mapping[str, object],
+    *,
+    lookahead_config: Mapping[str, object] | None = None,
+) -> gym.Env:
+    """指定設定を適用したraw MetaDrive環境、またはlookahead wrapperを返す。
 
     呼出元は解決済みTOMLのstage設定を明示して渡す。
     """
@@ -34,11 +38,26 @@ def make_env(env_config: Mapping[str, object]) -> MetaDriveEnv:
         # MetaDrive implementation remains byte-for-byte untouched.
         from start_lane_env import StartLaneMetaDriveEnv
 
-        return StartLaneMetaDriveEnv(config)
+        raw_env = StartLaneMetaDriveEnv(config)
+    else:
+        from metadrive.envs import MetaDriveEnv
 
-    from metadrive.envs import MetaDriveEnv
+        raw_env = MetaDriveEnv(config)
+    if lookahead_config is None:
+        return raw_env
 
-    return MetaDriveEnv(config)
+    # Keep the host factory responsible only for constructing the raw
+    # environment.  The optional package owns its adapter/wrapper boundary and
+    # receives the already resolved TOML values without a second mode switch.
+    try:
+        from lookahead_learning.adapter import wrap_lookahead_env
+
+        return wrap_lookahead_env(raw_env, **dict(lookahead_config))
+    except Exception:
+        # A failed optional-wrapper import or construction must not leave the
+        # just-created simulator alive in a worker process.
+        raw_env.close()
+        raise
 
 
 def make_training_env(
@@ -46,6 +65,7 @@ def make_training_env(
     seed: int,
     monitor_dir: Path | str,
     env_config: Mapping[str, object],
+    lookahead_config: Mapping[str, object] | None = None,
 ) -> gym.Env:
     """rank固有のMonitorログを持つ学習用環境を生成する。
 
@@ -54,6 +74,8 @@ def make_training_env(
         seed: Action/Observation spaceの乱数seedの基準値。
         monitor_dir: ``*.monitor.csv`` の保存先。
         env_config: MetaDriveへ渡す解決済みTOMLの環境設定。
+        lookahead_config: Optional resolved ``[lookahead]`` settings.  When
+            present, the lookahead wrapper is inserted before ``Monitor``.
 
     Returns:
         記録専用のSB3 ``Monitor`` で包んだMetaDrive環境。
@@ -69,7 +91,7 @@ def make_training_env(
     destination = Path(monitor_dir)
     destination.mkdir(parents=True, exist_ok=True)
 
-    env = make_env(env_config)
+    env = make_env(env_config, lookahead_config=lookahead_config)
     try:
         worker_seed = seed + rank
         env.action_space.seed(worker_seed)
@@ -86,15 +108,16 @@ def make_training_env(
 def make_evaluation_env(
     seed: int,
     env_config: Mapping[str, object],
-) -> MetaDriveEnv:
-    """評価用の単一raw環境を生成する。
+    lookahead_config: Mapping[str, object] | None = None,
+) -> gym.Env:
+    """評価用の単一環境を生成する。
 
     MetaDrive 0.4.3のtop-down記録はconstruction時のconfigではなく
     ``env.render(..., screen_record=True)`` で開始する。録画の有無は評価側の
     recorderが扱い、このfactoryには渡さない。
     """
 
-    env = make_env(env_config)
+    env = make_env(env_config, lookahead_config=lookahead_config)
     try:
         env.action_space.seed(seed)
         env.observation_space.seed(seed)

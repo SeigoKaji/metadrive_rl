@@ -34,6 +34,11 @@ class ExperimentProfile:
     training_config: Mapping[str, object]
     default_model_name: str
     evaluation_defaults: Mapping[str, object] = field(default_factory=dict)
+    # ``None`` means the ordinary raw MetaDrive environment.  An explicit
+    # ``[lookahead]`` table is retained as a resolved mapping so train/evaluate
+    # can pass the exact same wrapper settings to the shared environment
+    # factory.
+    lookahead_config: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +87,7 @@ _ROOT_KEYS = frozenset(
         "training",
         "evaluation",
         "environment",
+        "lookahead",
     }
 )
 _TRAINING_REQUIRED_KEYS = frozenset(
@@ -348,6 +354,19 @@ def _validate_environment(
     return validated
 
 
+def _validate_lookahead(value: object) -> dict[str, object] | None:
+    """Resolve ``[lookahead]`` through the portable package contract."""
+
+    if value is None:
+        return None
+    from lookahead_learning.checkpoint import resolve_lookahead_config
+
+    try:
+        return resolve_lookahead_config(value)
+    except ValueError as error:
+        raise ExperimentConfigError(str(error)) from error
+
+
 def _validate_evaluation_action_compatibility(
     environment: Mapping[str, object],
     location: str,
@@ -570,6 +589,7 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
     default_model_name = normalize_model_name(
         root.get("default_model_name", name), "default_model_name"
     )
+    lookahead_config = _validate_lookahead(root.get("lookahead"))
     training = _validate_training(_required_table(root, "training", "training"))
     if "model_name" not in training:
         training["model_name"] = default_model_name
@@ -612,6 +632,7 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
         training_config=training,
         default_model_name=default_model_name,
         evaluation_defaults=evaluation,
+        lookahead_config=lookahead_config,
     )
 
 

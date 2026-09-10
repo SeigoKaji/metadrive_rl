@@ -23,6 +23,10 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from env_factory import make_training_env
+from lookahead_learning.checkpoint import (
+    set_lookahead_model_metadata,
+    validate_lookahead_model_metadata,
+)
 from configs.experiment_config import (
     ExperimentConfigError,
     PPO_COMMON_SCALAR_KEYS,
@@ -288,6 +292,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     experiment = experiment_selection_from_args(args)
     profile = experiment.profile
     environment_config = profile.train_env_config
+    lookahead_config = profile.lookahead_config
     training_config = profile.training_config
     ppo_config = _resolved_ppo_config(args, training_config)
     scenario_start = int(environment_config["start_seed"])
@@ -315,6 +320,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             seed=args.seed,
             monitor_dir=MONITOR_LOG_DIR,
             env_config=environment_config,
+            lookahead_config=lookahead_config,
         )
         for rank in range(args.num_envs)
     ]
@@ -333,6 +339,10 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             device=args.device,
             tensorboard_log=str(TENSORBOARD_LOG_DIR),
         )
+        # Stable-Baselines3 serializes custom instance attributes in the PPO
+        # ZIP.  Store the resolved TOML values before saving so evaluation can
+        # reject same-shaped checkpoints made with different lookahead values.
+        set_lookahead_model_metadata(model, lookahead_config)
         actual_device = str(model.device)
         print(
             "training_start",
@@ -365,6 +375,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
 
         # Loading with the same VecEnv also checks the saved observation/action spaces.
         reloaded_model = PPO.load(str(model_path), env=train_env, device=args.device)
+        validate_lookahead_model_metadata(reloaded_model, lookahead_config)
         reload_device = str(reloaded_model.device)
         del reloaded_model
 
@@ -382,6 +393,9 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             "profile": experiment.name,
             "config_source": experiment.source_metadata(),
             "environment_config": dict(environment_config),
+            "lookahead": (
+                None if lookahead_config is None else dict(lookahead_config)
+            ),
             "profile_training_config": dict(training_config),
             "training": {
                 "policy": str(training_config["policy"]),

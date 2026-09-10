@@ -2,6 +2,8 @@
 
 MetaDrive 環境を Stable-Baselines3 の PPO で学習・評価するためのプロジェクトです。学習・評価などの Python コマンドは、この README があるプロジェクトルートで実行します。 `configs/official.toml` は、MetaDrive公式の Stable-Baselines3 サンプル相当の例です。
 
+前方注視を使う実験も、専用CLIではなく通常の `train.py` / `evaluate.py` に同じ TOML を渡して実行します。`[lookahead]` を省略するとbaseline、tableがあり `pp_weight = 0.0` なら注視点3値だけ、正値ならPP不一致ペナルティも追加します。詳しくは [lookahead_learning の手順](lookahead_learning/docs/README.md) を参照してください。
+
 ## 環境構築
 
 `requirements.txt` は `../metadrive` を editable install します。このリポジトリと `metadrive/` を同じ親ディレクトリの直下に配置してください。
@@ -63,6 +65,8 @@ python3 -m venv .venv
 - `configs/generalization.toml`: 手続き生成道路で学習し、別の scenario 範囲で評価する設定です。
 - `configs/example_experiment.toml`: 新しい実験を作るためのテンプレートです。
 - `configs/official_start_lane_return.toml`: reset 時の開始レーンを維持して到着することを目指す baseline です。
+- `configs/official_start_lane_return_lookahead.toml`: `lookahead_m = 6.0`、
+  `pp_weight = 0.0` の前方注視入力例です。
 - `configs/01_official_start_lane_return_idle_penalty.toml`: 低速 penalty の一要因実験です。
 - `configs/02_official_start_lane_return_progress_balance.toml`: 開始レーン中心 cost の係数を下げる一要因実験です。
 - `configs/03_official_start_lane_return_timeout_penalty.toml`: 純粋な時間切れ penalty の一要因実験です。

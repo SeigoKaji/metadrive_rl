@@ -88,3 +88,76 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     }
     assert resolved["n_steps"] == args.n_steps
     assert training_metadata["ppo_seed_argument"] is None
+
+
+def test_training_serializes_resolved_lookahead_config_into_ppo_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """active TOML値はPPO ZIPのcustom attributeと通常metadataへ届く。"""
+
+    source = canonical_config_path("official")
+    config_path = tmp_path / "lookahead.toml"
+    config_path.write_text(
+        source.read_text(encoding="utf-8")
+        + "\n[lookahead]\nlookahead_m = 6.0\npp_weight = 0.25\n",
+        encoding="utf-8",
+    )
+    captured_metadata: dict[str, object] = {}
+    saved_attributes: dict[str, object] = {}
+
+    class FakeVecEnv:
+        def __init__(self, factories: object) -> None:
+            self.factories = factories
+
+        def close(self) -> None:
+            pass
+
+    class FakePPO:
+        def __init__(self, _policy: str, _env: object, **_kwargs: object) -> None:
+            self.device = "cpu"
+            self.num_timesteps = 0
+
+        def learn(self, *, total_timesteps: int, log_interval: int) -> None:
+            del log_interval
+            self.num_timesteps = total_timesteps
+
+        def save(self, path: str) -> None:
+            saved_attributes.update(
+                {
+                    "lookahead_schema_version": self.lookahead_schema_version,
+                    "lookahead_config": self.lookahead_config,
+                }
+            )
+            Path(f"{path}.zip").write_bytes(b"fake PPO model")
+
+        @staticmethod
+        def load(*_args: object, **_kwargs: object) -> object:
+            return type("ReloadedPPO", (), {
+                "device": "cpu",
+                **saved_attributes,
+            })()
+
+    monkeypatch.setattr(train_module, "MODEL_DIR", tmp_path / "models")
+    monkeypatch.setattr(train_module, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(train_module, "MONITOR_LOG_DIR", tmp_path / "monitor")
+    monkeypatch.setattr(train_module, "TENSORBOARD_LOG_DIR", tmp_path / "tensorboard")
+    monkeypatch.setattr(train_module, "OUTPUT_DIR", tmp_path / "outputs")
+    monkeypatch.setattr(train_module, "SubprocVecEnv", FakeVecEnv)
+    monkeypatch.setattr(train_module, "PPO", FakePPO)
+    monkeypatch.setattr(
+        train_module,
+        "_write_json",
+        lambda _path, payload: captured_metadata.update(payload),
+    )
+
+    args = train_module.parse_args(["--config", str(config_path)])
+    model_path = train_module._run_training(args, tmp_path / "train.log")
+
+    expected = {"lookahead_m": 6.0, "pp_weight": 0.25}
+    assert saved_attributes == {
+        "lookahead_schema_version": 1,
+        "lookahead_config": expected,
+    }
+    assert captured_metadata["lookahead"] == expected
+    assert model_path.is_file()

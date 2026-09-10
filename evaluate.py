@@ -19,6 +19,7 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.utils import check_for_correct_spaces
 
 from env_factory import make_evaluation_env
+from lookahead_learning.checkpoint import validate_lookahead_model_metadata
 from evaluation_visualization import (
     ACTION_HISTORY_SECONDS,
     STEP_TELEMETRY_FIELDS,
@@ -127,6 +128,12 @@ def _resolve_log_path(path: Path | None, output_prefix: str) -> Path:
     if path is None:
         return _default_evaluation_log(output_prefix)
     return _resolve_project_path(path)
+
+
+def _host_env(env: Any) -> Any:
+    """Return the raw host below an optional Gymnasium lookahead wrapper."""
+
+    return getattr(env, "unwrapped", env)
 
 
 def _sha256_file(path: Path) -> str:
@@ -373,6 +380,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     experiment = experiment_selection_from_args(args)
     profile = experiment.profile
     environment_config = profile.evaluation_env_config
+    lookahead_config = profile.lookahead_config
     record_gif = bool(getattr(args, "record_gif", True))
     deterministic = bool(getattr(args, "deterministic", True))
     scenario_start = int(environment_config["start_seed"])
@@ -390,6 +398,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
 
     set_random_seed(args.seed)
     model = PPO.load(str(model_path), device=args.device)
+    validate_lookahead_model_metadata(model, lookahead_config)
     actual_device = str(model.device)
     run_dir = _evaluation_output_directory(experiment.name, args.output_prefix)
     _prepare_evaluation_output_directory(run_dir)
@@ -429,16 +438,18 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
             env = make_evaluation_env(
                 seed=args.seed,
                 env_config=environment_config,
+                lookahead_config=lookahead_config,
             )
+            host_env = _host_env(env)
             check_for_correct_spaces(env, model.observation_space, model.action_space)
             simulation_timing = derive_timing(
-                env.config,
+                host_env.config,
             )
             action_history_length = max(
                 1,
                 math.ceil(ACTION_HISTORY_SECONDS * simulation_timing.control_hz),
             )
-            horizon_value = env.config.get("horizon")
+            horizon_value = host_env.config.get("horizon")
             horizon = None if horizon_value is None else int(horizon_value)
 
             print(
@@ -456,7 +467,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                 # scenario範囲を先頭から一度ずつ走査し、ランダム抽選による重複を避ける。
                 scenario_seed = scenario_start + episode_number - 1
                 obs, reset_info = env.reset(seed=scenario_seed)
-                actual_scenario_seed = int(env.current_seed)
+                actual_scenario_seed = int(host_env.current_seed)
                 if actual_scenario_seed != scenario_seed:
                     raise RuntimeError(
                         "要求したscenarioと実際のscenarioが一致しません: "
@@ -484,7 +495,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
 
                 while True:
                     action, _state = model.predict(obs, deterministic=deterministic)
-                    decoded_action = decode_discrete_action(action, env.config)
+                    decoded_action = decode_discrete_action(action, host_env.config)
                     obs, reward, terminated, truncated, info = env.step(action)
                     step_reward = float(reward)
                     total_reward += step_reward
@@ -512,7 +523,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                         cumulative_reward=total_reward,
                         terminated=terminated_flag,
                         truncated=truncated_flag,
-                        road=read_runtime_road_metrics(env.agent),
+                        road=read_runtime_road_metrics(host_env.agent),
                         action_switch_count=switch_count,
                         action_switches_per_second=switches_per_second,
                     )
@@ -521,7 +532,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     speed_samples_m_s.append(float(telemetry["speed_m_s"]))
 
                     active_recorder.record_frame(
-                        env=env,
+                        env=host_env,
                         telemetry=telemetry,
                         switch_tracker=switch_tracker,
                     )
@@ -582,7 +593,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                 if target_lane_metrics is not None:
                     episode_result["target_lane"] = target_lane_metrics
                 episode_result["visualization"] = active_recorder.finalize(
-                    env=env,
+                    env=host_env,
                     timing=simulation_timing,
                     expected_frame_count=episode_length,
                 )
@@ -666,6 +677,9 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "config_source": experiment.source_metadata(),
         "output_directory": str(run_dir.resolve()),
         "environment_config": dict(environment_config),
+        "lookahead": (
+            None if lookahead_config is None else dict(lookahead_config)
+        ),
         "scenario_seed_range": {
             "start": scenario_start,
             "stop_exclusive": scenario_start + scenario_count,

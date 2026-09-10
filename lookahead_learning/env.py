@@ -8,9 +8,9 @@ returns the reference used by mode ``lookahead_obs_pp_reward``.  Both providers 
 be pure reads of the host state.  They are called once per state and are never
 used to alter the action.
 
-The wrapper requires an :class:`~lookahead_learning.adapter.ObservationContract` that
-was verified against the host.  Consequently a 259-wide upstream MetaDrive
-observation cannot be padded into the requested 262-wide schema.
+The wrapper requires an :class:`~lookahead_learning.adapter.ObservationContract`
+for the concrete host space.  The raw prefix remains opaque and is copied at
+its host-defined width ``D``; the lookahead observation is always ``D + 3``.
 """
 
 from __future__ import annotations
@@ -24,8 +24,6 @@ import gymnasium as gym
 import numpy as np
 
 from .adapter import (
-    AUGMENTED_OBS_DIM,
-    BASELINE_OBS_DIM,
     HostContractError,
     Mode,
     ObservationContract,
@@ -113,7 +111,11 @@ def _freeze_value(value: object) -> object:
             for key, item in sorted(value.items(), key=lambda item: str(item[0]))
         )
     if isinstance(value, np.ndarray):
-        return tuple(_freeze_value(item) for item in value.tolist())
+        # ``tolist()`` returns a scalar for a zero-dimensional ndarray, which
+        # is exactly what SB3 emits for a single Discrete action.  Recurse on
+        # the converted value so both scalar and vector arrays use the same
+        # immutable representation.
+        return _freeze_value(value.tolist())
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_value(item) for item in value)
     if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
@@ -673,11 +675,13 @@ class LookaheadEnv(gym.Wrapper):
     """Apply the requested observation mode and optional PP reward term.
 
     Args:
-        env: Existing raw 262-wide single-agent Gymnasium environment.
+        env: Existing single-agent Gymnasium environment with a one-dimensional
+            float32 observation of host-defined width ``D``.
         mode: ``baseline``, ``lookahead_obs``, or ``lookahead_obs_pp_reward``.  The
             legacy ``obs`` and ``obs_pp`` spellings are accepted and normalized.
-        contract: Host evidence for the raw observation schema.  It must be
-            semantic-verified; this prevents accidental 259/262 conflation.
+        contract: Observation space shape, dtype and finite Box bounds.  The
+            host prefix is opaque and remains unchanged in the augmented
+            ``D + 3`` observation.
         preview_provider: Required for ``lookahead_obs`` and
             ``lookahead_obs_pp_reward``.  It must return
             a mapping accepted by :meth:`PreviewState.from_object`.
@@ -705,11 +709,7 @@ class LookaheadEnv(gym.Wrapper):
         mode = normalize_mode(mode)
         if not isinstance(contract, ObservationContract):
             raise UnsupportedHostError(
-                "LookaheadEnv requires an ObservationContract built from host evidence"
-            )
-        if not contract.semantic_verified:
-            raise UnsupportedHostError(
-                "LookaheadEnv refuses a shape-only raw observation contract"
+                "LookaheadEnv requires an ObservationContract built from the host Box"
             )
         super().__init__(env)
         actual_space = getattr(env, "observation_space", None)
@@ -838,7 +838,7 @@ class LookaheadEnv(gym.Wrapper):
         preview: PreviewState | None = None
         pp: PPReference | None = None
         # A baseline run may receive a provider solely for common geometry
-        # diagnostics.  It still returns the raw 262-vector and host reward;
+        # diagnostics.  It still returns the raw host vector and host reward;
         # the provider is only read once to produce the shared snapshot.
         if self._preview_provider is not None:
             assert self._preview_provider is not None
@@ -949,9 +949,11 @@ class LookaheadEnv(gym.Wrapper):
         namespace: dict[str, object] = {
             "run": self._run_id,
             "mode": self._mode,
-            "raw_observation_dim": BASELINE_OBS_DIM,
+            "raw_observation_dim": self._contract.shape[0],
             "observation_dim": (
-                BASELINE_OBS_DIM if self._mode == "baseline" else AUGMENTED_OBS_DIM
+                self._contract.shape[0]
+                if self._mode == "baseline"
+                else self._contract.shape[0] + 3
             ),
             "decision": post_snapshot.decision,
             "t_seconds": post_snapshot.t_seconds,
@@ -1349,38 +1351,6 @@ class LookaheadEnv(gym.Wrapper):
     def close(self):
         return self.env.close()
 
-
-def make_preview_env(
-    env: gym.Env,
-    *,
-    mode: Mode,
-    contract: ObservationContract,
-    preview_provider: PreviewProvider | None = None,
-    pp_provider: PPProvider | None = None,
-    pp_weight: float | None = None,
-    applied_action_reader: AppliedActionReader | None = None,
-    applied_steering_reader: AppliedSteeringReader | None = None,
-    dt_reader: DtReader | None = None,
-    state_reader: StateReader | None = None,
-    run_id: str = "",
-) -> LookaheadEnv:
-    """Convenience factory kept separate from the host's raw ``make_env``."""
-
-    return LookaheadEnv(
-        env,
-        mode=mode,
-        contract=contract,
-        preview_provider=preview_provider,
-        pp_provider=pp_provider,
-        pp_weight=pp_weight,
-        applied_action_reader=applied_action_reader,
-        applied_steering_reader=applied_steering_reader,
-        dt_reader=dt_reader,
-        state_reader=state_reader,
-        run_id=run_id,
-    )
-
-
 __all__ = [
     "AppliedActionReader",
     "AppliedSteeringReader",
@@ -1392,5 +1362,4 @@ __all__ = [
     "PreviewSnapshot",
     "PreviewState",
     "StateReader",
-    "make_preview_env",
 ]

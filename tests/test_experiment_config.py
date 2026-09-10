@@ -20,6 +20,7 @@ from configs.experiment_config import (
     select_experiment,
 )
 from evaluate import parse_args as parse_evaluation_args
+from lookahead_learning.checkpoint import LOOKAHEAD_DEFAULTS
 from project_paths import PROJECT_ROOT
 from train import parse_args as parse_training_args
 
@@ -300,6 +301,63 @@ def test_loader_deep_merges_common_environment_and_records_source(
         "log_file": "logs/custom_evaluate.log",
         "deterministic": False,
     }
+
+
+def test_loader_resolves_present_lookahead_table_and_keeps_absent_table_disabled(
+    tmp_path: Path,
+) -> None:
+    """[lookahead]の存在だけがwrapperを有効化し、値は解決済みで残る。"""
+
+    off_dir = tmp_path / "off"
+    off_dir.mkdir()
+    without_table = load_experiment_config(_write_config(off_dir))
+    assert without_table.profile.lookahead_config is None
+
+    on_dir = tmp_path / "on"
+    on_dir.mkdir()
+    with_table = _write_config(
+        on_dir,
+        VALID_TOML + "\n[lookahead]\nlookahead_m = 6.0\npp_weight = 0.0\n",
+    )
+    selection = load_experiment_config(with_table)
+    assert selection.profile.lookahead_config == {
+        "lookahead_m": 6.0,
+        "pp_weight": 0.0,
+    }
+
+    defaults_dir = tmp_path / "defaults"
+    defaults_dir.mkdir()
+    empty_table = _write_config(defaults_dir, VALID_TOML + "\n[lookahead]\n")
+    assert load_experiment_config(empty_table).profile.lookahead_config == LOOKAHEAD_DEFAULTS
+
+
+@pytest.mark.parametrize(
+    ("lookahead_table", "match"),
+    [
+        ("unknown = 1", "lookahead: 未対応のkeyがあります: unknown"),
+        ("lookahead_m = 0", "lookahead.lookahead_m"),
+        ("lookahead_m = -1", "lookahead.lookahead_m"),
+        ("lookahead_m = true", "lookahead.lookahead_m"),
+        ("lookahead_m = \"6.0\"", "lookahead.lookahead_m"),
+        ("lookahead_m = nan", "lookahead.lookahead_m"),
+        ("lookahead_m = inf", "lookahead.lookahead_m"),
+        ("pp_weight = -0.1", "lookahead.pp_weight"),
+        ("pp_weight = true", "lookahead.pp_weight"),
+        ("pp_weight = \"0.0\"", "lookahead.pp_weight"),
+        ("pp_weight = nan", "lookahead.pp_weight"),
+        ("pp_weight = inf", "lookahead.pp_weight"),
+    ],
+)
+def test_loader_rejects_invalid_lookahead_settings(
+    tmp_path: Path,
+    lookahead_table: str,
+    match: str,
+) -> None:
+    """lookahead値は有限数の範囲と閉じたkey集合を守る。"""
+
+    path = _write_config(tmp_path, VALID_TOML + f"\n[lookahead]\n{lookahead_table}\n")
+    with pytest.raises(ExperimentConfigError, match=match):
+        load_experiment_config(path)
 
 
 def test_loader_resolves_optional_ppo_scalars_to_sb3_defaults(tmp_path: Path) -> None:

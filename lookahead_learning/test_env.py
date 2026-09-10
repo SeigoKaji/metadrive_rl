@@ -7,7 +7,6 @@ module is imported and no existing project file is modified by these tests.
 from __future__ import annotations
 
 import math
-from pathlib import Path
 import unittest
 
 import gymnasium as gym
@@ -15,39 +14,14 @@ import numpy as np
 
 from .adapter import (
     ActionContract,
-    HostAdapter,
+    MetaDrivePreviewProvider,
     ObservationContract,
     UnsupportedHostError,
     build_fixed_navigation_route,
     navigation_lane_sequence,
+    wrap_lookahead_env,
 )
 from .env import LookaheadEnv
-
-
-def _evidence() -> list[dict[str, object]]:
-    return [
-        {
-            "index": 259,
-            "name": "start_lane_lateral_offset",
-            "meaning": "verified start-lane lateral offset",
-            "encoding": "host state observation encoding",
-            "source": "test verified host contract",
-        },
-        {
-            "index": 260,
-            "name": "start_lane_heading_error",
-            "meaning": "verified start-lane heading error",
-            "encoding": "host state observation encoding",
-            "source": "test verified host contract",
-        },
-        {
-            "index": 261,
-            "name": "start_lane_reference_valid",
-            "meaning": "verified start-lane reference validity",
-            "encoding": "host state observation encoding",
-            "source": "test verified host contract",
-        },
-    ]
 
 
 class FakeVehicle:
@@ -67,13 +41,15 @@ class FakeRawEnv(gym.Env):
     def __init__(
         self,
         *,
+        observation_dim: int = 262,
         terminal_after: int | None = None,
         truncated_after: int | None = None,
         target_valid: bool = True,
     ) -> None:
+        self.observation_dim = int(observation_dim)
         self.observation_space = gym.spaces.Box(
-            low=np.full((262,), -2.0, dtype=np.float32),
-            high=np.full((262,), 3.0, dtype=np.float32),
+            low=np.full((self.observation_dim,), -2.0, dtype=np.float32),
+            high=np.full((self.observation_dim,), 3.0, dtype=np.float32),
             dtype=np.float32,
         )
         self.action_space = gym.spaces.Discrete(9)
@@ -107,7 +83,7 @@ class FakeRawEnv(gym.Env):
         self.vehicle.current_action = np.array([0.0, 0.0], dtype=np.float32)
         self.vehicle.position[:] = (0.0, 0.0, 0.0)
         self.vehicle.heading_theta = 0.0
-        observation = np.full((262,), 0.25, dtype=np.float32)
+        observation = np.full((self.observation_dim,), 0.25, dtype=np.float32)
         return observation, {
             "raw_reset": self.reset_calls,
             "scenario_seed": self.current_seed,
@@ -120,6 +96,11 @@ class FakeRawEnv(gym.Env):
 
     def step(self, action):
         self.step_calls += 1
+        # SB3 emits a zero-dimensional ndarray for a scalar Discrete action;
+        # the host decoder receives its scalar value while the wrapper still
+        # records the original action object.
+        if isinstance(action, np.ndarray) and action.ndim == 0:
+            action = action.item()
         steering, throttle = self.action_contract.decode(action)
         self.vehicle.current_action = np.array(
             [steering, throttle], dtype=np.float32
@@ -127,7 +108,7 @@ class FakeRawEnv(gym.Env):
         self.vehicle.position[0] = float(self.step_calls)
         self.vehicle.heading_theta = 0.02 * self.step_calls
         self.vehicle.speed = 1.0 + self.step_calls
-        observation = np.full((262,), 0.5, dtype=np.float32)
+        observation = np.full((self.observation_dim,), 0.5, dtype=np.float32)
         terminated = (
             self.terminal_after is not None
             and self.step_calls >= self.terminal_after
@@ -208,7 +189,6 @@ class PPProbe:
 def _contract(raw: FakeRawEnv) -> ObservationContract:
     return ObservationContract.from_space(
         raw.observation_space,
-        feature_evidence=_evidence(),
         source="lookahead_learning.test_env",
     )
 
@@ -224,6 +204,64 @@ def _state(env: FakeRawEnv) -> dict[str, object]:
 
 
 class ObservationWrapperTests(unittest.TestCase):
+    def test_scalar_numpy_action_is_recorded_without_freeze_error(self) -> None:
+        raw = FakeRawEnv()
+        wrapped = LookaheadEnv(
+            raw,
+            mode="lookahead_obs",
+            contract=_contract(raw),
+            preview_provider=PreviewProbe(),
+            state_reader=_state,
+        )
+        wrapped.reset(seed=17)
+        _, reward, terminated, truncated, info = wrapped.step(np.asarray(5))
+        self.assertEqual(reward, 2.0)
+        self.assertFalse(terminated)
+        self.assertFalse(truncated)
+        self.assertEqual(info["lookahead_learning"]["action_env"], 5)
+
+    def test_259_wide_host_is_augmented_without_padding(self) -> None:
+        raw = FakeRawEnv(observation_dim=259)
+        wrapped = LookaheadEnv(
+            raw,
+            mode="lookahead_obs",
+            contract=_contract(raw),
+            preview_provider=PreviewProbe(),
+            state_reader=_state,
+        )
+        initial, _ = wrapped.reset(seed=13)
+        self.assertEqual(initial.shape, (262,))
+        np.testing.assert_array_equal(initial[:259], np.full(259, 0.25, np.float32))
+        next_observation, reward, *_ = wrapped.step(5)
+        self.assertEqual(next_observation.shape, (262,))
+        np.testing.assert_array_equal(
+            next_observation[:259], np.full(259, 0.5, np.float32)
+        )
+        self.assertEqual(reward, 2.0)
+
+    def test_adapter_wrap_uses_toml_parameters_and_host_width(self) -> None:
+        raw = FakeRawEnv()
+        wrapped = wrap_lookahead_env(raw, lookahead_m=6.0, pp_weight=0.0)
+        self.assertIsInstance(wrapped, LookaheadEnv)
+        self.assertEqual(wrapped.mode, "lookahead_obs")
+        self.assertEqual(wrapped.contract.shape, (262,))
+        self.assertEqual(wrapped.observation_space.shape, (265,))
+        self.assertEqual(raw.reset_calls, 0)
+
+    def test_adapter_wrap_rejects_zero_lookahead_distance(self) -> None:
+        with self.assertRaises(ValueError):
+            wrap_lookahead_env(FakeRawEnv(), lookahead_m=0.0, pp_weight=0.0)
+
+    def test_adapter_wrap_selects_pp_mode_for_positive_weight(self) -> None:
+        wrapped = wrap_lookahead_env(
+            FakeRawEnv(),
+            lookahead_m=6.0,
+            pp_weight=0.25,
+        )
+        self.assertEqual(wrapped.mode, "lookahead_obs_pp_reward")
+        self.assertEqual(wrapped.pp_weight, 0.25)
+        self.assertEqual(wrapped.observation_space.shape, (265,))
+
     def test_obs_preserves_raw_prefix_and_uses_one_transition(self) -> None:
         raw = FakeRawEnv()
         preview = PreviewProbe()
@@ -322,7 +360,7 @@ class ObservationWrapperTests(unittest.TestCase):
         self.assertTrue(namespace["preview_metrics_available"])
         self.assertIsNone(namespace["pp_valid"])
 
-    def test_sb3_check_env_accepts_fake_verified_262_wrapper(self) -> None:
+    def test_sb3_check_env_accepts_generic_host_wrapper(self) -> None:
         from stable_baselines3.common.env_checker import check_env
 
         raw = FakeRawEnv()
@@ -601,37 +639,50 @@ class ObservationWrapperTests(unittest.TestCase):
 
 
 class ContractAndNavigationTests(unittest.TestCase):
-    def test_host_factory_receives_deep_copied_nested_config(self) -> None:
-        original = {"nested": {"values": [1, {"keep": True}]}}
+    def test_provider_passes_lookahead_distance_to_geometry(self) -> None:
+        lane = StraightLane((0.0, 0.0), (20.0, 0.0), lane_index=("A", "B", 0))
+        navigation = FakeNavigation(("A", "B"), {"A": {"B": [lane]}})
+        vehicle = FakeVehicle()
+        vehicle.navigation = navigation
+        env = type("Env", (), {"agents": {"agent0": vehicle}})()
 
-        def mutating_factory(config):
-            config["nested"]["values"].append(2)
-            config["nested"]["values"][1]["keep"] = False
-            return config
+        short = MetaDrivePreviewProvider(lookahead_m=3.0)
+        long = MetaDrivePreviewProvider(lookahead_m=6.0)
+        short.reset(env)
+        long.reset(env)
+        short_result = short(env)
+        long_result = long(env)
+        self.assertTrue(short_result["preview_valid"])
+        self.assertTrue(long_result["preview_valid"])
+        self.assertAlmostEqual(short_result["s_goal_m"], 3.0)
+        self.assertAlmostEqual(long_result["s_goal_m"], 6.0)
+        self.assertNotEqual(short_result["q_xy"], long_result["q_xy"])
 
-        adapter = HostAdapter(
-            project_root=Path.cwd(),
-            _factory=mutating_factory,
-        )
-        returned = adapter.make_raw_env(original)
-        self.assertEqual(returned["nested"]["values"][-1], 2)
-        self.assertEqual(original, {"nested": {"values": [1, {"keep": True}]}})
+    def test_host_width_is_generic_and_prefix_is_preserved(self) -> None:
+        for width in (259, 262):
+            space = gym.spaces.Box(
+                low=np.full(width, -2.0, dtype=np.float32),
+                high=np.full(width, 3.0, dtype=np.float32),
+                dtype=np.float32,
+            )
+            contract = ObservationContract.from_space(space)
+            # Keep values inside this test Box while retaining a distinct
+            # prefix value at every position.
+            raw = np.linspace(-1.0, 2.0, width, dtype=np.float32)
+            augmented = contract.append_preview(raw, (0.2, 0.8, 1.0))
+            self.assertEqual(contract.shape, (width,))
+            self.assertEqual(contract.augmented_space().shape, (width + 3,))
+            np.testing.assert_array_equal(augmented[:width], raw)
+            np.testing.assert_allclose(augmented[width:], (0.2, 0.8, 1.0))
 
-    def test_shape_only_and_legacy_259_are_rejected(self) -> None:
-        shape_only = gym.spaces.Box(
-            low=np.zeros(262, dtype=np.float32),
-            high=np.ones(262, dtype=np.float32),
+    def test_non_vector_observation_is_rejected(self) -> None:
+        image = gym.spaces.Box(
+            low=np.zeros((2, 2), dtype=np.float32),
+            high=np.ones((2, 2), dtype=np.float32),
             dtype=np.float32,
         )
         with self.assertRaises(UnsupportedHostError):
-            ObservationContract.from_space(shape_only)
-        legacy = gym.spaces.Box(
-            low=np.zeros(259, dtype=np.float32),
-            high=np.ones(259, dtype=np.float32),
-            dtype=np.float32,
-        )
-        with self.assertRaises(UnsupportedHostError):
-            ObservationContract.from_space(legacy)
+            ObservationContract.from_space(image)
 
     def test_nonzero_discrete_start_is_rejected(self) -> None:
         raw = FakeRawEnv()
