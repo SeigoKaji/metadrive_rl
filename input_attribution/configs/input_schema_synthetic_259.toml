@@ -1,0 +1,10 @@
+schema_version = "input_attribution.schema.v1"
+schema_id = "synthetic_259_contract"
+generator = "synthetic_259_contract"
+dimension = 259
+dtype = "float32"
+verified = true
+real_host_verified = false
+
+# Artificial SyntheticEnv rows for the dependency-light demo.  They do not
+# carry MetaDrive road, navigation, control, or LiDAR meanings.

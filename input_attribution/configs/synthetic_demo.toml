@@ -1,0 +1,29 @@
+# Dependency-light synthetic N=2 demo.  Its data belongs under a synthetic
+# output directory and must never be mixed with an official MetaDrive run.
+backend = "synthetic"
+model_path = "synthetic://softmax"
+schema = "synthetic_259_contract"
+output_dir = "outputs/input_attribution/demo/synthetic"
+base_main_sha = "7849aad80ac353fd616c1a1398c11dd3497eed05"
+scenario_seed = 5
+policy_seed = 0
+horizon = 127
+record_gif = true
+deterministic = true
+synthetic_dimension = 259
+synthetic_steps = 127
+synthetic_natural_end_step = 50
+synthetic_action_count = 9
+fixed_value = -1.0
+
+[[patterns]]
+id = "P01"
+name = "synthetic_features_prefix"
+indices = [0, 1]
+fixed_value = -1.0
+
+[[patterns]]
+id = "P02"
+name = "synthetic_features_heading_slot"
+indices = [2]
+fixed_value = -1.0

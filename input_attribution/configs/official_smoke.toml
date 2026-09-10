@@ -1,0 +1,25 @@
+# Two-pattern official MetaDrive smoke configuration.
+backend = "metadrive"
+model_path = "models/official_baseline.zip"
+environment_config = "configs/official.toml"
+schema = "input_schema_259.toml"
+output_dir = "outputs/input_attribution/official_smoke"
+base_main_sha = "7849aad80ac353fd616c1a1398c11dd3497eed05"
+scenario_seed = 5
+policy_seed = 5
+horizon = 500
+record_gif = true
+deterministic = true
+fixed_value = -1.0
+
+[[patterns]]
+id = "P01"
+name = "road_edges"
+indices = [0, 1]
+fixed_value = -1.0
+
+[[patterns]]
+id = "P02"
+name = "lane_heading"
+indices = [2]
+fixed_value = -1.0

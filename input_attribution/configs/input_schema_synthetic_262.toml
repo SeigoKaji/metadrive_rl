@@ -1,0 +1,10 @@
+schema_version = "input_attribution.schema.v1"
+schema_id = "synthetic_262_contract"
+generator = "synthetic_262_contract"
+dimension = 262
+dtype = "float32"
+verified = true
+real_host_verified = false
+
+# This generated schema is for the dependency-light SyntheticEnv contract
+# test only.  It makes no claim about a real MetaDrive/host observation.

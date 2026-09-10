@@ -1,0 +1,28 @@
+# T13 synthetic 262-wide contract test.  These names and positions are
+# artificial and do not verify any real host environment.
+backend = "synthetic"
+model_path = "synthetic://softmax"
+schema = "synthetic_262_contract"
+output_dir = "outputs/input_attribution/demo/synthetic_262"
+base_main_sha = "7849aad80ac353fd616c1a1398c11dd3497eed05"
+scenario_seed = 5
+policy_seed = 0
+horizon = 127
+record_gif = false
+deterministic = true
+synthetic_dimension = 262
+synthetic_steps = 127
+synthetic_action_count = 9
+fixed_value = -1.0
+
+[[patterns]]
+id = "SYNTHETIC_CHECK_01"
+name = "synthetic_features_prefix"
+indices = [0, 1, 2]
+fixed_value = -1.0
+
+[[patterns]]
+id = "SYNTHETIC_CHECK_02"
+name = "synthetic_features_suffix"
+indices = [259, 260, 261]
+fixed_value = -1.0

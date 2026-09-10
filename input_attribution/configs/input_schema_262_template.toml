@@ -1,0 +1,10 @@
+schema_version = "input_attribution.schema.v1"
+schema_id = "host_262_migration_template"
+generator = "host_262_migration_template"
+dimension = 262
+dtype = "float32"
+verified = false
+
+# All 262 rows are unverified placeholders.  The target host must supply the
+# position/order, meaning, normalization, reference lane, and valid flag for
+# every row.  D=262 alone does not establish a 259+3 layout.

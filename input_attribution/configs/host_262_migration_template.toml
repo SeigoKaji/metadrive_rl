@@ -1,0 +1,26 @@
+# Explicit host-porting checklist.  This is not a verified real 262 schema.
+backend = "metadrive"
+model_path = "models/host_262_model.zip"
+schema = "input_schema_262_template.toml"
+output_dir = "outputs/input_attribution/host_262_migration"
+base_main_sha = "7849aad80ac353fd616c1a1398c11dd3497eed05"
+scenario_seed = 5
+policy_seed = 5
+horizon = 127
+record_gif = false
+deterministic = true
+fixed_value = -1.0
+
+# Replace this table with the target host's actual environment settings.
+[environment_config]
+host_contract = "REQUIRED: inspect target environment"
+observation_dim = 262
+
+# Patterns must be supplied after the target host verifies index order.  The
+# example below is deliberately a single explicit test pattern, not a claim
+# that indices 0 and 1 have MetaDrive's road-edge meaning on the host.
+[[patterns]]
+id = "HOST_CHECK_01"
+name = "replace_after_host_schema_review"
+indices = [0]
+fixed_value = -1.0

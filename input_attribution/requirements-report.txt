@@ -1,0 +1,4 @@
+# Dependencies for ``python -m input_attribution report`` only.
+# MetaDrive, Stable-Baselines3, and PyTorch are intentionally not required.
+Pillow>=10
+matplotlib>=3.7
