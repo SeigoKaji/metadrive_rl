@@ -1,243 +1,177 @@
 # 移植手順
 
-この追加モジュールは、既存のMetaDriveホストのルートへ
-`lookahead_learning/`を置いて使います。ホストの環境・観測・assetsをこの
-モジュールから作り直すことはありません。前方注視の仕様は
-[`methods.md`](methods.md)、文書一覧は[`README.md`](README.md)にあります。
+lookahead_learning は既存のMetaDriveホストへ追加する小さなruntimeです。
+移植先の start_lane_env.py にあるStartLane系Subclassの入力生成、reward_function、
+終了条件、Action適用を基底Envとしてそのまま使い、その外側にLookaheadEnvを
+compositionで置きます。既存Subclassを書き換えたり、基底の観測・報酬を再実装したり、
+observe/stepをwrapperから繰り返し呼び出したりしません。
 
-## コピー後の配置
+## 配布するフォルダ
 
-コピー元のcheckoutにある`lookahead_learning/`の直下の`.py` 17個を、
-移植先ホストのルート直下へコピーします。移植先には、ホスト側の3個の
-Pythonファイルと`configs`のPythonファイル、使用するTOMLも必要です。
+移植元から lookahead_learning/ フォルダを移植先rootへ置きます。本番の最小runtimeは
+次の5ファイルです。
 
-コピー元からコピーする対象は、次の1行の関係です。
+~~~text
+lookahead_learning/
+├── __init__.py
+├── checkpoint.py
+├── adapter.py
+├── env.py
+└── geometry.py
+~~~
 
-```text
-<source checkout>/lookahead_learning/*.py  →  <destination host root>/lookahead_learning/
-```
+移植後の契約を確認する軽量テストを同梱する場合は、次の3ファイルを追加します。
 
-コピー後の移植先は次のtreeになります。
+~~~text
+lookahead_learning/
+├── test_checkpoint.py
+├── test_env.py
+└── test_geometry.py
+~~~
 
-```text
-<destination host root>/
-├── env_factory.py                         (既存ホスト)
-├── start_lane_env.py                      (既存ホスト)
-├── project_paths.py                       (既存ホスト)
-├── configs/
-│   ├── __init__.py                         (既存ホスト)
-│   ├── experiment_config.py                (既存ホスト)
-│   └── official_start_lane_return.toml    (選択する設定)
-└── lookahead_learning/
-    ├── __init__.py
-    ├── __main__.py
-    ├── adapter.py
-    ├── checkpoint.py
-    ├── diagnostics.py
-    ├── env.py
-    ├── geometry.py
-    ├── portability.py
-    ├── runner.py
-    ├── telemetry.py
-    ├── test_checkpoint.py
-    ├── test_env.py
-    ├── test_geometry.py
-    ├── test_portability.py
-    ├── test_runner.py
-    ├── test_telemetry.py
-    ├── tests.py
-    └── docs/                                (読解用、任意)
-        ├── README.md
-        ├── methods.md
-        ├── run.md
-        ├── porting.md
-        └── copilot_porting_prompt.md
-```
+docsは読み物として任意です。診断や比較のための補助機能は通常の学習・評価に
+必要ありません。生成済みの
+outputs、models、logs、assets、bytecodeも移植しません。
 
-実行に必要なファイルの最小構成は、上記17個の追加モジュール、ホスト側の
-`env_factory.py`・`start_lane_env.py`・`project_paths.py`、
-`configs/__init__.py`・`configs/experiment_config.py`、そして選択したTOML
-です。これはファイルの最小構成であり、実行には監査済みPython依存ライブラリと
-MetaDrive assetsが別途すでに必要です。読み物としては、
-`lookahead_learning/docs/`内の`README.md`・`methods.md`・`run.md`・
-`porting.md`・`copilot_porting_prompt.md`の5つのMarkdownを推奨しますが、これらは実行の最小構成には含めません。
-GitHub Copilotへ移植作業を依頼する場合は、[移植依頼プロンプト](copilot_porting_prompt.md)を使えます。
+コピー元と移植先の例です。
 
-`__pycache__/`、その他のbytecode、`outputs/`、`models/`、`logs/`、
-MetaDriveの`assets/`はこのコピーに含めません。チェックポイントを持ち込む
-場合だけは、下の「checkpointを移す場合」の規則に従ってください。
+~~~bash
+SOURCE_ROOT=/path/to/metadrive_rl-lookahead
+HOST_ROOT=/path/to/metadrive-host
+cp -R "$SOURCE_ROOT/lookahead_learning" "$HOST_ROOT/"
+~~~
 
-## ファイルをコピーする
+このフォルダには本番runtime 5ファイル、任意の契約テスト3ファイル、任意のdocsが
+含まれます。必要なファイルだけを選ぶ場合でも、同じlookahead_learning/の中から
+runtimeとテストをコピーします。
 
-Linux/macOSのシェルでは、コピー元と移植先を明示して、package直下の`.py`
-だけをコピーします。パスに空白があっても引用符で囲めば動きます。
+外部の configs/、train.py、evaluate.py、env_factory.py、start_lane_env.py をこの
+フォルダからコピーしません。移植先の既存ファイルと既存依存関係を使います。
 
-```bash
-SOURCE_ROOT="/path/to/metadrive_rl-lookahead"
-HOST_ROOT="/path/to/metadrive-host"
-mkdir -p "$HOST_ROOT/lookahead_learning"
-cp "$SOURCE_ROOT"/lookahead_learning/*.py "$HOST_ROOT/lookahead_learning/"
-# 読み物も持ち込む場合（任意）
-cp -R "$SOURCE_ROOT"/lookahead_learning/docs "$HOST_ROOT/lookahead_learning/"
-```
+## 移植先で確認する3接続点
 
-選択したTOMLが移植先の`configs/`にまだない場合は、同じ内容の
-`configs/official_start_lane_return.toml`を用意します。既存の別設定を確認
-なしに上書きせず、使用する設定の`map`・scenario範囲・PPO条件が監査対象と
-一致していることを確認してください。
+移植時に確認・編集するのは、既存hostへ設定を伝える次の接続点です。
 
-PowerShellでは次の形で同じ17個をコピーできます。
+1. **config loader**
 
-```powershell
-$SourceRoot = 'C:\path\to\metadrive_rl-lookahead'
-$HostRoot = 'C:\path\to\metadrive-host'
-$AddonDestination = Join-Path $HostRoot 'lookahead_learning'
-New-Item -ItemType Directory -Force $AddonDestination | Out-Null
-Get-ChildItem (Join-Path $SourceRoot 'lookahead_learning') -File -Filter '*.py' |
-    Copy-Item -Destination $AddonDestination
-```
+   既存の configs.experiment_config.select_experiment() が読むTOMLへ
+   [lookahead] tableを追加し、resolverで次のmappingまたはNoneへ変換します。
 
-`-Recurse`は付けていないため、`lookahead_learning`の直下にある`.py`
-だけが対象です。`PYTHONPATH`を恒久設定したり、editable installを作ったり
-する必要はありません。
+   ~~~python
+   from lookahead_learning.checkpoint import resolve_lookahead_config
 
-## 移植先の前提
+   lookahead_config = resolve_lookahead_config(raw.get("lookahead"))
+   ~~~
 
-移植先は、単に同じshapeを返すホストでは足りません。運用モードには、
-hostが提供する`(262,)`・`float32`の観測、そのうちindex 259--261の意味・
-順序・encoding・正規化をソースで確認した証拠、そして追加adapterのregistry
-登録が必要です。`lookahead_obs`と`lookahead_obs_pp_reward`は、その262値に
-前方注視の3値を追加するため、policy observationは`(265,)`になります。
-paddingや切り捨てでこの条件を満たすことはできません。
+   tableなしは None、tableありは lookahead_m（有限で正）とpp_weight（有限で0以上）
+   です。checkpoint.pyは標準ライブラリだけでこの解決を行います。移植先の設定形式に
+   合わせてresolverを短く接続し、専用mode CLIや別の運用経路へ複製しません。
 
-具体的には、[`../adapter.py`](../adapter.py)の`PrefixFeatureEvidence`で
-index 259・260・261それぞれの`name`・`meaning`・`encoding`・`source`を
-ソース根拠付き（source-backed）に確認し、hostクラスの対応を[`../runner.py`](../runner.py)の
-`_VERIFIED_HOST_PREFIX_EVIDENCE`へ登録した状態が必要です。shapeだけを見て
-registryへ登録することはできません。
+2. **通常train/evaluateと共通env factory**
 
-このcheckoutの実hostはraw `(259,)`・`float32`で、追加3値は未登録です。
-そのため、このcheckoutでの移植チェックはファイル配置・import・help・
-static doctorの確認までで、運用学習や評価の合格を意味しません。別PCで
-262値が得られても、ソース根拠（source-backed evidence）とregistryがなければ同じ拒否に
-なります。
+   rootの train.py と evaluate.py は同じ選択結果の lookahead_config を使います。
+   train.py は make_training_env(..., lookahead_config=lookahead_config)、
+   evaluate.py は make_evaluation_env(..., lookahead_config=lookahead_config) を呼び、
+   共通factoryはraw host Envを作ったあと、設定がある場合だけ次を呼びます。
 
-監査で記録された依存関係とassetsは次の組み合わせです。移植先に既に存在
-していることを確認してください。この追加モジュールはpip installやassets
-downloadを行いません。
+   ~~~python
+   from lookahead_learning.adapter import wrap_lookahead_env
 
-| 項目 | 監査値 |
-| --- | --- |
-| Python | 3.12.3 |
-| MetaDrive | 0.4.3、source commit `85e5dadc6c7436d324348f6e3d8f8e680c06b4db` |
-| Stable-Baselines3 | 2.9.0 |
-| Gymnasium | 1.3.0 |
-| Panda3D | 1.10.16 |
-| PyTorch | 2.13.0 |
-| NumPy | 2.5.2 |
-| MetaDrive assets | version 0.4.3、監査時はversion一致・更新なし |
+   if lookahead_config is not None:
+       raw_env = wrap_lookahead_env(raw_env, **lookahead_config)
+   ~~~
 
-ソース側では [`../adapter.py`](../adapter.py) がhost importと観測・行動契約を
-確認し、[`../runner.py`](../runner.py) がsource identityと学習・評価を管理
-します。移設検証の実装は [`../portability.py`](../portability.py) です。
+   wrapperはraw Envの外側、trainingでは既存Monitorの内側です。既存の学習用Monitorは
+   このwrapperの外側へ置き、評価側にMonitorを新設しません。既存のenv.reset/step返却値を
+   使い、基底reward_functionを再呼出ししません。trainは
+   lookahead_learning.checkpoint.set_lookahead_model_metadata(model, config)を保存前に
+   呼び、evaluateはPPOロード後に
+   lookahead_learning.checkpoint.validate_lookahead_model_metadata(model, config)を
+   呼びます。設定は model.lookahead_config と model.lookahead_schema_version=1 として
+   PPO ZIP内へ記録し、追加ファイルやハッシュ照合は使いません。
 
-## 移植後の確認順
+3. **host adapter**
 
-移植先ホストのルートで、選択したPythonを使います。現在のcheckoutで監査に
-使ったPythonを参照する場合は`../metadrive_rl-main/.venv/bin/python`です。
-別PCでは、依存関係が入っている環境の`python`（またはその環境の
-`python3`）に置き換えます。
+   adapter.wrap_lookahead_env がraw Envのobservation_space、reset/step、
+   Navigation、vehicle、Actionの実際の契約を確認します。raw観測はflat Boxの1次元
+   float32、幅Dをopaque prefixとして保持し、注視値3つを末尾へ足してD+3にします。
+   Dを特定の幅へ固定、padding、切り捨て、既存prefixの再正規化はしません。
+   lookaheadを有効にするとMetaDrivePreviewProviderが経路と注視点を読み、
+   pp_weightが正の場合だけMetaDrivePPProviderが車軸長、最大操舵角、操舵符号の
+   ソースと単位を読みます。数値の大小から単位や符号を推測しないでください。
 
-```bash
-cd "/path/to/metadrive-host"
-LOOKAHEAD_PY="/path/to/audited-python"
-"$LOOKAHEAD_PY" -B -m lookahead_learning --help
-```
+接続後のcall pathは次のようになります。
 
-PowerShellでは、空白を含むcwdとPythonのパスを引用し、`&`で選択した実行
-ファイルを呼び出します。
+~~~text
+TOML
+  -> configs.experiment_config.select_experiment
+  -> ExperimentProfile.lookahead_config
+  -> train.py/evaluate.py
+  -> env_factory.make_training_env/make_evaluation_env
+  -> env_factory.make_env
+  -> adapter.wrap_lookahead_env
+  -> LookaheadEnv
+  -> 既存StartLane系Subclassのreset/step（報酬計算は基底Env内）
+~~~
 
-```powershell
-Set-Location 'C:\path with spaces\to\metadrive-host'
-$LOOKAHEAD_PY = 'C:\path with spaces\to\Python\python.exe'
-& $LOOKAHEAD_PY -B -m lookahead_learning --help
-```
+環境の内部順序は「既存Subclass/raw Env → LookaheadEnv → Monitor → VecEnv」です。
+既存Subclassの入力、報酬、終了条件はこの順序で保持されます。評価側は
+LookaheadEnvを通してreset/stepし、MetaDrive固有のcustom propertyやrenderは
+env.unwrappedから取得します。
 
-続けてstatic doctorと単体・模擬環境テスト（実MetaDrive起動・学習なし）を実行します。どちらもこの段階ではengineを
-起動しません。
+## 設定ファイル
 
-```bash
-"$LOOKAHEAD_PY" -B -m lookahead_learning doctor \
-  --config configs/official_start_lane_return.toml \
-  --output "outputs/lookahead_learning_docs/porting-doctor-static"
+移植先では、そのhostが既に運用しているTOMLへ [lookahead] を追記します。
 
-"$LOOKAHEAD_PY" -B -m lookahead_learning test \
-  --output "outputs/lookahead_learning_docs/porting-test-unit"
-```
+~~~toml
+[lookahead]
+lookahead_m = 6.0
+pp_weight = 0.0
+~~~
 
-`test --portability`は、空白を含む新しい一時的な配置へ必要な`.py`と設定を
-コピーし、fresh subprocessのhelpとstatic doctorを確認します。`--portability`
-だけの実行はstaticで、MetaDrive engineを起動しません。
+lookahead_mは経路に沿った弧長[m]、pp_weightは追加PP不一致ペナルティ係数です。
+tableを省略すればbaseline、pp_weight=0.0なら注視点3値だけ、正値なら注視点と
+追加PP報酬になります。学習と評価へ同じTOMLを渡します。
 
-```bash
-"$LOOKAHEAD_PY" -B -m lookahead_learning test --portability \
-  --config configs/official_start_lane_return.toml \
-  --output "outputs/lookahead_learning_docs/porting-portability-static"
-```
+このrepositoryにある configs/official_start_lane_return_lookahead.toml は、この
+repositoryだけの設定例です。移植先へ configs/ をコピーする前提ではなく、hostの
+既存TOMLへ値を追記し、schema、環境設定、scenario範囲、PPO設定を維持します。
+既存TOMLのroot schemaを変更する場合は、loaderの既存検証と衝突しないようにします。
 
-`--integration`はraw `doctor --probe`だけを実行するruntime診断です。static
-portabilityと同時に指定して両方が検証されると考えず、必要なら別コマンドで
-実行してください。
+## 依存と運用
 
-```bash
-"$LOOKAHEAD_PY" -B -m lookahead_learning test --integration \
-  --config configs/official_start_lane_return.toml \
-  --seed 5 --steps 3 \
-  --output "outputs/lookahead_learning_docs/porting-integration-raw-s5"
-```
+移植先にはhostが通常使うPython、MetaDrive、Gymnasium、Stable-Baselines3、
+NumPy、Panda3D assetsが既に必要です。このruntimeは依存インストールやassets
+downloadを行いません。Pythonのimport pathを恒久変更する必要もありません。
 
-2 workerのspawnを含む移設先runtimeを明示的に調べる場合は、次の1コマンドを
-使えます。これはホストの未包装環境（raw環境）をreset/stepする診断であり、262/265の
-前方注視比較の合格判定
-ではありません。`--seeds`はspawn workerが2個なので2値を指定します。
+まずhostが通常使う依存環境でroot入口と設定が解決できることを確認します。
 
-```bash
-"$LOOKAHEAD_PY" -B -m lookahead_learning.portability \
-  --spawn-probe --project-root . \
-  --config configs/official_start_lane_return.toml \
-  --output "outputs/lookahead_learning_docs/porting-spawn-raw-s5" \
-  --seeds 5 5 --steps 1
-```
+~~~bash
+cd /path/to/metadrive-host
+python train.py --help
+python evaluate.py --help
+~~~
 
-このruntime診断や`doctor --probe --pulse`を使うときだけ、MetaDrive/Panda3D
-engineが起動します。出力先は毎回新しくし、既存runに追記しないでください。
+root入口の --help はMetaDriveなどhostの通常依存関係を必要とします。
 
-## checkpointを移す場合
+次に同じ設定で学習・評価を実行します。
 
-checkpointは必須の移植物ではありません。持ち込む場合は、学習時にrunnerが
-作った対応する学習runディレクトリをまとめてコピーします。最低限、同じディレ
-クトリに次の2つを残してください。
+~~~bash
+python train.py --config configs/your_experiment.toml
+python evaluate.py --config configs/your_experiment.toml
+~~~
 
-```text
-<training-run>/
-├── <model-name>.zip
-└── metadata.json
-```
+評価時は、学習時に保存したZIPの lookahead_config と schema version が選択TOMLに
+一致することを確認します。lookahead_mまたはpp_weightが異なるTOML、注視ありTOML
+でbaseline ZIPを読む組み合わせは停止します。注視3値の順序・encoding・報酬定義を
+変更する場合はschema versionを更新します。
 
-同じrunのmonitorやtelemetryを後から読む場合は、それらもrunディレクトリの
-他のファイルとして一緒にコピーします。zipだけを別のmetadata.jsonと組み
-合わせたり、同じshapeに見える別runのsidecarを付けたりしないでください。
+テストを同梱した場合の最小確認は次のとおりです。
 
-`metadata.json`にはmodelのSHA-256、mode、観測・行動契約、設定、学習seed、
-source identityが保存されます。evaluateはこのsidecarと、移植先で計算した
-source identityをPPOのロード前に照合します。したがって、別host・別mode・
-別PP weight・別ソースのrunは、shapeが一致しても拒否されます。
+~~~bash
+python -B -m unittest -v lookahead_learning.test_checkpoint lookahead_learning.test_geometry lookahead_learning.test_env
+~~~
 
-package名やソースが現在の`lookahead_learning`と異なる場合、
-sidecarの相対source keyやSHA-256も異なります。旧metadataを
-書き換えて互換に見せる手順はありませんし、任意の古いsidecarが新sourceで
-使えるとも仮定しません。古いraw checkpointを履歴診断したい場合だけ、
-`doctor --checkpoint <existing.zip> --legacy-evaluate`を使います。この経路
-はraw shapeとActionが一致する旧checkpointの`legacy_raw259_diagnostic`で、
-正規packageによる運用学習・評価の代用ではありません。新しい正規packageで運用
-するcheckpointが必要なら、条件を満たすhost上で新しいrunを作ります。
+test_checkpoint.pyだけは標準ライブラリのみで実行できます。test_env.pyと
+test_geometry.pyはruntime依存関係を必要とします。実simやPPOの長時間学習は必要な
+環境で別途行い、軽量テストの成功だけから性能改善を判断しません。

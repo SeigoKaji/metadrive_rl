@@ -1,51 +1,38 @@
-"""Read-only connection and contract checks for the host MetaDrive project.
+"""Host boundary and runtime helpers for lookahead learning.
 
-The host checkout used by this repository currently exposes the upstream
-259-wide state observation.  The requested extension is defined against a
-*verified* 262-wide host observation which already contains the three
-start-lane fields.  This module deliberately refuses to manufacture those
-fields when the host does not provide them.
+The lookahead core treats the host observation as an opaque one-dimensional
+``float32`` vector.  The host adapter validates its concrete shape, dtype and
+Box bounds, then appends the three preview values without interpreting or
+padding the host prefix.  Route, vehicle and action meaning is checked at the
+host boundary where those objects are available.
 
-No MetaDrive module is imported at module import time.  A caller can therefore
-use :mod:`lookahead_learning.adapter` for ``--help`` and static checks on a machine
-where the simulator dependencies are absent.  Environment construction is
-explicit and is never performed by an import.
+No MetaDrive module is imported at module import time.  The adapter can
+therefore be imported on a machine where simulator dependencies are absent;
+environment construction is explicit and is never performed by an import.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
-import copy
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import importlib
 import math
-from pathlib import Path
-import sys
-from types import ModuleType
-from typing import Any, Final, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
 import numpy as np
 
+if TYPE_CHECKING:
+    from .env import LookaheadEnv
 
-BASELINE_OBS_DIM: Final[int] = 262
-"""Required width of the already modified host observation."""
 
 PREVIEW_FEATURE_DIM: Final[int] = 3
-AUGMENTED_OBS_DIM: Final[int] = BASELINE_OBS_DIM + PREVIEW_FEATURE_DIM
 NORMALIZATION_DISTANCE_M: Final[float] = 10.0
-PREFIX_FEATURE_INDICES: Final[tuple[int, int, int]] = (259, 260, 261)
-PREFIX_FEATURE_NAMES: Final[tuple[str, str, str]] = (
-    "start_lane_lateral_offset",
-    "start_lane_heading_error",
-    "start_lane_reference_valid",
-)
 
 Mode: TypeAlias = Literal["baseline", "lookahead_obs", "lookahead_obs_pp_reward"]
 
-# The descriptive names are the values carried through runtime metadata and
-# telemetry.  The short names remain accepted at the input boundary so old
-# launch scripts can be rerun while producing canonical records.
+# The descriptive names are the values carried through runtime metadata.  The
+# short names remain accepted at the input boundary for existing configurations
+# while producing canonical records.
 CANONICAL_MODES: Final[tuple[str, str, str]] = (
     "baseline",
     "lookahead_obs",
@@ -55,11 +42,8 @@ MODE_ALIASES: Final[dict[str, str]] = {
     "obs": "lookahead_obs",
     "obs_pp": "lookahead_obs_pp_reward",
 }
-MODE_CHOICES: Final[tuple[str, ...]] = CANONICAL_MODES + tuple(MODE_ALIASES)
-
-
 def normalize_mode(value: str) -> Mode:
-    """Normalize a CLI or API mode to its descriptive canonical value."""
+    """Normalize a configuration or API mode to its canonical value."""
 
     if not isinstance(value, str):
         raise ValueError(f"mode must be a string, found {type(value).__name__}")
@@ -78,10 +62,6 @@ class UnsupportedHostError(HostContractError):
     """A requested mode is outside the evidence available from the host."""
 
 
-class HostImportError(HostContractError):
-    """A host module could not be imported from the requested project root."""
-
-
 def _finite_number(value: object, *, name: str) -> float:
     if isinstance(value, bool):
         raise HostContractError(f"{name} must be numeric, not bool")
@@ -92,13 +72,6 @@ def _finite_number(value: object, *, name: str) -> float:
     if not math.isfinite(number):
         raise HostContractError(f"{name} must be finite")
     return number
-
-
-def _normalise_root(project_root: str | Path) -> Path:
-    root = Path(project_root).expanduser().resolve()
-    if not root.is_dir():
-        raise HostImportError(f"project root is not a directory: {root}")
-    return root
 
 
 def _host_config_mapping(value: object, *, name: str = "config") -> Mapping[str, object]:
@@ -132,264 +105,20 @@ def _host_config_mapping(value: object, *, name: str = "config") -> Mapping[str,
     return result
 
 
-def _inside(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False
-    return True
-
-
-@contextmanager
-def _temporary_import_root(project_root: Path):
-    """Temporarily make a flat host checkout importable.
-
-    The path is restored immediately after import.  This is a process-local
-    import operation, not a PYTHONPATH edit or a persistent environment change.
-    """
-
-    path_string = str(project_root)
-    old_path = list(sys.path)
-    # Put the requested checkout first even when it was already present later
-    # in sys.path.  This avoids importing a same-named module from another
-    # checkout during a relocated run.
-    sys.path[:] = [path_string] + [entry for entry in old_path if entry != path_string]
-    try:
-        yield
-    finally:
-        sys.path[:] = old_path
-
-
-def _module_path(module: ModuleType, module_name: str) -> Path:
-    origin = getattr(module, "__file__", None)
-    if origin is None:
-        raise HostImportError(f"host module has no file origin: {module_name}")
-    return Path(origin).resolve()
-
-
-def import_host_module(
-    module_name: str,
-    *,
-    project_root: str | Path,
-) -> ModuleType:
-    """Import one flat host module and verify its file origin.
-
-    ``env_factory`` imports sibling modules by their historical top-level
-    names, so a normal import is retained.  A pre-existing module from another
-    checkout is rejected instead of silently reusing it.
-    """
-
-    root = _normalise_root(project_root)
-    # Check before import as well as after it: a wrong-root parent package
-    # (for example ``configs``) can otherwise satisfy importlib while the
-    # requested child is loaded lazily from the wrong checkout.
-    _check_known_host_origins(root)
-    existing = sys.modules.get(module_name)
-    if existing is not None:
-        try:
-            existing_path = _module_path(existing, module_name)
-        except HostImportError:
-            raise
-        if not _inside(existing_path, root):
-            raise HostImportError(
-                f"{module_name} is already imported from another root: "
-                f"{existing_path}; requested root={root}"
-            )
-        return existing
-
-    try:
-        with _temporary_import_root(root):
-            module = importlib.import_module(module_name)
-    except HostContractError:
-        raise
-    except Exception as error:
-        raise HostImportError(
-            f"failed to import {module_name!r} from {root}: "
-            f"{type(error).__name__}: {error}"
-        ) from error
-
-    origin = _module_path(module, module_name)
-    if not _inside(origin, root):
-        raise HostImportError(
-            f"{module_name} resolved outside requested project root: "
-            f"{origin} (root={root})"
-        )
-    _check_known_host_origins(root)
-    return module
-
-
-# These are flat top-level modules used by this checkout's factory and config
-# path.  A process may have imported a same-named module from another clone
-# before the preview runner starts; accepting that module would make the
-# requested project root advisory rather than authoritative.  Third-party
-# modules (including the separately checked-out MetaDrive dependency) are
-# intentionally outside this list.
-_KNOWN_HOST_MODULES: Final[tuple[str, ...]] = (
-    "env_factory",
-    "project_paths",
-    "start_lane_env",
-    "configs",
-    "configs.experiment_config",
-)
-
-
-def _check_known_host_origins(project_root: Path) -> None:
-    """Reject loaded project modules whose origins are outside ``project_root``."""
-
-    for module_name in _KNOWN_HOST_MODULES:
-        module = sys.modules.get(module_name)
-        if module is None:
-            continue
-        origin = _module_path(module, module_name)
-        if not _inside(origin, project_root):
-            raise HostImportError(
-                f"{module_name} is loaded from another project root: {origin}; "
-                f"requested root={project_root}"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class PrefixFeatureEvidence:
-    """Evidence for one of the three host-provided start-lane fields.
-
-    Shape alone is intentionally insufficient.  ``meaning``, ``encoding``
-    and ``source`` are required so a caller cannot accidentally reinterpret an
-    unrelated 262-wide vector as the requested schema.
-    """
-
-    index: int
-    name: str
-    meaning: str
-    encoding: str
-    source: str
-
-    def __post_init__(self) -> None:
-        if self.index not in PREFIX_FEATURE_INDICES:
-            raise HostContractError(
-                f"host prefix feature index must be one of {PREFIX_FEATURE_INDICES}: "
-                f"{self.index!r}"
-            )
-        for field_name in ("name", "meaning", "encoding", "source"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value.strip():
-                raise HostContractError(
-                    f"prefix feature {field_name} must be a non-empty string"
-                )
-
-    @classmethod
-    def from_mapping(
-        cls,
-        value: Mapping[str, object],
-        *,
-        expected_index: int | None = None,
-    ) -> "PrefixFeatureEvidence":
-        try:
-            index_value = value["index"]
-            name = value["name"]
-            meaning = value["meaning"]
-            encoding = value["encoding"]
-            source = value["source"]
-        except KeyError as error:
-            raise HostContractError(
-                f"prefix feature evidence missing key: {error.args[0]}"
-            ) from error
-        if isinstance(index_value, bool) or not isinstance(index_value, int):
-            raise HostContractError("prefix feature evidence index must be int")
-        if expected_index is not None and index_value != expected_index:
-            raise HostContractError(
-                f"prefix feature evidence index {index_value} does not match "
-                f"expected {expected_index}"
-            )
-        return cls(
-            index=index_value,
-            name=str(name),
-            meaning=str(meaning),
-            encoding=str(encoding),
-            source=str(source),
-        )
-
-
-def _coerce_feature_evidence(
-    evidence: Mapping[int, PrefixFeatureEvidence | Mapping[str, object]]
-    | Sequence[PrefixFeatureEvidence | Mapping[str, object]]
-    | None,
-) -> tuple[PrefixFeatureEvidence, ...]:
-    if evidence is None:
-        return ()
-    values: list[PrefixFeatureEvidence] = []
-    if isinstance(evidence, Mapping):
-        for expected_index in PREFIX_FEATURE_INDICES:
-            if expected_index not in evidence:
-                raise HostContractError(
-                    f"prefix feature evidence missing index {expected_index}"
-                )
-            item = evidence[expected_index]
-            if isinstance(item, PrefixFeatureEvidence):
-                feature = item
-                if feature.index != expected_index:
-                    raise HostContractError(
-                        f"prefix feature evidence key/index mismatch: "
-                        f"key={expected_index}, index={feature.index}"
-                    )
-            elif isinstance(item, Mapping):
-                feature = PrefixFeatureEvidence.from_mapping(
-                    item,
-                    expected_index=expected_index,
-                )
-            else:
-                raise HostContractError(
-                    f"prefix feature evidence at {expected_index} must be mapping"
-                )
-            values.append(feature)
-    else:
-        if len(evidence) == 0:
-            return ()
-        if len(evidence) != len(PREFIX_FEATURE_INDICES):
-            raise HostContractError(
-                "prefix feature evidence must contain exactly three entries"
-            )
-        for expected_index, item in zip(PREFIX_FEATURE_INDICES, evidence):
-            if isinstance(item, PrefixFeatureEvidence):
-                feature = item
-                if feature.index != expected_index:
-                    raise HostContractError(
-                        f"prefix feature evidence order/index mismatch: "
-                        f"expected={expected_index}, actual={feature.index}"
-                    )
-            elif isinstance(item, Mapping):
-                feature = PrefixFeatureEvidence.from_mapping(
-                    item,
-                    expected_index=expected_index,
-                )
-            else:
-                raise HostContractError(
-                    f"prefix feature evidence at {expected_index} must be mapping"
-                )
-            values.append(feature)
-
-    by_index = {feature.index: feature for feature in values}
-    if set(by_index) != set(PREFIX_FEATURE_INDICES):
-        raise HostContractError("prefix feature evidence must cover indices 259..261")
-    for index, expected_name in zip(PREFIX_FEATURE_INDICES, PREFIX_FEATURE_NAMES):
-        if by_index[index].name != expected_name:
-            raise HostContractError(
-                f"prefix feature {index} has name {by_index[index].name!r}; "
-                f"expected {expected_name!r}"
-            )
-    return tuple(by_index[index] for index in PREFIX_FEATURE_INDICES)
-
-
 @dataclass(frozen=True, slots=True)
 class ObservationContract:
-    """Verified raw observation schema and the immutable Box bounds."""
+    """Verified raw observation schema and immutable Box bounds.
+
+    The host width is data driven.  ``shape[0]`` is the only baseline
+    dimension used by the wrapper, so both 259-wide and 262-wide host vectors
+    follow the same path without padding or truncation.
+    """
 
     shape: tuple[int, ...]
     dtype: np.dtype
     low: np.ndarray = field(repr=False)
     high: np.ndarray = field(repr=False)
-    prefix_features: tuple[PrefixFeatureEvidence, ...] = ()
     source: str = ""
-    semantic_verified: bool = False
 
     def __post_init__(self) -> None:
         shape = tuple(int(value) for value in self.shape)
@@ -402,10 +131,10 @@ class ObservationContract:
         high.setflags(write=False)
         object.__setattr__(self, "low", low)
         object.__setattr__(self, "high", high)
-        if shape != (BASELINE_OBS_DIM,):
+        if len(shape) != 1 or shape[0] <= 0:
             raise UnsupportedHostError(
-                f"requested lookahead_learning host raw observation must have shape "
-                f"({BASELINE_OBS_DIM},), found {shape}"
+                "lookahead_learning requires a positive one-dimensional raw "
+                f"observation, found {shape}"
             )
         if dtype != np.dtype(np.float32):
             raise UnsupportedHostError(
@@ -421,21 +150,11 @@ class ObservationContract:
             raise HostContractError("observation Box bounds must be finite")
         if np.any(low > high):
             raise HostContractError("observation Box low must not exceed high")
-        if self.semantic_verified:
-            if len(self.prefix_features) != 3:
-                raise UnsupportedHostError(
-                    "semantic_verified raw schema requires evidence for indices 259..261"
-                )
-            _coerce_feature_evidence(self.prefix_features)
-
     @classmethod
     def from_space(
         cls,
         space: object,
         *,
-        feature_evidence: Mapping[int, PrefixFeatureEvidence | Mapping[str, object]]
-        | Sequence[PrefixFeatureEvidence | Mapping[str, object]]
-        | None = None,
         source: str = "",
     ) -> "ObservationContract":
         from gymnasium.spaces import Box
@@ -449,20 +168,12 @@ class ObservationContract:
         dtype = np.dtype(getattr(space, "dtype", object))
         low = np.asarray(getattr(space, "low", np.array([], dtype=dtype)))
         high = np.asarray(getattr(space, "high", np.array([], dtype=dtype)))
-        prefix = _coerce_feature_evidence(feature_evidence)
-        if not prefix:
-            raise UnsupportedHostError(
-                "raw shape alone is insufficient: provide verified semantic "
-                "evidence for existing start-lane features at indices 259..261"
-            )
         return cls(
             shape=shape,
             dtype=dtype,
             low=low,
             high=high,
-            prefix_features=prefix,
             source=source,
-            semantic_verified=bool(prefix),
         )
 
     def validate_raw(self, observation: object) -> np.ndarray:
@@ -509,7 +220,8 @@ class ObservationContract:
         if np.any(values < 0.0) or np.any(values > 1.0):
             raise HostContractError("preview values must be in [0, 1]")
         augmented = np.concatenate((raw, values)).astype(np.float32, copy=False)
-        if augmented.shape != (AUGMENTED_OBS_DIM,):
+        expected_shape = (self.shape[0] + PREVIEW_FEATURE_DIM,)
+        if augmented.shape != expected_shape:
             raise AssertionError("unexpected augmented observation shape")
         return augmented
 
@@ -916,7 +628,6 @@ def _saved_start_lane_ordinal(env_or_vehicle: object, vehicle: object) -> int | 
 def read_target_lane_state(
     env: object,
     *,
-    project_root: str | Path | None = None,
     tolerance_ratio: float | None = None,
 ) -> object:
     """Read the audited host start-lane state without stepping or re-observing.
@@ -928,9 +639,8 @@ def read_target_lane_state(
     reset ordinal, and returns the host ``TargetLaneState`` object.  It never
     calls ``observe``, ``step``, ``reward_function``, or mutates the host.
 
-    ``project_root`` should be supplied by a relocated runner so the flat
-    project module's origin is checked before use.  Omitting it retains the
-    ordinary import behavior for an already configured host process.
+    The resolver is imported lazily so a host without the optional
+    ``start_lane_env`` module can continue with the fixed Navigation route.
     """
 
     vehicle = get_single_agent(env)
@@ -953,21 +663,17 @@ def read_target_lane_state(
     if tolerance < 0.0:
         raise HostContractError("start_lane_tolerance_ratio must be non-negative")
 
-    if project_root is None:
-        try:
-            module = importlib.import_module("start_lane_env")
-        except Exception as error:
-            raise HostImportError(
-                "failed to import start_lane_env for target-lane diagnostics: "
-                f"{type(error).__name__}: {error}"
-            ) from error
-    else:
-        module = import_host_module("start_lane_env", project_root=project_root)
+    try:
+        module = importlib.import_module("start_lane_env")
+    except Exception as error:
+        raise UnsupportedHostError(
+            "optional start_lane_env target resolver is unavailable: "
+            f"{type(error).__name__}: {error}"
+        ) from error
     resolver = getattr(module, "resolve_target_lane_state", None)
     if not callable(resolver):
-        raise HostImportError(
-            "start_lane_env.resolve_target_lane_state is unavailable in the "
-            "requested host"
+        raise UnsupportedHostError(
+            "start_lane_env.resolve_target_lane_state is unavailable"
         )
     try:
         return resolver(
@@ -1268,7 +974,7 @@ def build_fixed_navigation_route(
     validated prefix and a diagnostic boundary are retained when a later
     lane is unsupported or disconnected; geometry then marks lookahead that
     crosses the boundary invalid.  This function imports the pure geometry
-    module lazily so importing or displaying CLI help never imports a simulator.
+    module lazily so importing the adapter itself never imports a simulator.
     """
 
     (
@@ -1326,191 +1032,441 @@ def build_fixed_navigation_route(
     return replace(result, path=path, diagnostics=diagnostics)
 
 
-@dataclass(frozen=True, slots=True)
-class HostAudit:
-    """Read-only audit result suitable for doctor output."""
+def _target_ordinal_after_reset(env: object, vehicle: object) -> tuple[int, bool]:
+    """Resolve the reset target lane ordinal without re-observing the host."""
 
-    project_root: Path
-    imported_module_origins: Mapping[str, str] = field(default_factory=dict)
-    raw_shape: tuple[int, ...] | None = None
-    raw_dtype: str | None = None
-    action_space: str | None = None
-    dt_seconds: float | None = None
-    supported_baseline_schema: bool = False
-    semantic_evidence: bool = False
-    issues: tuple[str, ...] = ()
+    saved = _saved_start_lane_ordinal(env, vehicle)
+    if saved is not None:
+        return int(saved), True
+    lane_index = getattr(vehicle, "lane_index", None)
+    if lane_index is None:
+        raise UnsupportedHostError("vehicle lane_index is unavailable after reset")
+    try:
+        value = lane_index[-1]
+    except (IndexError, KeyError, TypeError) as error:
+        raise UnsupportedHostError(
+            "vehicle lane_index has no reset target ordinal"
+        ) from error
+    if isinstance(value, bool):
+        raise UnsupportedHostError("vehicle lane ordinal must be an integer")
+    try:
+        return int(value), False
+    except (TypeError, ValueError) as error:
+        raise UnsupportedHostError("vehicle lane ordinal must be an integer") from error
 
-    @property
-    def supported(self) -> bool:
-        return self.supported_baseline_schema and not self.issues
 
-    def as_dict(self) -> dict[str, object]:
+def _target_lane_state(
+    env: object,
+) -> object | None:
+    """Read optional host target-lane state, preserving raw route fallback."""
+
+    try:
+        return read_target_lane_state(env)
+    except UnsupportedHostError:
+        # A plain host may have no target-lane resolver or retained ordinal.
+        # The fixed Navigation route remains the source of preview geometry.
+        return None
+
+
+def _target_reference_present(vehicle: object, target_ordinal: int) -> bool | None:
+    """Return target-lane presence, or ``None`` when the host exposes no refs."""
+
+    navigation = getattr(vehicle, "navigation", None)
+    references = getattr(navigation, "current_ref_lanes", None)
+    if references is None:
+        return None
+    for lane in references:
+        index = getattr(lane, "index", None)
+        if index is None:
+            continue
+        try:
+            ordinal = index[-1]
+        except (IndexError, KeyError, TypeError):
+            continue
+        if isinstance(ordinal, bool):
+            continue
+        try:
+            if int(ordinal) == target_ordinal:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _read_direct_policy(env: object, vehicle: object) -> object:
+    """Read the policy registered for the active vehicle through the engine."""
+
+    engine = getattr(env, "engine", None)
+    getter = getattr(engine, "get_policy", None)
+    name = getattr(vehicle, "name", None)
+    if not callable(getter) or name is None:
+        raise UnsupportedHostError(
+            "Pure Pursuit mode requires the direct engine policy lookup for "
+            "the active vehicle"
+        )
+    policy = getter(name)
+    if policy is None:
+        raise UnsupportedHostError(
+            f"Pure Pursuit mode found no engine policy for active vehicle {name!r}"
+        )
+    return policy
+
+
+def _read_vehicle_geometry(
+    env: object,
+    *,
+    verify_direct_policy: bool = True,
+) -> dict[str, float]:
+    """Read source-audited axle geometry used by the PP provider.
+
+    MetaDrive exposes ``FRONT_WHEELBASE`` and ``REAR_WHEELBASE`` in metres and
+    ``max_steering`` in degrees.  The provider passes the rear axle position
+    explicitly to the pure geometry function; no body-centre approximation or
+    unit inference is performed here.
+    """
+
+    vehicle = get_single_agent(env)
+    module_name = type(vehicle).__module__
+    qualname = type(vehicle).__qualname__
+    if not module_name.startswith("metadrive."):
+        raise UnsupportedHostError(
+            "vehicle geometry is verified only for MetaDrive vehicle classes; "
+            f"found {module_name}.{qualname}"
+        )
+    if verify_direct_policy and (
+        module_name != "metadrive.component.vehicle.vehicle_type"
+        or qualname != "DefaultVehicle"
+    ):
+        raise UnsupportedHostError(
+            "Pure Pursuit vehicle geometry is source-audited only for "
+            "metadrive.component.vehicle.vehicle_type.DefaultVehicle; "
+            f"found {module_name}.{qualname}"
+        )
+
+    def number(name: str, *fallback: str) -> float:
+        value = getattr(vehicle, name, None)
+        if value is None:
+            config = getattr(vehicle, "config", None)
+            try:
+                mapping = _host_config_mapping(config, name="vehicle.config")
+            except HostContractError:
+                mapping = {}
+            value = mapping.get(name)
+        if value is None:
+            for alternate in fallback:
+                value = getattr(vehicle, alternate, None)
+                if value is not None:
+                    break
+        try:
+            number_value = float(value)
+        except (TypeError, ValueError) as error:
+            raise UnsupportedHostError(
+                f"vehicle geometry {name} is unavailable"
+            ) from error
+        if not math.isfinite(number_value) or number_value <= 0.0:
+            raise UnsupportedHostError(
+                f"vehicle geometry {name} must be positive"
+            )
+        return number_value
+
+    front = number("FRONT_WHEELBASE")
+    rear = number("REAR_WHEELBASE")
+    max_deg = number("max_steering")
+    if verify_direct_policy:
+        policy = _read_direct_policy(env, vehicle)
+        policy_path = f"{type(policy).__module__}.{type(policy).__qualname__}"
+        if policy_path != "metadrive.policy.env_input_policy.EnvInputPolicy":
+            raise UnsupportedHostError(
+                "Pure Pursuit mode requires metadrive.policy.env_input_policy."
+                "EnvInputPolicy through engine.get_policy; "
+                f"found {policy_path}"
+            )
+    return {
+        "front_wheelbase_m": front,
+        "rear_wheelbase_m": rear,
+        "wheelbase_m": front + rear,
+        "max_steering_deg": max_deg,
+    }
+
+
+class MetaDrivePreviewProvider:
+    """Build one fixed Navigation route and compute preview features per state.
+
+    This provider is part of the host adapter used by both ordinary
+    ``train.py`` and ``evaluate.py`` paths.  The wrapper remains independent
+    of MetaDrive imports until an episode actually starts.
+    """
+
+    def __init__(
+        self,
+        *,
+        lookahead_m: float = 6.0,
+    ) -> None:
+        value = _finite_number(lookahead_m, name="lookahead_m")
+        if value < 0.0:
+            raise ValueError("lookahead_m must be non-negative")
+        self.lookahead_m = value
+        self._route: object | None = None
+        self._route_error: str | None = None
+        self._episode_key: object = None
+        self._target_ordinal: int | None = None
+        self._target_ordinal_persistent = False
+
+    def reset(self, env: object) -> None:
+        """Rebuild route state exactly once after the raw environment reset."""
+
+        self._route = None
+        self._route_error = None
+        self._episode_key = None
+        self._target_ordinal = None
+        self._target_ordinal_persistent = False
+        vehicle = get_single_agent(env)
+        target_ordinal, persistent = _target_ordinal_after_reset(env, vehicle)
+        self._target_ordinal = target_ordinal
+        self._target_ordinal_persistent = persistent
+        self._route = build_fixed_navigation_route(env)
+        state = read_vehicle_state(env)
+        self._episode_key = tuple(state.get("checkpoints", ()))
+
+    @staticmethod
+    def _invalid(reason: str, **details: object) -> Mapping[str, object]:
         return {
-            "project_root": str(self.project_root),
-            "imported_module_origins": dict(self.imported_module_origins),
-            "raw_shape": list(self.raw_shape) if self.raw_shape is not None else None,
-            "raw_dtype": self.raw_dtype,
-            "action_space": self.action_space,
-            "dt_seconds": self.dt_seconds,
-            "supported_baseline_schema": self.supported_baseline_schema,
-            "semantic_evidence": self.semantic_evidence,
-            "supported": self.supported,
-            "issues": list(self.issues),
+            "preview_valid": False,
+            "x_g_m": 0.0,
+            "y_g_m": 0.0,
+            "invalid_reason": reason,
+            "details": details,
+        }
+
+    def __call__(self, env: object) -> Mapping[str, object]:
+        from .geometry import compute_preview
+
+        state = read_vehicle_state(env)
+        point = state.get("position_xy")
+        psi = state.get("heading_theta")
+        vehicle = get_single_agent(env)
+        velocity = getattr(vehicle, "velocity", None)
+        speed = state.get("speed_m_s")
+        if velocity is not None and psi is not None:
+            try:
+                speed = (
+                    float(velocity[0]) * math.cos(float(psi))
+                    + float(velocity[1]) * math.sin(float(psi))
+                )
+            except (TypeError, ValueError, IndexError):
+                speed = state.get("speed_m_s")
+        current_checkpoints = tuple(state.get("checkpoints", ()))
+        if self._route is None:
+            return self._invalid(self._route_error or "route_unavailable")
+        if self._episode_key is not None and current_checkpoints != self._episode_key:
+            return self._invalid(
+                "navigation_route_changed",
+                reset_checkpoints=self._episode_key,
+                current_checkpoints=current_checkpoints,
+            )
+        assert self._target_ordinal is not None
+        if self._target_ordinal_persistent:
+            observed_target, observed_persistent = _target_ordinal_after_reset(
+                env, vehicle
+            )
+            if not observed_persistent or observed_target != self._target_ordinal:
+                return self._invalid(
+                    "start_lane_reference_changed",
+                    reset_target_ordinal=self._target_ordinal,
+                    observed_target_ordinal=observed_target,
+                )
+        target_state = _target_lane_state(env)
+        target_fields: dict[str, object]
+        if target_state is None:
+            present = _target_reference_present(vehicle, self._target_ordinal)
+            # ``None`` means this host does not expose current reference lane
+            # objects.  The fixed route and reset lane ordinal still provide
+            # the route contract, so do not make the optional resolver a hard
+            # dependency.
+            start_lane_valid = True if present is None else bool(present)
+            target_fields = {
+                "target_lane_state_source": (
+                    "navigation.current_ref_lanes.ordinal_presence"
+                    if present is not None
+                    else "fixed_navigation_route"
+                ),
+                "target_lane_valid": start_lane_valid,
+            }
+        else:
+            start_lane_valid = bool(getattr(target_state, "valid", False))
+            target_fields = {
+                "target_lane_state_source": "start_lane_env.resolve_target_lane_state",
+                "target_lane_valid": start_lane_valid,
+                "target_lane_ordinal": getattr(target_state, "target_ordinal", None),
+                "current_lane_ordinal": getattr(target_state, "current_ordinal", None),
+                "target_lane_offset_m": getattr(target_state, "target_lane_offset_m", None),
+                "target_lane_normalized_error": getattr(target_state, "normalized_error", None),
+                "in_target_lane": getattr(target_state, "in_target_lane", None),
+                "target_lane_departed": getattr(target_state, "departed", None),
+            }
+        if point is None or psi is None:
+            return self._invalid("vehicle_geometry_unavailable")
+        route = self._route
+        result = compute_preview(
+            route.path,
+            point,
+            psi,
+            lookahead_m=self.lookahead_m,
+            forward_speed_mps=speed,
+            start_lane_valid=start_lane_valid,
+        )
+        details: dict[str, object] = {
+            "p_xy": point,
+            "psi_rad": psi,
+            "route": route.diagnostics.as_dict(),
+            "fixed_route_lane_ids": [
+                item.lane_id for item in route.path.metadata
+            ],
+            "fixed_route_lane_types": [
+                item.lane_type for item in route.path.metadata
+            ],
+            "projection": (
+                None
+                if result.projection is None
+                else result.projection.as_dict()
+            ),
+            "heading_error_rad": result.heading_error_rad,
+            "distance_to_goal_m": result.distance_to_goal_m,
+        }
+        details.update(target_fields)
+        return {
+            "preview_valid": bool(result.valid),
+            "x_g_m": result.x_g,
+            "y_g_m": result.y_g,
+            "q_xy": result.q,
+            "s_proj_m": result.s_proj,
+            "s_goal_m": result.s_goal,
+            "projected_lane_id": result.projected_lane_index,
+            "goal_lane_id": result.goal_lane_index,
+            "invalid_reason": result.reason,
+            "x_clipped": result.x_clipped,
+            "y_clipped": result.y_clipped,
+            "details": details,
         }
 
 
-@dataclass(slots=True)
-class HostAdapter:
-    """Explicit host connection used by the portable runner.
+class MetaDrivePPProvider:
+    """Calculate a PP reference from the same pre-action preview point."""
 
-    The adapter owns no environment instance.  ``make_raw_env`` constructs one
-    only when called by the runner, which keeps module imports and doctor static
-    checks free of simulator side effects.
+    def __init__(self, *, steering_sign: float = 1.0) -> None:
+        sign = _finite_number(steering_sign, name="steering_sign")
+        if sign not in (-1.0, 1.0):
+            raise ValueError("steering_sign must be +1 or -1")
+        self.steering_sign = sign
+        self.geometry: dict[str, float] | None = None
+
+    def reset(self, env: object) -> None:
+        self.geometry = _read_vehicle_geometry(env)
+
+    def __call__(self, env: object, preview: object) -> Mapping[str, object]:
+        from .geometry import pure_pursuit_from_rear_coordinates
+
+        if not getattr(preview, "preview_valid", False) or getattr(
+            preview, "q_xy", None
+        ) is None:
+            return {
+                "pp_valid": False,
+                "u_pp": None,
+                "invalid_reason": "preview_invalid",
+            }
+        if self.geometry is None:
+            self.geometry = _read_vehicle_geometry(env)
+        details = dict(getattr(preview, "details", ()))
+        point = details.get("p_xy")
+        psi = details.get("psi_rad")
+        q = getattr(preview, "q_xy", None)
+        if point is None or psi is None or q is None:
+            return {
+                "pp_valid": False,
+                "u_pp": None,
+                "invalid_reason": "vehicle_geometry_unavailable",
+            }
+        forward = (math.cos(float(psi)), math.sin(float(psi)))
+        rear = (
+            float(point[0]) - self.geometry["rear_wheelbase_m"] * forward[0],
+            float(point[1]) - self.geometry["rear_wheelbase_m"] * forward[1],
+        )
+        left = (-math.sin(float(psi)), math.cos(float(psi)))
+        delta = (float(q[0]) - rear[0], float(q[1]) - rear[1])
+        x_rear = delta[0] * forward[0] + delta[1] * forward[1]
+        y_rear = delta[0] * left[0] + delta[1] * left[1]
+        result = pure_pursuit_from_rear_coordinates(
+            x_rear,
+            y_rear,
+            wheelbase_m=self.geometry["wheelbase_m"],
+            max_steering_deg=self.geometry["max_steering_deg"],
+            steering_sign=self.steering_sign,
+            q=q,
+            rear_position=rear,
+            rear_wheelbase_m=self.geometry["rear_wheelbase_m"],
+        )
+        return {
+            "pp_valid": bool(result.valid),
+            "u_pp": result.u_pp,
+            "u_pp_unclipped": result.u_pp_unclipped,
+            "x_rear_m": result.x_rear,
+            "y_rear_m": result.y_rear,
+            "kappa_pp": result.kappa_pp,
+            "delta_pp_rad": result.delta_pp_rad,
+            "saturated": result.saturated,
+            "invalid_reason": result.reason,
+            "details": {
+                "wheelbase_m": self.geometry["wheelbase_m"],
+                "rear_wheelbase_m": self.geometry["rear_wheelbase_m"],
+                "max_steering_deg": self.geometry["max_steering_deg"],
+                "steering_sign": self.steering_sign,
+            },
+        }
+
+
+def wrap_lookahead_env(
+    raw_env: object,
+    *,
+    lookahead_m: float = 6.0,
+    pp_weight: float = 0.0,
+) -> LookaheadEnv:
+    """Wrap a raw host environment using ordinary TOML-resolved parameters.
+
+    ``pp_weight == 0`` selects observation-only mode.  A positive weight adds
+    the PP penalty while retaining the same augmented observation.  The raw
+    environment is never stepped or reset during construction; all host
+    access happens through :class:`lookahead_learning.env.LookaheadEnv`.
     """
 
-    project_root: Path
-    semantic_evidence: tuple[PrefixFeatureEvidence, ...] = ()
-    _factory: Callable[[Mapping[str, object]], object] | None = field(
-        default=None,
-        repr=False,
+    lookahead = _finite_number(lookahead_m, name="lookahead_m")
+    if lookahead <= 0.0:
+        raise ValueError("lookahead_m must be finite and positive")
+    weight = _finite_number(pp_weight, name="pp_weight")
+    if weight < 0.0:
+        raise ValueError("pp_weight must be finite and non-negative")
+    from .env import LookaheadEnv
+
+    contract = ObservationContract.from_space(
+        getattr(raw_env, "observation_space", None),
+        source=f"{type(raw_env).__module__}.{type(raw_env).__qualname__}",
     )
-
-    def __post_init__(self) -> None:
-        self.project_root = _normalise_root(self.project_root)
-        self.semantic_evidence = _coerce_feature_evidence(self.semantic_evidence)
-
-    @classmethod
-    def for_project(
-        cls,
-        project_root: str | Path,
-        *,
-        semantic_evidence: Mapping[int, PrefixFeatureEvidence | Mapping[str, object]]
-        | Sequence[PrefixFeatureEvidence | Mapping[str, object]]
-        | None = None,
-    ) -> "HostAdapter":
-        return cls(
-            project_root=_normalise_root(project_root),
-            semantic_evidence=_coerce_feature_evidence(semantic_evidence),
+    provider = MetaDrivePreviewProvider(lookahead_m=lookahead)
+    if weight == 0.0:
+        return LookaheadEnv(
+            raw_env,
+            mode="lookahead_obs",
+            contract=contract,
+            preview_provider=provider,
         )
-
-    def load_factory(self) -> Callable[[Mapping[str, object]], object]:
-        if self._factory is None:
-            module = import_host_module(
-                "env_factory",
-                project_root=self.project_root,
-            )
-            _check_known_host_origins(self.project_root)
-            factory = getattr(module, "make_env", None)
-            if not callable(factory):
-                raise HostImportError(
-                    f"env_factory.make_env is not callable in {self.project_root}"
-                )
-            self._factory = factory
-        return self._factory
-
-    def make_raw_env(self, env_config: Mapping[str, object]) -> object:
-        """Construct exactly one raw host environment on explicit request."""
-
-        factory = self.load_factory()
-        # MetaDrive merges nested configuration tables in place.  Give the
-        # host factory a deep copy so a run cannot mutate a shared TOML object.
-        with _temporary_import_root(self.project_root):
-            env = factory(copy.deepcopy(dict(env_config)))
-        # ``env_factory`` may import ``start_lane_env`` lazily when the
-        # configuration selects that subclass.  Check after construction too,
-        # while retaining the temporary import-root context for the factory
-        # call above.
-        _check_known_host_origins(self.project_root)
-        return env
-
-    def inspect_env(self, env: object) -> tuple[ObservationContract, ActionContract, float]:
-        """Inspect an existing raw env without reset/step calls."""
-
-        source = f"{type(env).__module__}.{type(env).__qualname__}"
-        observation_contract = ObservationContract.from_space(
-            getattr(env, "observation_space", None),
-            feature_evidence=self.semantic_evidence or None,
-            source=source,
-        )
-        config = _host_config_mapping(
-            getattr(env, "config", None),
-            name="raw environment config",
-        )
-        action_contract = ActionContract.from_space(
-            getattr(env, "action_space", None),
-            config,
-            source=source,
-        )
-        dt = simulation_dt_seconds(env)
-        return observation_contract, action_contract, dt
-
-    def audit_env(self, env: object) -> HostAudit:
-        """Create a non-throwing doctor report for an already constructed env."""
-
-        issues: list[str] = []
-        shape: tuple[int, ...] | None = None
-        dtype: str | None = None
-        action_space_name: str | None = None
-        dt: float | None = None
-        schema_ok = False
-        semantic_ok = bool(self.semantic_evidence)
-        try:
-            space = getattr(env, "observation_space")
-            shape = tuple(getattr(space, "shape", ()) or ())
-            dtype = str(getattr(space, "dtype", None))
-            action_space_name = type(getattr(env, "action_space")).__name__
-        except Exception as error:
-            issues.append(f"space inspection failed: {type(error).__name__}: {error}")
-        if shape != (BASELINE_OBS_DIM,):
-            issues.append(
-                "raw observation schema mismatch: "
-                f"expected ({BASELINE_OBS_DIM},), found {shape}"
-            )
-        elif dtype != str(np.dtype(np.float32)):
-            issues.append(
-                f"raw observation dtype mismatch: expected float32, found {dtype}"
-            )
-        else:
-            schema_ok = True
-        if not self.semantic_evidence:
-            semantic_ok = False
-            issues.append(
-                "indices 259..261 semantic evidence is absent; shape-only support "
-                "is refused for operational modes"
-            )
-        try:
-            dt = simulation_dt_seconds(env)
-        except Exception as error:
-            issues.append(f"simulation dt unavailable: {type(error).__name__}: {error}")
-        try:
-            ActionContract.from_space(
-                getattr(env, "action_space"),
-                getattr(env, "config"),
-            )
-        except Exception as error:
-            issues.append(f"action contract invalid: {type(error).__name__}: {error}")
-        try:
-            _check_known_host_origins(self.project_root)
-            origins = {
-                name: str(_module_path(sys.modules[name], name))
-                for name in _KNOWN_HOST_MODULES
-                if name in sys.modules
-            }
-        except HostImportError as error:
-            origins = {}
-            issues.append(str(error))
-        return HostAudit(
-            project_root=self.project_root,
-            imported_module_origins=origins,
-            raw_shape=shape,
-            raw_dtype=dtype,
-            action_space=action_space_name,
-            dt_seconds=dt,
-            supported_baseline_schema=schema_ok,
-            semantic_evidence=semantic_ok,
-            issues=tuple(issues),
-        )
-
+    pp_provider = MetaDrivePPProvider()
+    return LookaheadEnv(
+        raw_env,
+        mode="lookahead_obs_pp_reward",
+        contract=contract,
+        preview_provider=provider,
+        pp_provider=pp_provider,
+        pp_weight=weight,
+    )
 
 def normalize_preview_coordinate(value_m: float) -> float:
     """Encode a finite metric in metres to the requested [0, 1] value."""
@@ -1528,27 +1484,19 @@ def invalid_preview_values() -> tuple[float, float, float]:
 
 __all__ = [
     "ActionContract",
-    "AUGMENTED_OBS_DIM",
-    "BASELINE_OBS_DIM",
-    "HostAdapter",
-    "HostAudit",
     "HostContractError",
-    "HostImportError",
+    "MetaDrivePPProvider",
+    "MetaDrivePreviewProvider",
     "CANONICAL_MODES",
     "MODE_ALIASES",
-    "MODE_CHOICES",
     "Mode",
     "NORMALIZATION_DISTANCE_M",
     "ObservationContract",
     "PREVIEW_FEATURE_DIM",
-    "PREFIX_FEATURE_INDICES",
-    "PREFIX_FEATURE_NAMES",
-    "PrefixFeatureEvidence",
     "UnsupportedHostError",
     "get_single_agent",
     "build_fixed_navigation_route",
     "navigation_lane_sequence",
-    "import_host_module",
     "invalid_preview_values",
     "normalize_preview_coordinate",
     "normalize_mode",
@@ -1557,4 +1505,5 @@ __all__ = [
     "read_target_lane_state",
     "read_vehicle_state",
     "simulation_dt_seconds",
+    "wrap_lookahead_env",
 ]

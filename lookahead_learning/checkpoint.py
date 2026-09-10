@@ -1,185 +1,150 @@
-"""Strict, sidecar-only checkpoint compatibility validation.
+"""Portable lookahead configuration and checkpoint compatibility contracts.
 
 This module intentionally uses only the Python standard library.  It does not
 load PPO, inspect tensors, import the host project, or write metadata.  A
-runner computes a semantic ``expected`` mapping from the current host and
-passes the sidecar mapping it read as ``saved``.  Only keys present in
-``expected`` are compared; extra saved fields (including machine-specific
-paths) are left untouched unless the runner explicitly includes them.
+runner may use :func:`resolve_lookahead_config` for the TOML-facing settings and
+attach the resulting mapping to a PPO object before saving it.  Model
+compatibility is checked from those ZIP-carried attributes, so this module
+does not require an extra artifact or host-specific metadata.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from decimal import Decimal
-import hashlib
 import math
-from numbers import Real
-from pathlib import Path
-from typing import Any
 
 
 class CheckpointContractError(ValueError):
-    """The checkpoint bytes or saved semantic metadata violate the contract."""
+    """ZIP-carried lookahead attributes violate the compatibility contract."""
 
 
-def _field_path(path: str, key: Any) -> str:
-    if isinstance(key, int) and not isinstance(key, bool):
-        return f"{path}[{key}]"
-    key_text = str(key)
-    if path:
-        return f"{path}.{key_text}"
-    return key_text
+LOOKAHEAD_DEFAULTS: dict[str, float] = {
+    "lookahead_m": 6.0,
+    "pp_weight": 0.0,
+}
+"""Resolved defaults used whenever an explicit ``[lookahead]`` table exists."""
+
+LOOKAHEAD_MODEL_SCHEMA_VERSION = 1
+LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE = "lookahead_config"
+LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE = "lookahead_schema_version"
+_LOOKAHEAD_KEYS = frozenset(LOOKAHEAD_DEFAULTS)
+_MISSING = object()
 
 
-def _error(message: str) -> CheckpointContractError:
-    return CheckpointContractError(message)
+def _lookahead_real(
+    value: object,
+    *,
+    key: str,
+    minimum: float,
+    minimum_inclusive: bool,
+) -> float:
+    """Validate one TOML-facing finite scalar without importing root config."""
 
-
-def _validate_finite(value: Any, path: str, active: set[int]) -> None:
-    """Reject non-finite scalar values anywhere in metadata."""
-
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise _error(f"metadata field {path or '<root>'} must be finite")
-        return
-    if isinstance(value, Decimal):
-        if not value.is_finite():
-            raise _error(f"metadata field {path or '<root>'} must be finite")
-        return
-    if isinstance(value, Real) and not isinstance(value, bool):
-        # Real scalar implementations such as Fraction are finite by contract;
-        # checking float also catches custom Real values that expose infinity.
-        try:
-            if not math.isfinite(float(value)):
-                raise _error(f"metadata field {path or '<root>'} must be finite")
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise _error(f"metadata field {path or '<root>'} is not a finite scalar") from exc
-        return
-    if isinstance(value, Mapping):
-        identity = id(value)
-        if identity in active:
-            raise _error(f"metadata field {path or '<root>'} contains a cyclic mapping")
-        active.add(identity)
-        try:
-            for key, item in value.items():
-                _validate_finite(key, _field_path(path, key) + "<key>", active)
-                _validate_finite(item, _field_path(path, key), active)
-        finally:
-            active.remove(identity)
-        return
-    if isinstance(value, (list, tuple)):
-        identity = id(value)
-        if identity in active:
-            raise _error(f"metadata field {path or '<root>'} contains a cyclic sequence")
-        active.add(identity)
-        try:
-            for index, item in enumerate(value):
-                _validate_finite(item, _field_path(path, index), active)
-        finally:
-            active.remove(identity)
-        return
-    if isinstance(value, (set, frozenset)):
-        identity = id(value)
-        if identity in active:
-            raise _error(f"metadata field {path or '<root>'} contains a cyclic set")
-        active.add(identity)
-        try:
-            for index, item in enumerate(sorted(value, key=repr)):
-                _validate_finite(item, _field_path(path, index), active)
-        finally:
-            active.remove(identity)
-
-
-def _sha256_file(checkpoint: Path) -> str:
+    location = f"lookahead.{key}"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{location}: boolではない有限の数値で指定してください")
     try:
-        with checkpoint.open("rb") as stream:
-            digest = hashlib.sha256()
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except (OSError, TypeError) as exc:
-        raise _error(f"checkpoint cannot be read for model_sha256: {checkpoint}") from exc
-    return digest.hexdigest()
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{location}: 有限の数値で指定してください") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{location}: 有限の数値で指定してください")
+    too_small = (
+        number < minimum
+        if minimum_inclusive
+        else number <= minimum
+    )
+    if too_small:
+        comparator = "以上" if minimum_inclusive else "より大きい"
+        raise ValueError(f"{location}: {minimum} {comparator}の数値で指定してください")
+    return number
 
 
-def _compare_expected(saved: Any, expected: Any, path: str) -> None:
-    """Compare expected fields recursively, retaining a precise field path."""
+def resolve_lookahead_config(value: object) -> dict[str, float] | None:
+    """Resolve an optional TOML ``[lookahead]`` table.
 
-    if isinstance(expected, Mapping):
-        if not isinstance(saved, Mapping):
-            raise _error(f"metadata field {path or '<root>'} must be a mapping")
-        for key, expected_value in expected.items():
-            child_path = _field_path(path, key)
-            if key not in saved:
-                raise _error(f"missing metadata field {child_path}")
-            _compare_expected(saved[key], expected_value, child_path)
-        return
-    if isinstance(expected, list):
-        if not isinstance(saved, list):
-            raise _error(f"metadata field {path or '<root>'} must be a list")
-        if len(saved) != len(expected):
-            raise _error(
-                f"metadata field {path or '<root>'} list length mismatch: "
-                f"saved={len(saved)} expected={len(expected)}"
-            )
-        for index, (saved_item, expected_item) in enumerate(zip(saved, expected)):
-            _compare_expected(saved_item, expected_item, _field_path(path, index))
-        return
-    if isinstance(expected, tuple):
-        if not isinstance(saved, tuple):
-            raise _error(f"metadata field {path or '<root>'} must be a tuple")
-        if len(saved) != len(expected):
-            raise _error(
-                f"metadata field {path or '<root>'} tuple length mismatch: "
-                f"saved={len(saved)} expected={len(expected)}"
-            )
-        for index, (saved_item, expected_item) in enumerate(zip(saved, expected)):
-            _compare_expected(saved_item, expected_item, _field_path(path, index))
-        return
-    if type(saved) is not type(expected) or saved != expected:
-        raise _error(
-            f"metadata field {path or '<root>'} mismatch: "
-            f"saved={saved!r} expected={expected!r}"
-        )
-
-
-def validate_checkpoint_metadata(
-    checkpoint: Path,
-    saved: Mapping[str, Any],
-    expected: Mapping[str, Any],
-) -> None:
-    """Validate checkpoint bytes and the runner-selected semantic metadata.
-
-    ``saved`` must be a concrete ``dict`` because it is the decoded sidecar
-    object whose ownership and mutability contract is known to the runner.
-    ``expected`` may be any mapping.  The function returns ``None`` on success
-    and raises :class:`CheckpointContractError` on every contract mismatch.
+    ``None`` means that the feature is disabled.  Any mapping, including an
+    empty one, means enabled and receives the explicit defaults.  This function
+    deliberately accepts only plain finite numeric values so the same contract
+    can be reused by a copied ``lookahead_learning`` package.
     """
 
-    if not isinstance(saved, dict):
-        raise _error("saved checkpoint metadata must be a dict")
-    if not isinstance(expected, Mapping):
-        raise _error("expected checkpoint metadata must be a mapping")
-    _validate_finite(saved, "", set())
-    _validate_finite(expected, "", set())
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("lookahead: TOML tableで指定してください")
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError("lookahead: table keyは文字列で指定してください")
+    unknown = sorted(set(value) - _LOOKAHEAD_KEYS)
+    if unknown:
+        raise ValueError(f"lookahead: 未対応のkeyがあります: {', '.join(unknown)}")
+    return {
+        "lookahead_m": _lookahead_real(
+            value.get("lookahead_m", LOOKAHEAD_DEFAULTS["lookahead_m"]),
+            key="lookahead_m",
+            minimum=0.0,
+            minimum_inclusive=False,
+        ),
+        "pp_weight": _lookahead_real(
+            value.get("pp_weight", LOOKAHEAD_DEFAULTS["pp_weight"]),
+            key="pp_weight",
+            minimum=0.0,
+            minimum_inclusive=True,
+        ),
+    }
 
-    try:
-        checkpoint_path = checkpoint if isinstance(checkpoint, Path) else Path(checkpoint)
-    except (TypeError, ValueError) as exc:
-        raise _error("checkpoint must be a filesystem path") from exc
-    if not checkpoint_path.is_file():
-        raise _error(f"checkpoint does not exist: {checkpoint_path}")
 
-    saved_hash = saved.get("model_sha256")
-    if not isinstance(saved_hash, str) or not saved_hash:
-        raise _error("missing metadata field model_sha256")
-    actual_hash = _sha256_file(checkpoint_path)
-    if saved_hash != actual_hash:
-        raise _error(
-            "metadata field model_sha256 mismatch: "
-            f"saved={saved_hash!r} actual={actual_hash!r}"
+def set_lookahead_model_metadata(
+    model: object,
+    lookahead_config: Mapping[str, object] | None,
+) -> None:
+    """Attach resolved settings to attributes serialized inside a PPO ZIP."""
+
+    setattr(model, LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE, LOOKAHEAD_MODEL_SCHEMA_VERSION)
+    setattr(
+        model,
+        LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE,
+        None if lookahead_config is None else dict(lookahead_config),
+    )
+
+
+def validate_lookahead_model_metadata(
+    model: object,
+    expected: Mapping[str, object] | None,
+) -> None:
+    """Validate ZIP-carried lookahead settings against the selected TOML."""
+
+    actual = getattr(model, LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE, _MISSING)
+    if expected is None:
+        # Legacy baseline ZIPs have no custom attributes; newly saved baseline
+        # models carry ``None``.  An active checkpoint must not pass solely on
+        # an accidentally compatible observation shape.
+        if actual is _MISSING or actual is None:
+            return
+        raise CheckpointContractError(
+            "checkpoint contains active lookahead settings but the selected "
+            "TOML has no [lookahead] table"
         )
-    _compare_expected(saved, expected, "")
+    schema = getattr(model, LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE, None)
+    if schema != LOOKAHEAD_MODEL_SCHEMA_VERSION:
+        raise CheckpointContractError(
+            "lookahead config is active but the checkpoint has no supported "
+            "lookahead schema metadata"
+        )
+    if not isinstance(actual, Mapping) or dict(actual) != dict(expected):
+        raise CheckpointContractError(
+            "checkpoint lookahead settings do not match the selected TOML: "
+            f"expected={dict(expected)!r}, found={actual!r}"
+        )
 
 
-__all__ = ["CheckpointContractError", "validate_checkpoint_metadata"]
+__all__ = [
+    "CheckpointContractError",
+    "LOOKAHEAD_DEFAULTS",
+    "LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE",
+    "LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE",
+    "LOOKAHEAD_MODEL_SCHEMA_VERSION",
+    "resolve_lookahead_config",
+    "set_lookahead_model_metadata",
+    "validate_lookahead_model_metadata",
+]

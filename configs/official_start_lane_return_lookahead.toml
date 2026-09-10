@@ -1,0 +1,75 @@
+# Reset-lane return experiment with the lookahead observation extension.
+# Pass this same bundle to train.py and evaluate.py; the [lookahead] table is
+# the single feature switch and owns the resolved wrapper parameters.
+schema_version = 2
+name = "official_start_lane_return_lookahead"
+algorithm = "ppo"
+default_model_name = "official_start_lane_return_lookahead"
+
+[lookahead]
+# 経路に沿った前方注視距離[m]（正の有限値）。
+lookahead_m = 6.0
+# Pure Pursuit操舵不一致ペナルティ係数。0なら既存報酬を維持したまま観測を追加し、正値ならペナルティを追加する。
+pp_weight = 0.0
+
+[training]
+policy = "MlpPolicy"
+seed = 0
+num_envs = 4
+n_steps = 4096
+total_timesteps = 300000
+log_interval = 4
+device = "cpu"
+learning_rate = 0.0003
+batch_size = 64
+n_epochs = 10
+gamma = 0.99
+gae_lambda = 0.95
+clip_range = 0.2
+normalize_advantage = true
+ent_coef = 0.0
+vf_coef = 0.5
+max_grad_norm = 0.5
+
+[evaluation]
+record_gif = true
+output_prefix = "official_start_lane_return_lookahead"
+seed = 0
+device = "cpu"
+deterministic = true
+
+[environment.common]
+map = "C"
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+horizon = 500
+random_spawn_lane_index = false
+traffic_density = 0
+accident_prob = 0
+log_level = 50
+
+# MetaDrive's built-in lateral reward follows the dynamically localized lane,
+# so this task uses the project-local reset-lane target reward instead.
+use_lateral_reward = false
+on_broken_line_done = false
+out_of_road_done = true
+out_of_road_penalty = 200.0
+
+# Project-local StartLaneMetaDriveEnv task configuration.
+start_lane_objective = "return"
+start_lane_center_coef = 0.25
+start_lane_wrong_coef = 0.10
+start_lane_tolerance_ratio = 0.05
+start_lane_violation_hold_steps = 2
+start_lane_terminal_penalty = 200.0
+
+# Training retains the official sample's single scenario at seed 5.
+[environment.train]
+start_seed = 5
+num_scenarios = 1
+
+# Evaluation uses the same official sample scenario at seed 5.
+[environment.evaluation]
+start_seed = 5
+num_scenarios = 1
