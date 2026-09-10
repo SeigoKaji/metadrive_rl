@@ -394,3 +394,36 @@ def test_report_hashes_nested_frames_and_preserves_all_raw_data_on_regeneration(
     assert hashes() == before
     metadata_again = json.loads((tmp_path / "report_metadata.json").read_text(encoding="utf-8"))
     assert metadata_again["raw_data_sha256"] == metadata["raw_data_sha256"]
+
+
+def test_report_removes_stale_media_after_visual_producer_failure(tmp_path: Path, monkeypatch) -> None:
+    _fixture_run(tmp_path)
+    first = generate_report(tmp_path)
+    assert first.status == "success", first.errors
+    old_paths = (
+        tmp_path / "baseline" / "rollout.gif",
+        tmp_path / "baseline" / "rewards.png",
+        tmp_path / "patterns" / "P01" / "rollout.gif",
+        tmp_path / "patterns" / "P01" / "rewards.png",
+        tmp_path / "patterns" / "P01" / "policy_change.png",
+    )
+    assert all(path.is_file() for path in old_paths)
+
+    def fail_visual(*args, **kwargs):
+        return reporting.VisualResult(None, "failed", {}, ("forced visual failure",))
+
+    monkeypatch.setattr(reporting, "render_rollout_gif", fail_visual)
+    monkeypatch.setattr(reporting, "render_rewards_plot", fail_visual)
+    monkeypatch.setattr(reporting, "render_policy_change_plot", fail_visual)
+    second = generate_report(tmp_path)
+    assert second.status == "failed"
+    assert all(not path.exists() for path in old_paths)
+    html = (tmp_path / "report.html").read_text(encoding="utf-8")
+    for href in (
+        "baseline/rollout.gif",
+        "baseline/rewards.png",
+        "patterns/P01/rollout.gif",
+        "patterns/P01/rewards.png",
+        "patterns/P01/policy_change.png",
+    ):
+        assert f'href="{href}"' not in html

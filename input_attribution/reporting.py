@@ -711,6 +711,26 @@ def _fixed_value(pattern: Mapping[str, Any], index: int, indices: Sequence[int])
     return None
 
 
+def _compact_fixed_text(pattern: Mapping[str, Any], indices: Sequence[int]) -> str:
+    """Format one fixed-value label without expanding high-dimensional targets."""
+
+    values = [_fixed_value(pattern, index, indices) for index in indices]
+    if not values:
+        return "N/A"
+    labels = [
+        _fmt_number(value) if _number(value) is not None else (str(value) if value is not None else "N/A")
+        for value in values
+    ]
+    unique_labels = list(dict.fromkeys(labels))
+    if len(unique_labels) == 1:
+        return unique_labels[0]
+    numbers = [_number(value) for value in values]
+    if all(number is not None for number in numbers):
+        finite_numbers = [number for number in numbers if number is not None]
+        return f"[{_fmt_number(min(finite_numbers))},{_fmt_number(max(finite_numbers))}]"
+    return "multiple (see CSV)"
+
+
 def _replacement_text(rollout: _Rollout, pattern: Mapping[str, Any], *, is_baseline: bool) -> str:
     indices = _parse_indices(_first(pattern, "indices", "requested_indices", "target_indices", default=None))
     if is_baseline or not indices:
@@ -724,22 +744,7 @@ def _replacement_text(rollout: _Rollout, pattern: Mapping[str, Any], *, is_basel
     observed = [bound for bound in ranges.values() if bound is not None]
     before_min = min((bound[0] for bound in observed), default=None)
     before_max = max((bound[1] for bound in observed), default=None)
-    fixed_values = [_fixed_value(pattern, index, indices) for index in indices]
-    fixed_numbers = [number for number in (_number(value) for value in fixed_values) if number is not None]
-    if fixed_numbers and len(fixed_numbers) == len(fixed_values) and all(
-        math.isclose(number, fixed_numbers[0], rel_tol=0.0, abs_tol=0.0)
-        for number in fixed_numbers
-    ):
-        fixed_text = _fmt_number(fixed_numbers[0])
-    elif fixed_numbers and len(fixed_numbers) == len(fixed_values):
-        fixed_text = f"[{_fmt_number(min(fixed_numbers))},{_fmt_number(max(fixed_numbers))}]"
-    else:
-        labels = [
-            _fmt_number(value) if _number(value) is not None else (str(value) if value is not None else "N/A")
-            for value in fixed_values
-        ]
-        unique_labels = list(dict.fromkeys(labels))
-        fixed_text = unique_labels[0] if len(unique_labels) == 1 else f"{unique_labels[0]}等{len(unique_labels)}種"
+    fixed_text = _compact_fixed_text(pattern, indices)
     range_text = (
         f"[{_fmt_number(before_min)},{_fmt_number(before_max)}]"
         if before_min is not None and before_max is not None
@@ -856,11 +861,7 @@ def _overlay_callback(
             target_name = target_name[:21].rstrip() + "..."
         target = f"{rollout.identifier} {target_name}".strip()
         target += f" idx={_index_text(indices)}"
-        fixed_values = [_fixed_value(pattern, index, indices) for index in indices]
-        fixed = ",".join(
-            _fmt_number(value) if _number(value) is not None else (str(value) if value is not None else "N/A")
-            for value in fixed_values
-        ) or "N/A"
+        fixed = _compact_fixed_text(pattern, indices)
 
     def callback(record: Mapping[str, Any], step: int) -> list[str]:
         sim_time = _number(record.get("sim_time", record.get("simulation_time")))
@@ -891,11 +892,7 @@ def _overlay_callback(
 
 def _pattern_chart_title(rollout: _Rollout, pattern: Mapping[str, Any]) -> str:
     indices = _parse_indices(_first(pattern, "indices", "requested_indices", "target_indices", default=None))
-    fixed_values = [_fixed_value(pattern, index, indices) for index in indices]
-    fixed_text = ",".join(
-        _fmt_number(value) if _number(value) is not None else (str(value) if value is not None else "N/A")
-        for value in fixed_values
-    ) or "N/A"
+    fixed_text = _compact_fixed_text(pattern, indices)
     return f"{rollout.name} fixed={fixed_text} idx={_index_text(indices)}"
 
 
@@ -1349,6 +1346,17 @@ def _disabled_media_metadata(path: Path, *, reason: str) -> None:
     _write_json(path, {"status": "disabled", "reason": reason, "path": None})
 
 
+def _clear_derived(path: Path | None, *, label: str, errors: list[str]) -> None:
+    """Remove one previous report artifact before attempting to regenerate it."""
+
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        errors.append(f"{label}: cannot remove previous artifact {path}: {exc}")
+
+
 def _append_visual_result(
     result: VisualResult,
     *,
@@ -1357,7 +1365,15 @@ def _append_visual_result(
     errors: list[str],
 ) -> None:
     if result.path is not None and result.path.is_file():
-        files.append(result.path)
+        if result.status == "complete":
+            files.append(result.path)
+        else:
+            # A partial/failed producer may have left a current output.  Do
+            # not let HTML mistake it for a valid artifact on this run.
+            try:
+                result.path.unlink(missing_ok=True)
+            except OSError as exc:
+                errors.append(f"{label}: cannot remove incomplete artifact {result.path}: {exc}")
     if result.errors:
         errors.extend(f"{label}: {error}" for error in result.errors)
 
@@ -1368,6 +1384,7 @@ def _visual_call(
     label: str,
     files: list[Path],
     errors: list[str],
+    artifact_path: Path | None = None,
     **kwargs: Any,
 ) -> VisualResult | None:
     """Contain a backend exception so raw results still receive a report."""
@@ -1375,11 +1392,15 @@ def _visual_call(
     try:
         result = producer(*args, **kwargs)
     except Exception as exc:  # pragma: no cover - backend-specific failures
+        _clear_derived(artifact_path, label=label, errors=errors)
         errors.append(f"{label}: {type(exc).__name__}: {exc}")
         return None
     if not isinstance(result, VisualResult):
+        _clear_derived(artifact_path, label=label, errors=errors)
         errors.append(f"{label}: visual producer returned an invalid result")
         return None
+    if result.status != "complete":
+        _clear_derived(artifact_path, label=label, errors=errors)
     _append_visual_result(result, label=label, files=files, errors=errors)
     return result
 
@@ -1410,6 +1431,9 @@ def generate_report(
     baseline_gif = baseline_dir / "rollout.gif"
     baseline_rewards = baseline_dir / "rewards.png"
     baseline_media = baseline_dir / "media.json"
+    _clear_derived(baseline_gif, label="baseline GIF cleanup", errors=errors)
+    _clear_derived(baseline_rewards, label="baseline rewards cleanup", errors=errors)
+    _clear_derived(baseline_media, label="baseline media cleanup", errors=errors)
     gif_enabled = _gif_enabled(manifest, baseline.payload)
     if gif_enabled and not _rollout_not_run(baseline):
         _visual_call(
@@ -1421,6 +1445,7 @@ def generate_report(
             label="baseline GIF",
             files=files,
             errors=errors,
+            artifact_path=baseline_gif,
             metadata_path=baseline_media,
             overlay_lines=_overlay_callback(baseline, {"id": "P00", "name": "baseline"}, is_baseline=True),
         )
@@ -1431,15 +1456,17 @@ def generate_report(
         )
     if baseline_media.is_file():
         files.append(baseline_media)
-    _visual_call(
-        render_rewards_plot,
-        baseline_records,
-        baseline_rewards,
-        label="baseline rewards",
-        files=files,
-        errors=errors,
-        title="baseline rewards",
-    )
+    if not _rollout_not_run(baseline):
+        _visual_call(
+            render_rewards_plot,
+            baseline_records,
+            baseline_rewards,
+            label="baseline rewards",
+            files=files,
+            errors=errors,
+            artifact_path=baseline_rewards,
+            title="baseline rewards",
+        )
 
     summary_rows: list[dict[str, Any]] = [
         _summary_row(baseline, {"id": "P00", "name": baseline.name}, baseline, is_baseline=True)
@@ -1448,6 +1475,10 @@ def generate_report(
     used_components: set[str] = set()
     for rollout, pattern, offline, offline_path in pattern_entries:
         artifact = _artifact_paths(destination, rollout.identifier, used_components)
+        _clear_derived(artifact.gif, label=f"{rollout.identifier} GIF cleanup", errors=errors)
+        _clear_derived(artifact.rewards, label=f"{rollout.identifier} rewards cleanup", errors=errors)
+        _clear_derived(artifact.policy_change, label=f"{rollout.identifier} policy cleanup", errors=errors)
+        _clear_derived(artifact.media_metadata, label=f"{rollout.identifier} media cleanup", errors=errors)
         pattern_artifacts.append((rollout, pattern, offline, artifact))
         summary_rows.append(_summary_row(rollout, pattern, baseline, is_baseline=False))
         records = _records(rollout)
@@ -1461,6 +1492,7 @@ def generate_report(
                 label=f"{rollout.identifier} GIF",
                 files=files,
                 errors=errors,
+                artifact_path=artifact.gif,
                 metadata_path=artifact.media_metadata,
                 overlay_lines=_overlay_callback(rollout, pattern, is_baseline=False),
             )
@@ -1471,36 +1503,39 @@ def generate_report(
             )
         if artifact.media_metadata is not None and artifact.media_metadata.is_file():
             files.append(artifact.media_metadata)
-        _visual_call(
-            render_rewards_plot,
-            baseline_records,
-            artifact.rewards,
-            label=f"{rollout.identifier} rewards",
-            files=files,
-            errors=errors,
-            changed_records=records,
-            title=f"{rollout.name} rewards",
-        )
+        if not _rollout_not_run(rollout):
+            _visual_call(
+                render_rewards_plot,
+                baseline_records,
+                artifact.rewards,
+                label=f"{rollout.identifier} rewards",
+                files=files,
+                errors=errors,
+                artifact_path=artifact.rewards,
+                changed_records=records,
+                title=f"{rollout.name} rewards",
+            )
 
-        if offline is not None:
-            offline_records = offline.get("records", [])
-            if not isinstance(offline_records, list):
-                errors.append(f"{rollout.identifier} offline records must be a JSON array")
-            else:
-                _visual_call(
-                    render_policy_change_plot,
-                    [record for record in offline_records if isinstance(record, Mapping)],
-                    artifact.policy_change,
-                    label=f"{rollout.identifier} policy change",
-                    files=files,
-                    errors=errors,
-                    title=_pattern_chart_title(rollout, pattern),
-                    ylim=(0.0, LN2),
-                    xlim=(
-                        0.0,
-                        float(max(0, len(_executed_records(baseline)) - 1)),
-                    ),
-                )
+            if offline is not None:
+                offline_records = offline.get("records", [])
+                if not isinstance(offline_records, list):
+                    errors.append(f"{rollout.identifier} offline records must be a JSON array")
+                else:
+                    _visual_call(
+                        render_policy_change_plot,
+                        [record for record in offline_records if isinstance(record, Mapping)],
+                        artifact.policy_change,
+                        label=f"{rollout.identifier} policy change",
+                        files=files,
+                        errors=errors,
+                        artifact_path=artifact.policy_change,
+                        title=_pattern_chart_title(rollout, pattern),
+                        ylim=(0.0, LN2),
+                        xlim=(
+                            0.0,
+                            float(max(0, len(_executed_records(baseline)) - 1)),
+                        ),
+                    )
 
     # Keep the public six-column CSV exact.  Machine-readable extra detail is
     # separate and does not inflate the main table.
