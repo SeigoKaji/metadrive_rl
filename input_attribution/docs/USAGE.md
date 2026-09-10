@@ -20,7 +20,7 @@ python3 -c 'from input_attribution.schema import standard_259_schema, lidar_part
 | 262幅の移植チェック | `input_attribution/configs/host_262_migration_template.toml` |
 | T13人工262幅の合成契約 | `input_attribution/configs/synthetic_262_demo.toml` |
 
-公式設定の `model_path` は `models/official_baseline.zip`、環境は既存公式 `map=C`、3×3離散action（9 action）、scenario seed 5に合わせています。実行前にmodelの実在、modelの観測shape、実環境の観測shape、schemaをcheckで照合します。モデルのない環境で公式runを開始せず、合成設定を使います。
+公式設定の `model_path` は `models/official_baseline.zip`、環境は既存公式 `map=C`、3×3離散action（9 action）、scenario seed 5に合わせています。公式runの出力先は `outputs/official/input_attribution/official_smoke` または `outputs/official/input_attribution/official_fixed_stress` です。実行前にmodelの実在、modelの観測shape、実環境の観測shape、schemaをcheckで照合します。モデルのない環境で公式runを開始せず、合成設定を使います。
 
 ## check / run
 

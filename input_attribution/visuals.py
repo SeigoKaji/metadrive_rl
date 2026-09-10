@@ -727,7 +727,7 @@ def render_policy_change_plot(
     xlim: tuple[float, float] | None = None,
     dpi: int = 140,
 ) -> VisualResult:
-    """Render one JS time series and same-time argmax-change markers."""
+    """Render recorded JS points and same-time action-change markers."""
 
     destination = Path(output_path)
     rows = [record for record in records if isinstance(record, Mapping)]
@@ -741,7 +741,20 @@ def render_policy_change_plot(
         figure, axis = pyplot.subplots(figsize=(9.5, 4.8))
         steps, values, changed_points = _js_series(rows)
         if steps:
-            axis.plot(steps, values, linewidth=1.8, color="#5e81ac", label="JS divergence (nats)")
+            axis.scatter(
+                steps,
+                values,
+                s=20,
+                color="#5e81ac",
+                marker="o",
+                linewidths=0,
+                zorder=2,
+                clip_on=False,
+                label=_plot_label(
+                    "JS divergence（記録点、nats）",
+                    "JS divergence (recorded points, nats)",
+                ),
+            )
         if changed_points:
             axis.scatter(
                 [point[0] for point in changed_points],
@@ -751,7 +764,10 @@ def render_policy_change_plot(
                 marker="o",
                 zorder=4,
                 clip_on=False,
-                label="argmax changed at same step",
+                label=_plot_label(
+                    "行動が変化（入力変更前後）",
+                    "Action changed by input modification",
+                ),
             )
         finite = [value for value in values if math.isfinite(value)]
         mean = math.fsum(finite) / len(finite) if finite else None
@@ -760,9 +776,9 @@ def render_policy_change_plot(
             0.995,
             0.98,
             (
-                f"mean={mean:.4g}, max={maximum:.4g}, changed={len(changed_points)}, valid={len(finite)}"
+                f"mean={mean:.4g}, max={maximum:.4g}, action_changed={len(changed_points)}, valid={len(finite)}"
                 if mean is not None and maximum is not None
-                else f"JS unavailable; changed={len(changed_points)}, valid=0; missing steps are not zero"
+                else f"JS unavailable; action_changed={len(changed_points)}, valid=0; missing steps are not zero"
             ),
             transform=axis.transAxes,
             ha="right",

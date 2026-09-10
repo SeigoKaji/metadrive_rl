@@ -1174,7 +1174,7 @@ def _html_report(
             + "</article>"
         )
     patterns_html = '<section id="closed-loop"><h2>①-B 全pattern</h2>' + "".join(pattern_sections) + "</section>"
-    offline_html = '<section id="offline"><h2>①-A 保存観測のJS</h2><p class="note">JSは同じ時刻のp/q分布です。マーカーは隣接stepの変化ではなく、同時刻のargmax差です。未比較stepは0に補完していません。</p>' + "".join(offline_sections) + "</section>"
+    offline_html = '<section id="offline"><h2>①-A 保存観測のJS</h2><p class="note">JSは同じ時刻のp/q分布を、記録された各stepに1点で表示します。点どうしは線で結ばず、補間もしません。赤点は入力変更前後で最も確率の高い行動が異なるstepです。前stepとの比較ではありません。未比較stepや欠測JSは0に補完していません。</p>' + "".join(offline_sections) + "</section>"
     title = "Input attribution report"
     return f'''<!doctype html>
 <html lang="ja">
