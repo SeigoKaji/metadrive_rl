@@ -81,7 +81,7 @@ host固有の入力・車両・Navigationの意味と単位はadapterの監査�
 
 | 文書 | 内容 |
 |---|---|
-| [仕組みと数式](methods.md) | 観測、注視点、PP、追加報酬、1 decisionの処理 |
+| [観測入力と報酬関数の仕様](methods.md) | 観測の構成、注視点の生成・正規化、PP 参照と追加報酬の定義 |
 | [実行手順](run.md) | 通常train/evaluate、軽量テスト |
 | [移植手順](porting.md) | 必要なruntime、4つの薄いhook、移植後の運用確認 |
 | [GitHub Copilot向け移植プロンプト](copilot_porting_prompt.md) | 小さな移植依頼として貼れる指示文 |

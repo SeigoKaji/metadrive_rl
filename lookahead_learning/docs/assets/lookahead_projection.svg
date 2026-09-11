@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="720" viewBox="0 0 840 720" role="img" aria-labelledby="title desc">
+  <title id="title">車体基準点の投影と候補の競合</title>
+  <desc id="desc">上段は最初の区間 20 m と次の区間内 4 m を足して投影位置の累積距離が 24 m になる例。車体から中心線への直線距離 2 m は累積距離に加えない。下段左では隣接区間の共有端点で前区間を採用する。下段右では U 字経路の非隣接区間 1 と 3 にほぼ同距離の候補があり、ambiguous_projection として無効にする。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>
+    <marker id="blue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/></marker>
+    <marker id="green-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/></marker>
+    <marker id="amber-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/></marker>
+    <style>
+      text { font-family: sans-serif; font-size: 20px; fill: #172b4d; }
+      .heading { font-size: 24px; font-weight: 700; }
+      .label { font-size: 20px; font-weight: 700; }
+      .small { font-size: 17px; }
+      .blue { fill: #2563eb; }
+      .green { fill: #0f766e; }
+      .amber { fill: #b45309; }
+      .muted { fill: #64748b; }
+      .invalid { fill: #b91c1c; }
+      .panel { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1; }
+      .guide { fill: none; stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 5 5; }
+      .axis { fill: none; stroke: #64748b; stroke-width: 1.5; marker-end: url(#arrow); }
+      .dimension { fill: none; stroke: #64748b; stroke-width: 1.5; marker-start: url(#arrow); marker-end: url(#arrow); }
+      .route-blue { fill: none; stroke: #2563eb; stroke-width: 5; stroke-linecap: round; }
+      .route-green { fill: none; stroke: #0f766e; stroke-width: 5; stroke-linecap: round; }
+      .point { fill: #172b4d; }
+    </style>
+  </defs>
+  <rect width="840" height="720" fill="white"/>
+  <text x="28" y="34" class="heading">1.3 投影：中心線上の位置と、車体からの距離を分ける</text>
+  <text x="28" y="63" class="small">模式図。上段は数値例、下段は候補が競合する場合の例。</text>
+  <rect x="24" y="82" width="792" height="324" rx="10" class="panel"/>
+  <text x="44" y="112" class="label">A. 投影点までの累積距離を求める</text>
+
+  <path d="M 70 265 L 370 265" class="route-blue"/>
+  <path d="M 370 265 L 740 265" class="route-green"/>
+  <path d="M 670 265 L 710 265" fill="none" stroke="#0f766e" stroke-width="3" marker-end="url(#green-arrow)"/>
+  <text x="165" y="235" class="blue">区間 1</text>
+  <text x="650" y="235" class="green">区間 2</text>
+  <rect x="395" y="218" width="70" height="32" rx="7" fill="#fef3c7" stroke="#b45309" stroke-width="1.5"/>
+  <path d="M 442 226 L 451 235 L 442 244" fill="none" stroke="#b45309" stroke-width="1.5"/>
+  <path d="M 430 235 L 430 265" class="guide"/>
+  <circle cx="430" cy="235" r="4.5" fill="#b45309"/>
+  <path d="M 435 227 L 463 190" fill="none" stroke="#b45309" stroke-width="1"/>
+  <text x="478" y="174" class="amber">車体基準点 p</text>
+  <text x="478" y="198" class="small">vehicle.position（車体中央）</text>
+  <path d="M 438 255 L 487 244" fill="none" stroke="#64748b" stroke-width="1"/>
+  <text x="495" y="245" class="small muted">直線距離 2 m</text>
+
+  <circle cx="70" cy="265" r="5" class="point"/>
+  <circle cx="370" cy="265" r="5" class="point"/>
+  <circle cx="430" cy="265" r="5" fill="#0f766e"/>
+  <text x="50" y="292" class="small">S = 0</text>
+  <text x="348" y="292" class="small">20 m</text>
+  <path d="M 435 272 L 466 293" fill="none" stroke="#64748b" stroke-width="1"/>
+  <text x="475" y="302" class="green">投影点 P(S_proj)</text>
+  <path d="M 70 308 L 370 308" class="dimension"/>
+  <path d="M 370 308 L 430 308" class="dimension"/>
+  <text x="220" y="338" text-anchor="middle">20 m（S_start）</text>
+  <text x="435" y="338" text-anchor="middle" class="small">4 m（s_local）</text>
+  <text x="44" y="383" class="label">S_proj = S_start + s_local = 20 + 4 = 24 m</text>
+
+  <rect x="24" y="426" width="386" height="272" rx="10" class="panel"/>
+  <rect x="426" y="426" width="390" height="272" rx="10" class="panel"/>
+  <text x="44" y="458" class="label">B. 隣接区間の共有端点</text>
+  <path d="M 60 514 L 200 514" class="route-blue"/>
+  <path d="M 200 514 L 370 514" class="route-green"/>
+  <text x="70" y="495" class="small blue">区間 1</text>
+  <text x="285" y="495" class="small green">区間 2</text>
+  <circle cx="200" cy="514" r="5" class="point"/>
+  <path d="M 200 514 L 200 560" class="guide"/>
+  <circle cx="200" cy="560" r="5" fill="#b45309"/>
+  <text x="215" y="566" class="amber">p</text>
+  <text x="44" y="614" class="small">同じ接続点・累積位置・距離</text>
+  <text x="44" y="645" class="small">→ 前区間の候補を採用</text>
+  <text x="44" y="676" class="small muted">非隣接区間との競合がない場合。</text>
+
+  <text x="446" y="458" class="label">C. 非隣接区間の競合</text>
+  <path d="M 460 510 L 715 510" class="route-blue"/>
+  <path d="M 715 510 A 40 40 0 0 1 715 590" fill="none" stroke="#64748b" stroke-width="5"/>
+  <path d="M 715 590 L 460 590" class="route-green"/>
+  <path d="M 650 510 L 680 510" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <path d="M 680 590 L 650 590" fill="none" stroke="#0f766e" stroke-width="3" marker-end="url(#green-arrow)"/>
+  <text x="620" y="493" class="small blue">区間 1</text>
+  <text x="771" y="557" class="small muted">2</text>
+  <text x="620" y="617" class="small green">区間 3</text>
+  <path d="M 570 510 L 570 590" class="guide"/>
+  <circle cx="570" cy="510" r="5" fill="#2563eb"/>
+  <circle cx="570" cy="590" r="5" fill="#0f766e"/>
+  <circle cx="570" cy="550" r="5" fill="#b45309"/>
+  <text x="545" y="557" class="amber">p</text>
+  <text x="582" y="537" class="small muted">d</text>
+  <text x="582" y="579" class="small muted">d</text>
+  <text x="446" y="648" class="small invalid">距離差 ≤ 0.001 m → 無効</text>
+  <text x="446" y="676" class="small invalid">ambiguous_projection（b = 0）</text>
+</svg>

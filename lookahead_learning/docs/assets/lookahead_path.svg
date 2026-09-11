@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="560" viewBox="0 0 840 560" role="img" aria-labelledby="title desc">
+  <title id="title">固定経路の接続と累積距離</title>
+  <desc id="desc">reset 時に各道路から開始車線番号に対応する Lane を選ぶ。直線の区間 1 と円弧の区間 2 を進行方向につなぎ、次の区間との接続を検証できない境界で固定経路を終える。累積距離 S は始点を 0 として各区間の長さを足した値で、P(S) はその位置の中心線上の world 座標。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>
+    <marker id="blue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/></marker>
+    <marker id="green-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/></marker>
+    <marker id="amber-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/></marker>
+    <style>
+      text { font-family: sans-serif; font-size: 20px; fill: #172b4d; }
+      .heading { font-size: 24px; font-weight: 700; }
+      .label { font-size: 20px; font-weight: 700; }
+      .small { font-size: 17px; }
+      .blue { fill: #2563eb; }
+      .green { fill: #0f766e; }
+      .amber { fill: #b45309; }
+      .muted { fill: #64748b; }
+      .invalid { fill: #b91c1c; }
+      .panel { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1; }
+      .guide { fill: none; stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 5 5; }
+      .axis { fill: none; stroke: #64748b; stroke-width: 1.5; marker-end: url(#arrow); }
+      .dimension { fill: none; stroke: #64748b; stroke-width: 1.5; marker-start: url(#arrow); marker-end: url(#arrow); }
+      .route-blue { fill: none; stroke: #2563eb; stroke-width: 5; stroke-linecap: round; }
+      .route-green { fill: none; stroke: #0f766e; stroke-width: 5; stroke-linecap: round; }
+      .point { fill: #172b4d; }
+    </style>
+  </defs>
+  <rect width="840" height="560" fill="white"/>
+  <text x="28" y="34" class="heading">1.2 固定経路：Lane の中心線を進行方向につなぐ</text>
+  <text x="28" y="63" class="small">模式図。太線は採用した中心線、矢印は経路の進行方向。</text>
+  <rect x="24" y="86" width="792" height="68" rx="10" class="panel"/>
+  <text x="44" y="113" class="label">reset 時の Navigation</text>
+  <text x="44" y="139" class="small">計画順の各道路 → 開始車線番号に対応する Lane を 1 本ずつ選択</text>
+
+  <path d="M 70 350 L 300 350" class="route-blue"/>
+  <path d="M 180 350 L 220 350" fill="none" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <path d="M 300 350 A 125 125 0 0 0 425 225" class="route-green"/>
+  <path d="M 408.25 287.5 A 125 125 0 0 0 423.1 246.7" fill="none" stroke="#0f766e" stroke-width="3" marker-end="url(#green-arrow)"/>
+  <path d="M 495 225 L 755 225" fill="none" stroke="#94a3b8" stroke-width="4" stroke-dasharray="8 7"/>
+  <path d="M 425 225 L 495 225" fill="none" stroke="#b91c1c" stroke-width="1.5" stroke-dasharray="3 5"/>
+  <text x="80" y="269" class="label blue">区間 1</text>
+  <text x="80" y="296" class="small">StraightLane（長さ ℓ₁）</text>
+  <text x="300" y="185" class="label green">区間 2</text>
+  <text x="300" y="208" class="small">CircularLane（長さ ℓ₂）</text>
+  <text x="530" y="192" class="small muted">以降の Lane（未採用）</text>
+
+  <circle cx="70" cy="350" r="5" class="point"/>
+  <circle cx="300" cy="350" r="5" class="point"/>
+  <circle cx="388.4" cy="313.4" r="5" class="point"/>
+  <path d="M 395 313 L 426 313" fill="none" stroke="#64748b" stroke-width="1"/>
+  <text x="435" y="320">P(S)</text>
+  <text x="50" y="384">S = 0</text>
+  <text x="258" y="384">S = ℓ₁</text>
+  <path d="M 418 218 L 432 232 M 418 232 L 432 218" fill="none" stroke="#b91c1c" stroke-width="3"/>
+  <text x="438" y="255" class="small invalid">接続不可</text>
+  <path d="M 465 265 L 515 285" fill="none" stroke="#b91c1c" stroke-width="1"/>
+  <text x="530" y="297" class="small invalid">この例では端点の接続を検証できず、</text>
+  <text x="530" y="322" class="small invalid">区間 2 の終点を S_end とする。</text>
+  <text x="530" y="365" class="small">接続時は端点・接線・</text>
+  <text x="530" y="390" class="small">車線数・幅の連続性を確認。</text>
+
+  <rect x="24" y="418" width="792" height="118" rx="10" class="panel"/>
+  <text x="44" y="446" class="label">累積距離 S：各区間の長さを足す</text>
+  <path d="M 70 478 L 300 478" class="route-blue"/>
+  <path d="M 300 478 L 650 478" class="route-green"/>
+  <path d="M 70 472 L 70 484 M 300 472 L 300 484 M 650 472 L 650 484" fill="none" stroke="#172b4d" stroke-width="2"/>
+  <text x="165" y="470" class="small blue">区間 1</text>
+  <text x="440" y="470" class="small green">区間 2</text>
+  <text x="70" y="504" text-anchor="middle">0</text>
+  <text x="300" y="504" text-anchor="middle">ℓ₁</text>
+  <text x="650" y="504" text-anchor="middle">S_end = ℓ₁ + ℓ₂</text>
+  <text x="44" y="526" class="small">P(S) は、累積距離 S にある中心線上の world 座標。</text>
+</svg>
