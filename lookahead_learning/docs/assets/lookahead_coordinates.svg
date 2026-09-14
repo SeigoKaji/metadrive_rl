@@ -27,7 +27,7 @@
   </defs>
   <rect width="840" height="644" fill="white"/>
   <text x="28" y="34" class="heading">1.5 座標変換：注視点を車体の前方・左方の成分で表す</text>
-  <text x="28" y="63" class="small">左右の図は同じ p と q。例では x_g &gt; 0、y_g &gt; 0。</text>
+  <text x="28" y="63" class="small">左右の図は同じ p と q。例では x<tspan baseline-shift="sub" font-size="70%">g</tspan> &gt; 0、y<tspan baseline-shift="sub" font-size="70%">g</tspan> &gt; 0。</text>
   <rect x="24" y="86" width="450" height="420" rx="10" class="panel"/>
   <rect x="490" y="86" width="326" height="420" rx="10" class="panel"/>
   <text x="44" y="118" class="label">world 座標</text>
@@ -50,8 +50,8 @@
   <path d="M 335.88 295 L 280.88 199.74 L 125 289.74" class="guide"/>
   <path d="M 180 385 L 335.88 295" fill="none" stroke="#2563eb" stroke-width="4"/>
   <path d="M 180 385 L 125 289.74" fill="none" stroke="#0f766e" stroke-width="4"/>
-  <text x="270" y="350" class="blue">x_g</text>
-  <text x="96" y="337" class="green">y_g</text>
+  <text x="270" y="350" class="blue">x<tspan baseline-shift="sub" font-size="70%">g</tspan></text>
+  <text x="96" y="337" class="green">y<tspan baseline-shift="sub" font-size="70%">g</tspan></text>
   <path d="M 180 385 L 280.88 199.74" fill="none" stroke="#b45309" stroke-width="2.5" marker-end="url(#amber-arrow)"/>
   <text x="246" y="281" class="amber">Δ</text>
   <circle cx="180" cy="385" r="5" fill="#b45309"/>
@@ -66,18 +66,18 @@
   <path d="M 730 392 L 730 282 L 550 282" class="guide"/>
   <path d="M 550 392 L 730 392" fill="none" stroke="#2563eb" stroke-width="4"/>
   <path d="M 550 392 L 550 282" fill="none" stroke="#0f766e" stroke-width="4"/>
-  <text x="730" y="422" text-anchor="middle" class="blue">x_g</text>
-  <text x="501" y="287" class="green">y_g</text>
+  <text x="730" y="422" text-anchor="middle" class="blue">x<tspan baseline-shift="sub" font-size="70%">g</tspan></text>
+  <text x="501" y="287" class="green">y<tspan baseline-shift="sub" font-size="70%">g</tspan></text>
   <path d="M 550 392 L 730 282" fill="none" stroke="#b45309" stroke-width="2.5" marker-end="url(#amber-arrow)"/>
   <text x="632" y="321" class="amber">Δ</text>
   <circle cx="550" cy="392" r="5" fill="#b45309"/>
   <circle cx="730" cy="282" r="5" fill="#0f766e"/>
   <text x="510" y="452" class="small amber">p = (0, 0)</text>
-  <text x="660" y="254" class="green">q = (x_g, y_g)</text>
+  <text x="660" y="254" class="green">q = (x<tspan baseline-shift="sub" font-size="70%">g</tspan>, y<tspan baseline-shift="sub" font-size="70%">g</tspan>)</text>
   <text x="510" y="487" class="small muted">前方が右、車体左方が上。</text>
 
   <rect x="24" y="522" width="792" height="102" rx="10" class="panel"/>
-  <text x="44" y="554" class="label">Δ = q − p　　x_g = Δ · f　　y_g = Δ · l</text>
+  <text x="44" y="554" class="label">Δ = q − p　　x<tspan baseline-shift="sub" font-size="70%">g</tspan> = Δ · f　　y<tspan baseline-shift="sub" font-size="70%">g</tspan> = Δ · l</text>
   <text x="44" y="584" class="small">ψ：world の +x 軸から車体前方への反時計回りの角度</text>
   <text x="44" y="611" class="small">単位は m。観測に入れる前に 1.6 節の clip・正規化を行う。</text>
 </svg>

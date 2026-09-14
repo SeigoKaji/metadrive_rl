@@ -52,12 +52,12 @@
   <text x="50" y="292" class="small">S = 0</text>
   <text x="348" y="292" class="small">20 m</text>
   <path d="M 435 272 L 466 293" fill="none" stroke="#64748b" stroke-width="1"/>
-  <text x="475" y="302" class="green">投影点 P(S_proj)</text>
+  <text x="475" y="302" class="green">投影点 P(S<tspan baseline-shift="sub" font-size="70%">proj</tspan>)</text>
   <path d="M 70 308 L 370 308" class="dimension"/>
   <path d="M 370 308 L 430 308" class="dimension"/>
-  <text x="220" y="338" text-anchor="middle">20 m（S_start）</text>
-  <text x="435" y="338" text-anchor="middle" class="small">4 m（s_local）</text>
-  <text x="44" y="383" class="label">S_proj = S_start + s_local = 20 + 4 = 24 m</text>
+  <text x="220" y="338" text-anchor="middle">20 m（S<tspan baseline-shift="sub" font-size="70%">start</tspan>）</text>
+  <text x="435" y="338" text-anchor="middle" class="small">4 m（s<tspan baseline-shift="sub" font-size="70%">local</tspan>）</text>
+  <text x="44" y="383" class="label">S<tspan baseline-shift="sub" font-size="70%">proj</tspan> = S<tspan baseline-shift="sub" font-size="70%">start</tspan> + s<tspan baseline-shift="sub" font-size="70%">local</tspan> = 20 + 4 = 24 m</text>
 
   <rect x="24" y="426" width="386" height="272" rx="10" class="panel"/>
   <rect x="426" y="426" width="390" height="272" rx="10" class="panel"/>

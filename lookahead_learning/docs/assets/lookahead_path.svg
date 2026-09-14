@@ -55,7 +55,7 @@
   <text x="438" y="255" class="small invalid">接続不可</text>
   <path d="M 465 265 L 515 285" fill="none" stroke="#b91c1c" stroke-width="1"/>
   <text x="530" y="297" class="small invalid">この例では端点の接続を検証できず、</text>
-  <text x="530" y="322" class="small invalid">区間 2 の終点を S_end とする。</text>
+  <text x="530" y="322" class="small invalid">区間 2 の終点を S<tspan baseline-shift="sub" font-size="70%">end</tspan> とする。</text>
   <text x="530" y="365" class="small">接続時は端点・接線・</text>
   <text x="530" y="390" class="small">車線数・幅の連続性を確認。</text>
 
@@ -68,6 +68,6 @@
   <text x="440" y="470" class="small green">区間 2</text>
   <text x="70" y="504" text-anchor="middle">0</text>
   <text x="300" y="504" text-anchor="middle">ℓ₁</text>
-  <text x="650" y="504" text-anchor="middle">S_end = ℓ₁ + ℓ₂</text>
+  <text x="650" y="504" text-anchor="middle">S<tspan baseline-shift="sub" font-size="70%">end</tspan> = ℓ₁ + ℓ₂</text>
   <text x="44" y="526" class="small">P(S) は、累積距離 S にある中心線上の world 座標。</text>
 </svg>
