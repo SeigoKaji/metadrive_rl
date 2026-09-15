@@ -590,6 +590,16 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     "execution_seconds": time.perf_counter() - episode_start_time,
                 }
                 target_lane_metrics = _final_target_lane_metrics(final_info)
+                lookahead_info = final_info.get("lookahead_learning")
+                if isinstance(lookahead_info, Mapping):
+                    episode_result["lookahead_learning"] = {
+                        key: lookahead_info[key]
+                        for key in (
+                            "episode_r_base", "episode_r_pp", "episode_r_lateral_accel",
+                            "episode_r_total", "lateral_accel_episode",
+                        )
+                        if key in lookahead_info
+                    }
                 if target_lane_metrics is not None:
                     episode_result["target_lane"] = target_lane_metrics
                 episode_result["visualization"] = active_recorder.finalize(

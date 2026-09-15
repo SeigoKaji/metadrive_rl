@@ -1,11 +1,14 @@
 # lookahead の観測入力と報酬関数の仕様
 
-lookahead_learning は、既存環境を包む `LookaheadEnv` ラッパーで、次の 2 つを追加します。
+lookahead_learning は、既存環境を包む `LookaheadEnv` ラッパーで、観測と独立に切り替えられる2種類の報酬項を追加します。
 
 - **観測拡張**：既存環境の観測末尾に、経路に沿った前方の注視点を 3 値で追加します。
 - **操舵に関する報酬補正**：前方注視点へ向かう操舵を促すため、設定が有効な場合に、
   Pure Pursuit（PP）が計算したお手本の操舵値と実際に適用された操舵との差をペナルティとして
-  元の報酬に加えます。速度や加減速に対する直接の報酬補正は行いません。
+  元の報酬に加えます。
+- **参照経路の必要横加速度に関する報酬補正**：投影点から注視点までの最大曲率と
+  行動後の速度から必要横加速度を求め、許容値を超えた分へ負の報酬を加えます。
+  省略時はOffです。詳細は [新項の仕様](lateral_acceleration_reward.md) を参照してください。
 
 用語は次のように使います。
 
@@ -41,6 +44,8 @@ PP 報酬モードでは、**行動前に PP が計算したお手本の操舵�
 継続時は、今回の post-action が次回の pre-action になります。
 `reset()` は初期状態（$t=0$）から最初の観測を作り、報酬は返しません。
 表中の PP に関する処理は PP 報酬モードのみです。
+新項では pre-action の同じ参照区間と最大曲率 K_t を保存し、post-action の
+平面速度 v_{t+1} で今回の報酬を計算します。post の注視点や曲率への置換は行いません。
 
 ## 1. 観測の生成・変換
 
@@ -68,8 +73,10 @@ $$
 | 設定 | 方策に渡す観測 | step が返す報酬 |
 |---|---|---|
 | [lookahead] なし | 元の $D$ 要素 | $r_t^{\mathrm{base}}$ |
-| [lookahead] あり、pp_weight = 0 | 元の $D$ 要素と注視点の 3 要素 | $r_t^{\mathrm{base}}$ |
-| [lookahead] あり、pp_weight > 0 | 元の $D$ 要素と注視点の 3 要素 | 元の報酬と PP 追加報酬の和 |
+| [lookahead] あり、pp_weight = 0、新項Off | 元の $D$ 要素と注視点の 3 要素 | $r_t^{\mathrm{base}}$ |
+| [lookahead] あり、pp_weight > 0、新項Off | 元の $D$ 要素と注視点の 3 要素 | 元の報酬と PP 追加報酬の和 |
+| [lookahead] あり、pp_weight = 0、新項On | 元の $D$ 要素と注視点の 3 要素 | 元の報酬と必要横加速度の追加報酬の和 |
+| [lookahead] あり、pp_weight > 0、新項On | 元の $D$ 要素と注視点の 3 要素 | 元の報酬と両追加報酬の和 |
 
 注視点の 3 要素を並べたベクトルを $\phi_t$ とします。
 コード上の名前・数式の記号の対応は次のとおりです。
@@ -390,7 +397,7 @@ truncated フラグを $d_t^{\mathrm{trunc}}$ とし、どちらも既存環境�
 真偽値です。wrapper は既存環境の reward_function を呼び直さず、step の戻り値を
 $r_t^{\mathrm{base}}$ としてそのまま使います。
 
-pp_weight が 0 の通常設定では、wrapper は観測だけを拡張し、返す報酬は
+新項がOffで pp_weight が 0 の通常設定では、wrapper は観測だけを拡張し、返す報酬は
 $r_t^{\mathrm{base}}$ です。pp_weight が正のときは、ここで追加報酬と呼ぶ
 $r_t^{\mathrm{pp}}$ を以下の手順で計算して加えます。PP は、方策が選んだ操舵を
 報酬で評価するために、お手本の操舵値を計算します。
@@ -621,20 +628,20 @@ $$
 
 ### 2.5 元の報酬へ加算して返す
 
-PP 報酬モードで返す合計報酬を $r_t^{\mathrm{total}}$ と定義します。
+返す合計報酬を $r_t^{\mathrm{total}}$ と定義します。無効な追加項は0です。
 
 $$
 r_t^{\mathrm{total}}
  =
-r_t^{\mathrm{base}}+r_t^{\mathrm{pp}}.
+r_t^{\mathrm{base}}+r_t^{\mathrm{pp}}+r_t^{\mathrm{lat}}.
 $$
 
 terminated または truncated が真の終了 step では $m_t=0$ なので、
-$r_t^{\mathrm{pp}}=0$ です。既存環境が持つ終端報酬はそのまま残ります。
+$r_t^{\mathrm{pp}}=r_t^{\mathrm{lat}}=0$ です。既存環境が持つ終端報酬はそのまま残ります。
 終了 step の post-action 観測は作りますが、その注視点を利用できるかの判定結果で
 pre-action のお手本の操舵値や判定結果を上書きしません。
 
-たとえば、pre-action のお手本の操舵値が
+新項Offの例として、pre-action のお手本の操舵値が
 $u_{\mathrm{pp},t}=0.1$、step 後に読み取った実操舵が
 $u_{\mathrm{applied},t}=0.3$、終了しておらず、$\Delta t=0.1\,\mathrm{s}$、
 $w_{\mathrm{pp}}=1$、元の報酬が $r_t^{\mathrm{base}}=2$ だとします。
@@ -653,7 +660,8 @@ $$
 
 同じ数値でもその step が terminated なら $m_t=0$ となり、PP の不一致は
 計算せず、返す報酬は $2$ のままです。通常の TOML 経路では
-pp_weight = 0 のとき PP モードを選ばず、観測だけを追加して元の報酬を返します。
+pp_weight = 0 のとき PP モードを選びません。新項Offなら元の報酬を、
+新項Onなら元の報酬に必要横加速度の追加報酬を加えて返します。
 
 ### 2.6 報酬処理と実装の対応
 
@@ -664,4 +672,13 @@ pp_weight = 0 のとき PP モードを選ばず、観測だけを追加して�
 | 実操舵を読む | [adapter.py](../adapter.py) の read_applied_action または read_applied_steering | $u_{\mathrm{applied}}\in[-1,1]$、無次元 |
 | 追加報酬を計算するかを判定する | pre-action PPReference と terminated/truncated | $m\in\{0,1\}$ |
 | 時間・重みを掛ける | [env.py](../env.py) の LookaheadEnv.step | $\Delta t$ は s、pp_weight は設定係数 |
-| 加算して返す | [env.py](../env.py) の LookaheadEnv.step | $r^{\mathrm{total}}=r^{\mathrm{base}}+r^{\mathrm{pp}}$ |
+| 加算して返す | [env.py](../env.py) の LookaheadEnv.step | $r^{\mathrm{total}}=r^{\mathrm{base}}+r^{\mathrm{pp}}+r^{\mathrm{lat}}$ |
+
+### 2.7 参照経路の必要横加速度を使う追加項
+
+[lateral_acceleration_reward.md](lateral_acceleration_reward.md) に、区間・曲率取得・
+境界の包含・速度とdecision時間の単位・式・マスク・数値例・設定と旧モデル互換・限界をまとめています。
+実装は [geometry.py](../geometry.py) の RouteCurvatureProfile、
+[lateral_acceleration.py](../lateral_acceleration.py) の純粋関数、
+[env.py](../env.py) の共有snapshotと単一stepです。
+PPの曲率や実測横加速度を使う項ではなく、目標速度やActionの上書きも行いません。

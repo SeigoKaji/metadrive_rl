@@ -28,7 +28,8 @@ pp_weight = 0.0
 pp_weight=0.0ならraw観測へ注視点3値を追加します。正のpp_weightなら同じ3値に
 PP操舵不一致ペナルティを加えます。lookahead_mは経路に沿った弧長[m]、
 pp_weightは追加ペナルティ係数です。rawの観測幅はホストのDで決まり、wrapper後は
-D+3になります。
+D+3になります。新項Onの比較用には configs/official_start_lane_return_lookahead_lateral_accel.toml を別途用意しています。
+既存の設定例はOffのままです。On/OffとPPの4通りは [新項の仕様](lateral_acceleration_reward.md) を参照してください。
 
 ## 実行時のcall path
 
@@ -58,21 +59,25 @@ custom propertyやrender対象は env.unwrapped から取得します。
 train.pyは解決済みlookahead_configをfactoryへ渡し、PPOを保存する前に
 lookahead_learning.checkpoint.set_lookahead_model_metadata(model, config)を呼びます。
 ZIPには
-model.lookahead_config と model.lookahead_schema_version=1 が保存され、保存後の
+model.lookahead_config と model.lookahead_schema_version=2 が保存され、保存後の
 再読込でも検証されます。evaluate.pyはPPOロード直後に
 lookahead_learning.checkpoint.validate_lookahead_model_metadata(model, config)を呼び、
 選択TOMLとZIPの設定を照合します。checkpoint.pyは標準ライブラリだけで動作し、
 設定はZIP内属性だけで検証します。追加ファイルやハッシュ照合は使いません。
-学習・評価JSONにはlookahead dictまたはNoneを記録します。
+学習・評価JSONにはlookahead dictまたはNoneを記録します。schema v1の旧モデルは新項Offとして互換読み取りします。
+新項Offの上限・重み差は無視しますが、Onの実効設定不一致は拒否します。
 
 ## 設定の境界
 
-次の2値だけがlookaheadのTOML設定です。
+次の5値がlookaheadのTOML設定です。既定値と数式・互換性は [追加報酬の仕様](lateral_acceleration_reward.md) にまとめています。
 
 | キー | 検証 | 意味 |
 |---|---|---|
 | lookahead_m | 有限で正 | 経路に沿った注視距離[m] |
 | pp_weight | 有限で0以上 | 追加PP不一致ペナルティ係数 |
+| lateral_accel_reward_enabled | boolのみ、既定false | 必要横加速度の超過ペナルティをPPと独立に切り替える |
+| max_lateral_accel | 有限で正、既定0.8 | 許容横加速度 [m/s²] |
+| lateral_accel_weight | 有限で0以上、既定0.1 | 新項の係数。0は旧報酬との同値比較用 |
 
 raw prefixの順序・意味・encoding・正規化、車両単位、Actionの符号、物理step幅、
 decision repeat、報酬関数、終了条件はhostとadapterの責務です。raw幅Dを特定の幅へ
@@ -99,11 +104,12 @@ python evaluate.py --config configs/your_experiment.toml
 テストを同梱した場合は、runtimeの契約と幾何を確認できます。
 
 ~~~bash
-python -B -m unittest -v lookahead_learning.test_checkpoint lookahead_learning.test_geometry lookahead_learning.test_env
+python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
 ~~~
 
-test_checkpoint.pyだけは標準ライブラリのみで実行できます。test_env.pyと
-test_geometry.pyはNumPy、Gymnasiumなどruntime依存関係を必要とします。これは短時間の
+test_checkpoint.py、test_geometry.py、test_lateral_acceleration.pyは標準ライブラリのみです。
+envのfakeテストはNumPy/Gymnasium、Monitor/VecEnv確認はSB3を使います。
+test_portabilityはフォルダ単独コピーで元rootとMetaDriveのimportを禁止して確認します。これは短時間の
 契約確認で、実simやPPOの長時間学習を代替しません。テストやdocsは本番起動の必須入力
 ではなく、移植時の補助です。
 

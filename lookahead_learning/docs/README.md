@@ -1,7 +1,7 @@
 # 前方注視を使う強化学習
 
 lookahead_learning は、ホストの既存環境を包んで前方注視点の3値と任意の
-Pure Pursuit（PP）不一致ペナルティを追加するruntimeです。運用時の入口は
+Pure Pursuit（PP）不一致ペナルティと、独立に切り替える参照経路の必要横加速度ペナルティを追加するruntimeです。運用時の入口は
 ホスト直下の通常の train.py と evaluate.py です。
 
 ## 通常の実行
@@ -21,7 +21,8 @@ configs/official_start_lane_return_lookahead.toml です。これは参照用の
 注視点3値を追加し、正のpp_weightなら同じ観測にPP不一致ペナルティも加えます。
 lookahead_mは経路に沿った弧長[m]、pp_weightは追加ペナルティ係数です。raw観測の
 幅Dは移植先hostで決まり、wrapper後はD+3になります。数を合わせるためのpaddingや
-切り捨ては行いません。
+切り捨ては行いません。新項は lateral_accel_reward_enabled=true かつ正の重みで有効になり、省略時はOffです。
+設定例、数式、旧モデル互換は [新項の仕様](lateral_acceleration_reward.md) にあります。
 
 checkpoint.py は Python 標準ライブラリだけで動作します。config loaderでは
 次を一度呼びます。
@@ -33,10 +34,10 @@ lookahead_config = resolve_lookahead_config(raw.get("lookahead"))
 ~~~
 
 学習時は解決済み設定を model.lookahead_config と
-model.lookahead_schema_version=1 としてPPO.save()前にZIPへ保存します。評価時は
+model.lookahead_schema_version=2 としてPPO.save()前にZIPへ保存します。評価時は
 PPO.load()直後に選択TOMLとZIPの設定を照合します。checkpointの属性はZIP内にあり、
 追加ファイルやハッシュ照合をゲートには使いません。注視3値の順序・encoding・
-報酬定義を変更する場合はschema versionを更新してください。
+報酬定義を変更する場合はschema versionを更新してください。旧schema v1は新項Offとして読み取り互換を保ちます。
 
 ## 実装を追う4つの薄いhook
 
@@ -82,24 +83,25 @@ host固有の入力・車両・Navigationの意味と単位はadapterの監査�
 | 文書 | 内容 |
 |---|---|
 | [観測入力と報酬関数の仕様](methods.md) | 観測の構成、注視点の生成・正規化、PP 参照と追加報酬の定義 |
+| [必要横加速度の追加報酬](lateral_acceleration_reward.md) | 曲率区間、時刻、単位、On/Off、旧モデル互換、数値例と限界 |
 | [実行手順](run.md) | 通常train/evaluate、軽量テスト |
 | [移植手順](porting.md) | 必要なruntime、4つの薄いhook、移植後の運用確認 |
 | [GitHub Copilot向け移植プロンプト](copilot_porting_prompt.md) | 小さな移植依頼として貼れる指示文 |
 
 ## 配布と確認
 
-本番に必要なのは adapter.py、checkpoint.py、env.py、geometry.py、
-__init__.py です。test_checkpoint.py、test_env.py、test_geometry.py は
+本番に必要なのは adapter.py、checkpoint.py、env.py、geometry.py、lateral_acceleration.py、
+__init__.py です。同梱の test_*.py は
 移植後の契約確認用で、本番起動には必要ありません。生成済みモデル、ログ、
 assets、bytecodeは配布物へ含めません。
 
 テストを同梱した場合の最小確認は次のとおりです。
 
 ~~~bash
-python -B -m unittest -v lookahead_learning.test_checkpoint lookahead_learning.test_geometry lookahead_learning.test_env
+python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
 ~~~
 
-test_checkpoint.pyだけは標準ライブラリのみで実行できます。test_env.pyと
-test_geometry.py、およびrootの train.py/evaluate.py --help にはホストの依存関係が
+test_checkpoint.py、test_geometry.py、test_lateral_acceleration.pyは標準ライブラリのみです。
+envのfakeテストとrootの train.py/evaluate.py --help にはホストの依存関係が
 必要です。この確認は短時間の契約・幾何テストで、実simやPPOの長時間学習は
 依存関係を用意した移植先で通常の train.py / evaluate.py を使って別途実行します。

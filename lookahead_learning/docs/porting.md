@@ -1,15 +1,38 @@
-# 移植手順
+# 新規移植と既存移植の差分更新
 
-lookahead_learning は既存のMetaDriveホストへ追加する小さなruntimeです。
-移植先の start_lane_env.py にあるStartLane系Subclassの入力生成、reward_function、
-終了条件、Action適用を基底Envとしてそのまま使い、その外側にLookaheadEnvを
-compositionで置きます。既存Subclassを書き換えたり、基底の観測・報酬を再実装したり、
-observe/stepをwrapperから繰り返し呼び出したりしません。
+更新した lookahead_learning/ を移植先rootへ配置したあと、
+[Copilot向けプロンプト](copilot_porting_prompt.md) の内容をそのまま渡してください。
+新規・既存更新・部分移植・対応済みを同じプロンプトで扱います。
+報酬の詳細は [参照経路の必要横加速度](lateral_acceleration_reward.md)、
+既存観測とPPは [methods.md](methods.md) に同梱しています。元repositoryや外部サイトを開くことは移植作業の前提ではありません。
 
-## 配布するフォルダ
+## 差し替える前のバックアップ
 
-移植元から lookahead_learning/ フォルダを移植先rootへ置きます。本番の最小runtimeは
-次の5ファイルです。
+**旧 lookahead_learning/、host独自adapter、変更予定hostファイル、未コミット差分を、上書き前に別の場所へ保存してください。**
+更新済みフォルダを置いた後に旧独自変更が消えていた場合、プロンプトからは復元できません。
+モデルと既存設定は保管し、別の比較設定・出力名を使います。認証・共有設定・AGENTSは変更対象外です。
+
+フォルダコピーの例です。BACKUP_DIRは新しい空の退避先を指定します。
+
+~~~bash
+SOURCE_ROOT=/path/to/source
+HOST_ROOT=/path/to/host
+BACKUP_DIR=/path/to/backup-before-lookahead-update
+mkdir -p "$BACKUP_DIR"
+if [ -d "$HOST_ROOT/lookahead_learning" ]; then
+    cp -a "$HOST_ROOT/lookahead_learning" "$BACKUP_DIR/"
+fi
+cp -a "$SOURCE_ROOT/lookahead_learning" "$HOST_ROOT/"
+~~~
+
+host側で書き換えるファイルの一覧が分かったら、その原本と対象ファイルの git diff も保存します。
+バックアップ先に既存バックアップを重ねて上書きしないでください。
+host固有adapterは今後可能な範囲でパッケージの外へ配置し、コピー更新で消えない構成にします。
+今回のためだけに既存hostを大きく再配置する必要はありません。
+
+## コピーする範囲
+
+次を含む **lookahead_learning/ フォルダ全体** を持ち運びます。
 
 ~~~text
 lookahead_learning/
@@ -17,161 +40,116 @@ lookahead_learning/
 ├── checkpoint.py
 ├── adapter.py
 ├── env.py
-└── geometry.py
-~~~
-
-移植後の契約を確認する軽量テストを同梱する場合は、次の3ファイルを追加します。
-
-~~~text
-lookahead_learning/
+├── geometry.py
+├── lateral_acceleration.py
 ├── test_checkpoint.py
+├── test_geometry.py
 ├── test_env.py
-└── test_geometry.py
+├── test_lateral_acceleration.py
+├── test_lateral_env.py
+├── test_portability.py
+└── docs/  （仕様、移植プロンプト、既存の図・用語集）
 ~~~
 
-docsは読み物として任意です。診断や比較のための補助機能は通常の学習・評価に
-必要ありません。生成済みの
-outputs、models、logs、assets、bytecodeも移植しません。
+共通の実行コード6ファイル、設定解決、仕様、テストがこの範囲でそろいます。
+移植元rootの configs/、train.py、evaluate.py、env_factory.py、start_lane_env.py を必須コピーにしません。
+モデル、実行ログ、bytecode、Simulator assetsは配布物に含めません。
+docs/assetsの既存の図や編集用資料は同梱資料です。
 
-コピー元と移植先の例です。
+## フォルダの存在では判定しない
+
+更新済みフォルダを置いた時点で新schemaは既に存在します。完了状態はhostの実接続から判定します。
+
+| 状態 | host側の根拠 | 作業 |
+|---|---|---|
+| 新規 | 設定・wrapper・metadata接続が未導入 | 通常の入口へ1回だけ接続 |
+| 既存版からの更新 | D+3とwrapperは接続済み、新3キーやmetadata検証・出力の一部が不足 | 不足箇所だけ補う |
+| 部分移植／独自改変 | 接続が片側だけ、キー再構築、独自providerや報酬処理が存在 | 独自変更を保ち、必要な契約だけ補う |
+| 既に今回仕様を満たす | 5キーが全経路へ届き、schema互換・ログ・単一wrapperが動く | 検証のみ、不要な変更を作らない |
+
+限定して読むのは config loader の許可キーとresolver、train/evaluateの呼出し、
+共通factory/worker、実際のwrapper、checkpoint helper、host固有adapterです。
+全repositoryの再設計や全資料の調査は不要です。
+
+## 共有する接続契約
+
+### 設定とmetadata
+
+~~~python
+from lookahead_learning.checkpoint import (
+    resolve_lookahead_config,
+    set_lookahead_model_metadata,
+    validate_lookahead_model_metadata,
+)
+
+lookahead_config = resolve_lookahead_config(raw.get("lookahead"))
+# このmapping全体をprofile、train/evaluate、factory/workerで保持する。
+set_lookahead_model_metadata(model, lookahead_config)  # PPO.save前
+validate_lookahead_model_metadata(model, lookahead_config)  # PPO.load直後
+~~~
+
+loaderが許可キーを旧2つに限定していないか、factory引数を2つに再構築していないかを確認します。
+boolを含む型でmapping全体を運び、既定値・数式は同梱resolver/helperを共通源とします。
+新項の設定例とv1/v2互換規則は [新報酬の設定節](lateral_acceleration_reward.md) を参照してください。
+旧モデルはOffとして読み、検証時には変更しません。active/baselineや有効設定の不一致を無視しません。
+
+### 共通factory
+
+~~~python
+from lookahead_learning.adapter import wrap_lookahead_env
+
+# 既存のhost生成処理で作ったraw_envを使う。
+if lookahead_config is not None:
+    raw_env = wrap_lookahead_env(raw_env, **lookahead_config)
+~~~
+
+既存移植でこの接続があれば再利用します。新たなwrapperを重ねてD+6にしたり、報酬を二重加算したりしません。
+raw Env → LookaheadEnv → 既存Monitor → VecEnv の順序を保ち、評価にはMonitorを新設しません。
+reset/stepは既存wrapperチェーンを通します。内部属性の読み取りはenv.unwrappedでも構いませんが、
+unwrapped.step/resetで既存wrapperを迂回してはいけません。
+
+既存hostの入力生成・開始車線特徴・reward_function・終了条件・Action・シナリオ・並列数を保ちます。
+raw幅Dは実際のflat float32 Boxから読み、既存prefixへ3値を一度だけ追加します。
+
+### host adapterと評価出力
+
+StartLane系クラス名やファイル配置が異なっても、同じ意味の接続点を探します。
+同梱MetaDrive adapterの任意のstart-lane resolverはfallback可能ですが、
+その特定ファイル名を別hostへの新たな必須依存にしてはいけません。
+別のhost固有providerから [LookaheadEnv](../env.py) を直接構成することもできます。
+
+座標・速度単位と意味・decision dt・開始車線参照をソースで監査します。
+新項Onでは既存previewと同じS_proj/S_goalの LateralReference を追加し、
+state_reader は平面速度の大きさ speed_m_s を返します。
+半径APIが異なる場合は MetaDrivePreviewProvider(radius_reader=...) で
+対象中心線の半径[m]を明示します。PPの曲率やlane.lengthから推測しません。
+Offとゼロ重みでは新APIを要求しません。PP OffではMetaDrivePPProviderを構築しません。
+
+既存の評価traceへ info["lookahead_learning"] を渡し、episode出力には
+episode_r_base、episode_r_pp、episode_r_lateral_accel、episode_r_total、
+lateral_accel_episodeを渡します。host側で報酬式・集計式を再実装する必要はありません。
+
+## 移植後の確認と戻し方
+
+hostの既存Python環境で実行します。新たな依存更新やassets downloadは行いません。
 
 ~~~bash
-SOURCE_ROOT=/path/to/metadrive_rl-lookahead
-HOST_ROOT=/path/to/metadrive-host
-cp -R "$SOURCE_ROOT/lookahead_learning" "$HOST_ROOT/"
-~~~
-
-このフォルダには本番runtime 5ファイル、任意の契約テスト3ファイル、任意のdocsが
-含まれます。必要なファイルだけを選ぶ場合でも、同じlookahead_learning/の中から
-runtimeとテストをコピーします。
-
-外部の configs/、train.py、evaluate.py、env_factory.py、start_lane_env.py をこの
-フォルダからコピーしません。移植先の既存ファイルと既存依存関係を使います。
-
-## 移植先で確認する3接続点
-
-移植時に確認・編集するのは、既存hostへ設定を伝える次の接続点です。
-
-1. **config loader**
-
-   既存の configs.experiment_config.select_experiment() が読むTOMLへ
-   [lookahead] tableを追加し、resolverで次のmappingまたはNoneへ変換します。
-
-   ~~~python
-   from lookahead_learning.checkpoint import resolve_lookahead_config
-
-   lookahead_config = resolve_lookahead_config(raw.get("lookahead"))
-   ~~~
-
-   tableなしは None、tableありは lookahead_m（有限で正）とpp_weight（有限で0以上）
-   です。checkpoint.pyは標準ライブラリだけでこの解決を行います。移植先の設定形式に
-   合わせてresolverを短く接続し、専用mode CLIや別の運用経路へ複製しません。
-
-2. **通常train/evaluateと共通env factory**
-
-   rootの train.py と evaluate.py は同じ選択結果の lookahead_config を使います。
-   train.py は make_training_env(..., lookahead_config=lookahead_config)、
-   evaluate.py は make_evaluation_env(..., lookahead_config=lookahead_config) を呼び、
-   共通factoryはraw host Envを作ったあと、設定がある場合だけ次を呼びます。
-
-   ~~~python
-   from lookahead_learning.adapter import wrap_lookahead_env
-
-   if lookahead_config is not None:
-       raw_env = wrap_lookahead_env(raw_env, **lookahead_config)
-   ~~~
-
-   wrapperはraw Envの外側、trainingでは既存Monitorの内側です。既存の学習用Monitorは
-   このwrapperの外側へ置き、評価側にMonitorを新設しません。既存のenv.reset/step返却値を
-   使い、基底reward_functionを再呼出ししません。trainは
-   lookahead_learning.checkpoint.set_lookahead_model_metadata(model, config)を保存前に
-   呼び、evaluateはPPOロード後に
-   lookahead_learning.checkpoint.validate_lookahead_model_metadata(model, config)を
-   呼びます。設定は model.lookahead_config と model.lookahead_schema_version=1 として
-   PPO ZIP内へ記録し、追加ファイルやハッシュ照合は使いません。
-
-3. **host adapter**
-
-   adapter.wrap_lookahead_env がraw Envのobservation_space、reset/step、
-   Navigation、vehicle、Actionの実際の契約を確認します。raw観測はflat Boxの1次元
-   float32、幅Dをopaque prefixとして保持し、注視値3つを末尾へ足してD+3にします。
-   Dを特定の幅へ固定、padding、切り捨て、既存prefixの再正規化はしません。
-   lookaheadを有効にするとMetaDrivePreviewProviderが経路と注視点を読み、
-   pp_weightが正の場合だけMetaDrivePPProviderが車軸長、最大操舵角、操舵符号の
-   ソースと単位を読みます。数値の大小から単位や符号を推測しないでください。
-
-接続後のcall pathは次のようになります。
-
-~~~text
-TOML
-  -> configs.experiment_config.select_experiment
-  -> ExperimentProfile.lookahead_config
-  -> train.py/evaluate.py
-  -> env_factory.make_training_env/make_evaluation_env
-  -> env_factory.make_env
-  -> adapter.wrap_lookahead_env
-  -> LookaheadEnv
-  -> 既存StartLane系Subclassのreset/step（報酬計算は基底Env内）
-~~~
-
-環境の内部順序は「既存Subclass/raw Env → LookaheadEnv → Monitor → VecEnv」です。
-既存Subclassの入力、報酬、終了条件はこの順序で保持されます。評価側は
-LookaheadEnvを通してreset/stepし、MetaDrive固有のcustom propertyやrenderは
-env.unwrappedから取得します。
-
-## 設定ファイル
-
-移植先では、そのhostが既に運用しているTOMLへ [lookahead] を追記します。
-
-~~~toml
-[lookahead]
-lookahead_m = 6.0
-pp_weight = 0.0
-~~~
-
-lookahead_mは経路に沿った弧長[m]、pp_weightは追加PP不一致ペナルティ係数です。
-tableを省略すればbaseline、pp_weight=0.0なら注視点3値だけ、正値なら注視点と
-追加PP報酬になります。学習と評価へ同じTOMLを渡します。
-
-このrepositoryにある configs/official_start_lane_return_lookahead.toml は、この
-repositoryだけの設定例です。移植先へ configs/ をコピーする前提ではなく、hostの
-既存TOMLへ値を追記し、schema、環境設定、scenario範囲、PPO設定を維持します。
-既存TOMLのroot schemaを変更する場合は、loaderの既存検証と衝突しないようにします。
-
-## 依存と運用
-
-移植先にはhostが通常使うPython、MetaDrive、Gymnasium、Stable-Baselines3、
-NumPy、Panda3D assetsが既に必要です。このruntimeは依存インストールやassets
-downloadを行いません。Pythonのimport pathを恒久変更する必要もありません。
-
-まずhostが通常使う依存環境でroot入口と設定が解決できることを確認します。
-
-~~~bash
-cd /path/to/metadrive-host
+python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
 python train.py --help
 python evaluate.py --help
 ~~~
 
-root入口の --help はMetaDriveなどhostの通常依存関係を必要とします。
+test_checkpoint、test_geometry、test_lateral_accelerationは標準ライブラリのみです。
+envのfakeテストはNumPy/Gymnasium、Monitor/VecEnv確認はSB3を使います。
+test_portabilityはこのフォルダのみを一時コピーし、元root・MetaDriveのimportを禁止した状態で
+設定・純粋関数・fake hostテストを実行します。コピー側の依存環境はhostの既存環境を使います。
 
-次に同じ設定で学習・評価を実行します。
+hostでも、旧schema v1モデル＋Off、PP Off＋新項On、On/Offとゼロ重み、
+単一wrapper・D/D+3・報酬単一加算・Monitor合計を確認します。
+同梱fixtureは新規、旧版接続、更新済み接続を模した境界テストであり、
+実際の移植先やGitHub Copilotを実行した証明ではありません。
+Simulatorが利用可能なら1環境をresetし数stepで確認します。長時間学習は別の比較実験です。
 
-~~~bash
-python train.py --config configs/your_experiment.toml
-python evaluate.py --config configs/your_experiment.toml
-~~~
-
-評価時は、学習時に保存したZIPの lookahead_config と schema version が選択TOMLに
-一致することを確認します。lookahead_mまたはpp_weightが異なるTOML、注視ありTOML
-でbaseline ZIPを読む組み合わせは停止します。注視3値の順序・encoding・報酬定義を
-変更する場合はschema versionを更新します。
-
-テストを同梱した場合の最小確認は次のとおりです。
-
-~~~bash
-python -B -m unittest -v lookahead_learning.test_checkpoint lookahead_learning.test_geometry lookahead_learning.test_env
-~~~
-
-test_checkpoint.pyだけは標準ライブラリのみで実行できます。test_env.pyと
-test_geometry.pyはruntime依存関係を必要とします。実simやPPOの長時間学習は必要な
-環境で別途行い、軽量テストの成功だけから性能改善を判断しません。
+今回仕様を満たすhostで同じプロンプトを再実行した場合は検証のみで済ませます。
+接続を戻す場合は、変更前に退避したhostファイルと対応TOMLを戻し、対応する旧モデルを使います。
+新項だけをOffにする手順とモデル設定の整合は [新報酬の戻し方](lateral_acceleration_reward.md) を参照してください。

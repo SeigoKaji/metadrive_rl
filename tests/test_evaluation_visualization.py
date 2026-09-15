@@ -231,6 +231,10 @@ def test_post_step_speed_and_runtime_road_values_are_kept_in_each_row() -> None:
             "timeout_penalty": 0.0,
             "target_lane_forward_distance_m": 0.25,
             "target_lane_progress_reward": 0.25,
+            "lookahead_learning": {"r_lateral_accel": -0.0225, "lateral_accel": {
+                "required_lateral_accel_mps2": 2.0, "curve_speed_limit_mps": 6.3245553203,
+                "curve_speed_unlimited": False,
+            }},
         },
         **common,
     )
@@ -248,6 +252,9 @@ def test_post_step_speed_and_runtime_road_values_are_kept_in_each_row() -> None:
     )
 
     assert tuple(first) == STEP_TELEMETRY_FIELDS
+    assert first["lookahead_learning"]["r_lateral_accel"] == -0.0225
+    assert first["lookahead_learning"]["lateral_accel"]["required_lateral_accel_mps2"] == 2.0
+    assert second["lookahead_learning"] is None
     assert first["speed_m_s"] == 2.0
     assert first["speed_km_h"] == pytest.approx(7.2)
     assert second["speed_m_s"] == 3.0
@@ -500,6 +507,17 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
                 "crash_vehicle": False,
                 "crash_object": False,
                 "max_step": False,
+                "lookahead_learning": {
+                    "episode_r_base": float(self.step_number) + 0.0225,
+                    "episode_r_pp": 0.0,
+                    "episode_r_lateral_accel": -0.0225,
+                    "episode_r_total": float(self.step_number),
+                    "lateral_accel_episode": {
+                        "required_lateral_accel_max_mps2": 2.0,
+                        "exceedance_time_ratio": 1.0,
+                        "reference_invalid_time_ratio": 0.0,
+                    },
+                },
             }
             return (
                 np.zeros(1, dtype=np.float32),
@@ -601,6 +619,11 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
         episode["visualization"] for episode in result["episodes"]
     ]
     assert result["step_telemetry"]["row_count"] == 2
+    lookahead_episode = result["episodes"][0]["lookahead_learning"]
+    assert lookahead_episode["episode_r_lateral_accel"] == -0.0225
+    assert lookahead_episode["episode_r_total"] == result["episodes"][0]["total_reward"]
+    assert lookahead_episode["lateral_accel_episode"]["required_lateral_accel_max_mps2"] == 2.0
+    assert step_rows[-1]["lookahead_learning"] == lookahead_episode
     assert [row["speed_m_s"] for row in step_rows] == [1.0, 2.0]
     assert step_rows[-1]["action_switch_count"] == 1
     assert step_rows[-1]["action_switches_per_second"] == pytest.approx(5.0)

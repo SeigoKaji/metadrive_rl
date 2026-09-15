@@ -13,7 +13,7 @@ environment construction is explicit and is never performed by an import.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import importlib
 import math
@@ -21,8 +21,12 @@ from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
 import numpy as np
 
+from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
+from .lateral_acceleration import LateralReference, finite_real, planar_speed_mps
+
 if TYPE_CHECKING:
     from .env import LookaheadEnv
+    from .geometry import RouteCurvatureProfile
 
 
 PREVIEW_FEATURE_DIM: Final[int] = 3
@@ -405,7 +409,9 @@ def simulation_dt_seconds(env: object) -> float:
     return dt
 
 
-def read_vehicle_state(env: object) -> dict[str, object]:
+def read_vehicle_state(
+    env: object, *, require_planar_speed: bool = False
+) -> dict[str, object]:
     """Read common physical state scalars without stepping or observing.
 
     This reader is deliberately small and uses only properties exposed by the
@@ -440,18 +446,37 @@ def read_vehicle_state(env: object) -> dict[str, object]:
                 state["heading_theta"] = math.atan2(hy, hx)
         except (TypeError, IndexError):
             pass
+    # MetaDrive BaseObject.speed is norm(Bullet vx, vy), in m/s (clipped by
+    # the host to [0, 100000]); velocity exposes the same planar vector in m/s.
+    # Hosts with other units must provide an explicitly converting state_reader.
     speed = getattr(vehicle, "speed", None)
+    speed_source = "vehicle.speed"
     if speed is None:
         velocity = getattr(vehicle, "velocity", None)
         try:
             if velocity is not None and len(velocity) >= 2:
+                if require_planar_speed:
+                    finite_real(velocity[0], "vehicle.velocity[0] [m/s]")
+                    finite_real(velocity[1], "vehicle.velocity[1] [m/s]")
                 vx = _finite_number(velocity[0], name="vehicle.velocity[0]")
                 vy = _finite_number(velocity[1], name="vehicle.velocity[1]")
                 speed = math.hypot(vx, vy)
+                speed_source = "norm(vehicle.velocity[:2])"
         except (TypeError, IndexError):
             speed = None
     if speed is not None:
+        if require_planar_speed:
+            try:
+                speed = planar_speed_mps(speed, unit="m/s")
+            except ValueError as error:
+                raise HostContractError(str(error)) from error
         state["speed_m_s"] = _finite_number(speed, name="vehicle.speed")
+    elif require_planar_speed:
+        # The wrapper rejects unavailable speed at reset. After that, an
+        # explicitly unavailable value masks this transition, never meaning 0.
+        state["speed_m_s"] = None
+    if require_planar_speed:
+        state.update(speed_source=speed_source, speed_unit="m/s", speed_meaning="planar magnitude")
     navigation = getattr(vehicle, "navigation", None)
     if navigation is not None:
         travelled = getattr(navigation, "travelled_length", None)
@@ -1201,11 +1226,16 @@ class MetaDrivePreviewProvider:
         self,
         *,
         lookahead_m: float = 6.0,
+        include_lateral_accel: bool = False,
+        radius_reader: Callable[[object], float] | None = None,
     ) -> None:
         value = _finite_number(lookahead_m, name="lookahead_m")
         if value < 0.0:
             raise ValueError("lookahead_m must be non-negative")
         self.lookahead_m = value
+        self.include_lateral_accel = include_lateral_accel
+        self._radius_reader = radius_reader
+        self._curvature_profile: RouteCurvatureProfile | None = None
         self._route: object | None = None
         self._route_error: str | None = None
         self._episode_key: object = None
@@ -1216,6 +1246,7 @@ class MetaDrivePreviewProvider:
         """Rebuild route state exactly once after the raw environment reset."""
 
         self._route = None
+        self._curvature_profile = None
         self._route_error = None
         self._episode_key = None
         self._target_ordinal = None
@@ -1225,23 +1256,38 @@ class MetaDrivePreviewProvider:
         self._target_ordinal = target_ordinal
         self._target_ordinal_persistent = persistent
         self._route = build_fixed_navigation_route(env)
+        if self.include_lateral_accel:
+            from .geometry import RouteCurvatureProfile
+
+            if self._route.diagnostics.boundary_reason in {
+                "nonfinite_lane_geometry", "connection_geometry_error", "missing_lane_metadata"
+            }:
+                raise HostContractError(
+                    f"invalid lateral route contract: {self._route.diagnostics.as_dict()}"
+                )
+            self._curvature_profile = RouteCurvatureProfile.from_path(
+                self._route.path, radius_reader=self._radius_reader
+            )
         state = read_vehicle_state(env)
         self._episode_key = tuple(state.get("checkpoints", ()))
 
-    @staticmethod
-    def _invalid(reason: str, **details: object) -> Mapping[str, object]:
+    def _invalid(self, reason: str, **details: object) -> Mapping[str, object]:
         return {
             "preview_valid": False,
             "x_g_m": 0.0,
             "y_g_m": 0.0,
             "invalid_reason": reason,
             "details": details,
+            "lateral_reference": (
+                LateralReference(False, invalid_reason=reason)
+                if self.include_lateral_accel else None
+            ),
         }
 
     def __call__(self, env: object) -> Mapping[str, object]:
         from .geometry import compute_preview
 
-        state = read_vehicle_state(env)
+        state = read_vehicle_state(env, require_planar_speed=self.include_lateral_accel)
         point = state.get("position_xy")
         psi = state.get("heading_theta")
         vehicle = get_single_agent(env)
@@ -1315,6 +1361,24 @@ class MetaDrivePreviewProvider:
             forward_speed_mps=speed,
             start_lane_valid=start_lane_valid,
         )
+        lateral_reference = None
+        if self.include_lateral_accel:
+            if result.reason in {
+                "nonfinite_vehicle_geometry", "nonfinite_projection_geometry",
+                "projection_geometry_error", "goal_geometry_unavailable",
+            }:
+                raise HostContractError(f"invalid lateral geometry contract: {result.reason}")
+            assert self._curvature_profile is not None
+            lateral_reference = LateralReference(
+                valid=bool(result.valid),
+                s_proj_m=result.s_proj,
+                s_goal_m=result.s_goal,
+                kappa_abs_max_inv_m=(
+                    self._curvature_profile.max_abs_curvature(result.s_proj, result.s_goal)
+                    if result.valid else None
+                ),
+                invalid_reason=None if result.valid else result.reason,
+            )
         details: dict[str, object] = {
             "p_xy": point,
             "psi_rad": psi,
@@ -1347,6 +1411,7 @@ class MetaDrivePreviewProvider:
             "x_clipped": result.x_clipped,
             "y_clipped": result.y_clipped,
             "details": details,
+            "lateral_reference": lateral_reference,
         }
 
 
@@ -1427,8 +1492,11 @@ class MetaDrivePPProvider:
 def wrap_lookahead_env(
     raw_env: object,
     *,
-    lookahead_m: float = 6.0,
-    pp_weight: float = 0.0,
+    lookahead_m: float = LOOKAHEAD_DEFAULTS["lookahead_m"],
+    pp_weight: float = LOOKAHEAD_DEFAULTS["pp_weight"],
+    lateral_accel_reward_enabled: bool = LOOKAHEAD_DEFAULTS["lateral_accel_reward_enabled"],
+    max_lateral_accel: float = LOOKAHEAD_DEFAULTS["max_lateral_accel"],
+    lateral_accel_weight: float = LOOKAHEAD_DEFAULTS["lateral_accel_weight"],
 ) -> LookaheadEnv:
     """Wrap a raw host environment using ordinary TOML-resolved parameters.
 
@@ -1436,36 +1504,40 @@ def wrap_lookahead_env(
     the PP penalty while retaining the same augmented observation.  The raw
     environment is never stepped or reset during construction; all host
     access happens through :class:`lookahead_learning.env.LookaheadEnv`.
+    The lateral reward is independent of PP and defaults to Off. A positive
+    lateral weight when enabled also activates the radius/speed contracts.
     """
 
-    lookahead = _finite_number(lookahead_m, name="lookahead_m")
-    if lookahead <= 0.0:
-        raise ValueError("lookahead_m must be finite and positive")
-    weight = _finite_number(pp_weight, name="pp_weight")
-    if weight < 0.0:
-        raise ValueError("pp_weight must be finite and non-negative")
+    config = resolve_lookahead_config({
+        "lookahead_m": lookahead_m, "pp_weight": pp_weight,
+        "lateral_accel_reward_enabled": lateral_accel_reward_enabled,
+        "max_lateral_accel": max_lateral_accel,
+        "lateral_accel_weight": lateral_accel_weight,
+    })
+    assert config is not None
     from .env import LookaheadEnv
 
     contract = ObservationContract.from_space(
         getattr(raw_env, "observation_space", None),
         source=f"{type(raw_env).__module__}.{type(raw_env).__qualname__}",
     )
-    provider = MetaDrivePreviewProvider(lookahead_m=lookahead)
-    if weight == 0.0:
-        return LookaheadEnv(
-            raw_env,
-            mode="lookahead_obs",
-            contract=contract,
-            preview_provider=provider,
-        )
-    pp_provider = MetaDrivePPProvider()
+    provider = MetaDrivePreviewProvider(
+        lookahead_m=config["lookahead_m"],
+        include_lateral_accel=(
+            config["lateral_accel_reward_enabled"] and config["lateral_accel_weight"] > 0.0
+        ),
+    )
+    weight = config["pp_weight"]
     return LookaheadEnv(
         raw_env,
-        mode="lookahead_obs_pp_reward",
+        mode="lookahead_obs_pp_reward" if weight > 0.0 else "lookahead_obs",
         contract=contract,
         preview_provider=provider,
-        pp_provider=pp_provider,
+        pp_provider=MetaDrivePPProvider() if weight > 0.0 else None,
         pp_weight=weight,
+        lateral_accel_reward_enabled=config["lateral_accel_reward_enabled"],
+        max_lateral_accel=config["max_lateral_accel"],
+        lateral_accel_weight=config["lateral_accel_weight"],
     )
 
 def normalize_preview_coordinate(value_m: float) -> float:

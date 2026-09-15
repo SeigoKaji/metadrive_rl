@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 import math
 from typing import Any, Protocol, TypeAlias
 
@@ -36,6 +37,10 @@ from .adapter import (
     read_vehicle_state,
     normalize_mode,
     simulation_dt_seconds,
+)
+from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
+from .lateral_acceleration import (
+    LateralEpisodeMetrics, LateralReference, lateral_accel_penalty, planar_speed_mps,
 )
 
 
@@ -193,8 +198,15 @@ class PreviewState:
     x_clipped: bool = False
     y_clipped: bool = False
     details: tuple[tuple[str, object], ...] = ()
+    lateral_reference: LateralReference | None = None
 
     def __post_init__(self) -> None:
+        reference = self.lateral_reference
+        if isinstance(reference, Mapping):
+            reference = LateralReference(**reference)
+            object.__setattr__(self, "lateral_reference", reference)
+        if reference is not None and not isinstance(reference, LateralReference):
+            raise HostContractError("lateral_reference must be LateralReference or a mapping")
         valid = _strict_bool(self.preview_valid, name="preview_valid")
         object.__setattr__(self, "preview_valid", valid)
         if self.x_g_m is not None:
@@ -275,6 +287,7 @@ class PreviewState:
                 "x_clipped",
                 "y_clipped",
                 "details",
+                "lateral_reference",
             }
             details.extend(
                 (str(key), item)
@@ -296,6 +309,7 @@ class PreviewState:
             x_clipped=bool(_field(value, "x_clipped", default=False)),
             y_clipped=bool(_field(value, "y_clipped", default=False)),
             details=tuple(details),
+            lateral_reference=_field(value, "lateral_reference", default=None),
         )
 
     @property
@@ -326,6 +340,9 @@ class PreviewState:
             "normalized_x_g": values[0],
             "normalized_y_g": values[1],
             "details": dict(self.details),
+            "lateral_reference": (
+                None if self.lateral_reference is None else self.lateral_reference.as_dict()
+            ),
         }
 
 
@@ -672,7 +689,7 @@ def _snapshot_flat_fields(
 
 
 class LookaheadEnv(gym.Wrapper):
-    """Apply the requested observation mode and optional PP reward term.
+    """Apply preview observations and independent optional reward terms.
 
     Args:
         env: Existing single-agent Gymnasium environment with a one-dimensional
@@ -689,6 +706,12 @@ class LookaheadEnv(gym.Wrapper):
             preview object and must return an explicit ``pp_valid`` result.
         pp_weight: Non-negative PP coefficient.  It is required for ``lookahead_obs_pp_reward``
             even when zero, so a zero-weight equivalence test is explicit.
+        lateral_accel_reward_enabled: Opt in to the route lateral-demand term.
+        max_lateral_accel: Positive allowable reference demand in m/s².
+        lateral_accel_weight: Non-negative coefficient; zero preserves the old
+            reward and does not require the new host APIs. With positive weight,
+            preview_provider must supply LateralReference and state_reader
+            must supply a validated planar magnitude as speed_m_s.
     """
 
     def __init__(
@@ -700,6 +723,9 @@ class LookaheadEnv(gym.Wrapper):
         preview_provider: PreviewProvider | None = None,
         pp_provider: PPProvider | None = None,
         pp_weight: float | None = None,
+        lateral_accel_reward_enabled: bool = LOOKAHEAD_DEFAULTS["lateral_accel_reward_enabled"],
+        max_lateral_accel: float = LOOKAHEAD_DEFAULTS["max_lateral_accel"],
+        lateral_accel_weight: float = LOOKAHEAD_DEFAULTS["lateral_accel_weight"],
         applied_action_reader: AppliedActionReader | None = None,
         applied_steering_reader: AppliedSteeringReader | None = None,
         dt_reader: DtReader | None = None,
@@ -707,6 +733,23 @@ class LookaheadEnv(gym.Wrapper):
         run_id: str = "",
     ) -> None:
         mode = normalize_mode(mode)
+        wrapped = env
+        while isinstance(wrapped, gym.Wrapper):
+            if isinstance(wrapped, LookaheadEnv):
+                raise HostContractError("LookaheadEnv is already connected; refusing double wrapping")
+            wrapped = wrapped.env
+        lateral_config = resolve_lookahead_config({
+            "lateral_accel_reward_enabled": lateral_accel_reward_enabled,
+            "max_lateral_accel": max_lateral_accel,
+            "lateral_accel_weight": lateral_accel_weight,
+        })
+        assert lateral_config is not None
+        self._lateral_enabled = lateral_config["lateral_accel_reward_enabled"]
+        self._max_lateral_accel = lateral_config["max_lateral_accel"]
+        self._lateral_weight = lateral_config["lateral_accel_weight"]
+        self._lateral_effective = self._lateral_enabled and self._lateral_weight > 0.0
+        if mode == "baseline" and self._lateral_effective:
+            raise ValueError("lateral reward requires an active lookahead observation mode")
         if not isinstance(contract, ObservationContract):
             raise UnsupportedHostError(
                 "LookaheadEnv requires an ObservationContract built from the host Box"
@@ -760,7 +803,10 @@ class LookaheadEnv(gym.Wrapper):
         self._read_applied_action = applied_action_reader
         self._read_applied_steering = applied_steering_reader or read_applied_steering
         self._read_dt = dt_reader or simulation_dt_seconds
-        self._read_state = state_reader or read_vehicle_state
+        self._read_state = state_reader or (
+            partial(read_vehicle_state, require_planar_speed=True)
+            if self._lateral_effective else read_vehicle_state
+        )
         self._run_id = str(run_id)
         self._raw_observation_space = actual_space
         self._augmented_observation_space = (
@@ -774,6 +820,8 @@ class LookaheadEnv(gym.Wrapper):
         self._dt_seconds: float | None = None
         self._episode_r_base = 0.0
         self._episode_r_pp = 0.0
+        self._episode_r_lateral_accel = 0.0
+        self._lateral_metrics = LateralEpisodeMetrics()
         self._episode_r_total = 0.0
         self._previous_applied_steering: float | None = None
         self._previous_applied_action: tuple[float, float] | None = None
@@ -809,15 +857,30 @@ class LookaheadEnv(gym.Wrapper):
         return {
             "r_base": self._episode_r_base,
             "r_pp": self._episode_r_pp,
+            "r_lateral_accel": self._episode_r_lateral_accel,
             "r_total": self._episode_r_total,
         }
 
-    def _read_state_snapshot(self) -> tuple[tuple[str, object], ...]:
+    def _read_state_snapshot(self, *, initial: bool = False) -> tuple[tuple[str, object], ...]:
         if self._read_state is None:
             return ()
         value = self._read_state(self.env)
         if not isinstance(value, Mapping):
             raise HostContractError("state_reader must return a mapping")
+        if self._lateral_effective:
+            if value.get("speed_unit", "m/s") != "m/s":
+                raise HostContractError("state_reader speed_m_s requires explicit conversion to m/s")
+            if "speed_m_s" not in value or (initial and value["speed_m_s"] is None):
+                raise UnsupportedHostError(
+                    "lateral reward state_reader must expose audited planar magnitude "
+                    "speed_m_s at reset; convert km/h explicitly, never infer units"
+                )
+            if value["speed_m_s"] is not None:
+                try:
+                    speed = planar_speed_mps(value["speed_m_s"], unit="m/s")
+                except ValueError as error:
+                    raise HostContractError(str(error)) from error
+                value = {**value, "speed_m_s": speed}
         return _snapshot_state(value)
 
     def _read_dt_checked(self) -> float:
@@ -843,6 +906,17 @@ class LookaheadEnv(gym.Wrapper):
         if self._preview_provider is not None:
             assert self._preview_provider is not None
             preview = PreviewState.from_object(self._preview_provider(self.env))
+            if self._lateral_effective:
+                reference = preview.lateral_reference
+                if reference is None:
+                    raise UnsupportedHostError(
+                        "lateral reward requires lateral_reference from the shared preview provider"
+                    )
+                if reference.valid and (
+                    reference.s_proj_m != preview.s_proj_m
+                    or reference.s_goal_m != preview.s_goal_m
+                ):
+                    raise HostContractError("lateral interval differs from the shared preview interval")
             if self._mode == "lookahead_obs_pp_reward":
                 assert self._pp_provider is not None
                 pp = PPReference.from_object(
@@ -854,8 +928,59 @@ class LookaheadEnv(gym.Wrapper):
             t_seconds=float(time_seconds),
             preview=preview,
             pp=pp,
-            state=self._read_state_snapshot(),
+            state=self._read_state_snapshot(initial=decision == 0),
         )
+
+    def _lateral_diagnostic(
+        self, pre: PreviewSnapshot | None, post: PreviewSnapshot, *, episode_end: bool
+    ) -> dict[str, object]:
+        source = post if pre is None else pre
+        reference = None if source.preview is None else source.preview.lateral_reference
+        speed = _state_value(post, "speed_m_s")
+        diagnostic: dict[str, object] = {
+            "enabled": self._lateral_enabled,
+            "effective_enabled": self._lateral_effective,
+            "active": False,
+            "skip_reason": None,
+            "reference_valid": None if reference is None else reference.valid,
+            "reference_invalid_reason": None if reference is None else reference.invalid_reason,
+            "s_proj_m": None if reference is None else reference.s_proj_m,
+            "s_goal_m": None if reference is None else reference.s_goal_m,
+            "kappa_abs_max_inv_m": None if reference is None else reference.kappa_abs_max_inv_m,
+            "speed_post_mps": speed,
+            "required_lateral_accel_mps2": None,
+            "max_lateral_accel_mps2": self._max_lateral_accel,
+            "weight": self._lateral_weight,
+            "exceedance_ratio": None,
+            "curve_speed_limit_mps": None,
+            "curve_speed_unlimited": False,
+            "reward": 0.0,
+        }
+        if not self._lateral_enabled:
+            reason = "disabled"
+        elif not self._lateral_effective:
+            reason = "zero_weight"
+        elif pre is None:
+            reason = "reset"
+        elif episode_end:
+            reason = "episode_end"
+        elif reference is None or not reference.valid:
+            reason = "reference_invalid"
+        elif speed is None:
+            reason = "speed_unavailable"
+        else:
+            assert self._dt_seconds is not None
+            penalty = lateral_accel_penalty(
+                kappa_abs_max_inv_m=reference.kappa_abs_max_inv_m,
+                speed_mps=speed,
+                max_lateral_accel=self._max_lateral_accel,
+                weight=self._lateral_weight,
+                dt_seconds=self._dt_seconds,
+            )
+            diagnostic.update(penalty.as_dict(), active=True)
+            reason = None
+        diagnostic["skip_reason"] = reason
+        return diagnostic
 
     def _format_observation(
         self,
@@ -881,6 +1006,7 @@ class LookaheadEnv(gym.Wrapper):
         post_snapshot: PreviewSnapshot,
         r_base: float,
         r_pp: float,
+        r_lateral_accel: float,
         r_total: float,
         terminated: bool,
         truncated: bool,
@@ -889,6 +1015,7 @@ class LookaheadEnv(gym.Wrapper):
         e_pp: float | None,
         applied_throttle: float | None,
         previous_applied_action: tuple[float, float] | None,
+        lateral_diagnostic: dict[str, object],
     ) -> dict[str, object]:
         if not isinstance(info, Mapping):
             raise HostContractError("host reset/step info must be a mapping")
@@ -1007,10 +1134,14 @@ class LookaheadEnv(gym.Wrapper):
             "e_pp": e_pp,
             "r_base": r_base,
             "r_pp": r_pp,
+            "r_lateral_accel": r_lateral_accel,
             "r_total": r_total,
             "episode_r_base": self._episode_r_base,
             "episode_r_pp": self._episode_r_pp,
+            "episode_r_lateral_accel": self._episode_r_lateral_accel,
             "episode_r_total": self._episode_r_total,
+            "lateral_accel": lateral_diagnostic,
+            "lateral_accel_episode": self._lateral_metrics.as_dict(),
             "state_before": (
                 None if pre_snapshot is None else dict(pre_snapshot.state)
             ),
@@ -1046,7 +1177,7 @@ class LookaheadEnv(gym.Wrapper):
                 "policy_action_stage": "env" if action is not None else None,
                 "yaw_rate": _yaw_rate_after(pre_snapshot, post_snapshot, dt),
                 "episode_end": bool(terminated or truncated),
-                "lookahead_learning_schema_version": "lookahead_learning.env.v1",
+                "lookahead_learning_schema_version": "lookahead_learning.env.v2",
             }
         )
         # Preserve host-defined task telemetry exactly.  In particular,
@@ -1199,6 +1330,8 @@ class LookaheadEnv(gym.Wrapper):
         self._dt_seconds = None
         self._episode_r_base = 0.0
         self._episode_r_pp = 0.0
+        self._episode_r_lateral_accel = 0.0
+        self._lateral_metrics = LateralEpisodeMetrics()
         self._episode_r_total = 0.0
         self._previous_applied_steering = None
         self._previous_applied_action = None
@@ -1227,6 +1360,7 @@ class LookaheadEnv(gym.Wrapper):
             post_snapshot=snapshot,
             r_base=0.0,
             r_pp=0.0,
+            r_lateral_accel=0.0,
             r_total=0.0,
             terminated=False,
             truncated=False,
@@ -1235,11 +1369,12 @@ class LookaheadEnv(gym.Wrapper):
             e_pp=None,
             applied_throttle=None,
             previous_applied_action=None,
+            lateral_diagnostic=self._lateral_diagnostic(None, snapshot, episode_end=False),
         )
         return observation, reset_info
 
     def step(self, action: object):
-        """Apply one host decision and calculate the PP reward from s_t."""
+        """Apply one decision; use pre-action references and post-action speed."""
 
         if self._needs_reset or self._snapshot is None:
             raise RuntimeError("LookaheadEnv.step() called before reset or after done")
@@ -1302,11 +1437,6 @@ class LookaheadEnv(gym.Wrapper):
                 r_pp = -self._pp_weight * dt * e_pp
             else:
                 e_pp = None
-        if self._mode == "lookahead_obs_pp_reward":
-            r_total = r_base + r_pp
-        else:
-            r_total = r_base
-
         next_decision = pre_snapshot.decision + 1
         assert self._dt_seconds is not None
         next_time = pre_snapshot.t_seconds + self._dt_seconds
@@ -1314,11 +1444,20 @@ class LookaheadEnv(gym.Wrapper):
             decision=next_decision,
             time_seconds=next_time,
         )
+        lateral_diagnostic = self._lateral_diagnostic(
+            pre_snapshot, post_snapshot, episode_end=terminated or truncated
+        )
+        r_lateral_accel = float(lateral_diagnostic["reward"])
+        r_total = r_base + r_pp if self._mode == "lookahead_obs_pp_reward" else r_base
+        if self._lateral_effective:
+            r_total += r_lateral_accel
+        self._lateral_metrics.observe(lateral_diagnostic, dt)
         observation = self._format_observation(raw_observation, post_snapshot)
         self._decision = next_decision
         self._time_seconds = next_time
         self._episode_r_base += r_base
         self._episode_r_pp += r_pp
+        self._episode_r_lateral_accel += r_lateral_accel
         self._episode_r_total += r_total
         self._previous_applied_steering = u_applied
         self._previous_applied_action = (
@@ -1337,6 +1476,7 @@ class LookaheadEnv(gym.Wrapper):
             post_snapshot=post_snapshot,
             r_base=r_base,
             r_pp=r_pp,
+            r_lateral_accel=r_lateral_accel,
             r_total=r_total,
             terminated=terminated,
             truncated=truncated,
@@ -1345,8 +1485,12 @@ class LookaheadEnv(gym.Wrapper):
             e_pp=e_pp,
             applied_throttle=applied_throttle,
             previous_applied_action=previous_applied_action,
+            lateral_diagnostic=lateral_diagnostic,
         )
-        return observation, (r_total if self._mode == "lookahead_obs_pp_reward" else reward), terminated, truncated, step_info
+        returned_reward = (
+            r_total if self._mode == "lookahead_obs_pp_reward" or self._lateral_effective else reward
+        )
+        return observation, returned_reward, terminated, truncated, step_info
 
     def close(self):
         return self.env.close()

@@ -266,7 +266,7 @@ class ReferencePath:
             )
         if not self._segments:
             raise ValueError("reference route has no validated lane")
-        # bisect_right gives the previous segment at an interior shared
+        # bisect_right gives the following segment at an interior shared
         # endpoint; at the route end the final segment is selected.
         starts = self.lane_starts
         index = bisect_right(starts, value) - 1
@@ -316,6 +316,65 @@ class ReferencePath:
             "boundary_reason": self.boundary_reason,
             "diagnostics": self.diagnostics.as_dict(),
         }
+
+
+@dataclass(frozen=True)
+class RouteCurvatureProfile:
+    """Exact piecewise-constant curvature of an already validated route.
+
+    Construct once at reset, only when the lateral reward has positive weight.
+    The default radius source is the audited CircularLane.radius [m] API.
+    Other hosts must supply radius_reader(lane) -> centreline radius [m].
+    """
+
+    path: ReferencePath
+    curvatures_inv_m: Tuple[float, ...]
+
+    @classmethod
+    def from_path(
+        cls, path: ReferencePath, *, radius_reader: Optional[Callable[[Any], float]] = None
+    ) -> "RouteCurvatureProfile":
+        from .lateral_acceleration import finite_real
+
+        values: list[float] = []
+        for lane, metadata in zip(path.lanes, path.metadata):
+            if metadata.lane_type == "StraightLane":
+                values.append(0.0)
+            elif metadata.lane_type == "CircularLane":
+                radius_value = (
+                    radius_reader(lane) if radius_reader is not None
+                    else getattr(lane, "radius", None)
+                )
+                try:
+                    radius = finite_real(radius_value, "CircularLane centreline radius [m]")
+                    if radius <= 0.0:
+                        raise ValueError("CircularLane radius must be positive")
+                    values.append(finite_real(1.0 / radius, "route curvature [1/m]"))
+                except ValueError as error:
+                    raise GeometryError(str(error)) from error
+            else:
+                raise GeometryError(f"unsupported curvature shape: {metadata.lane_type}")
+        return cls(path, tuple(values))
+
+    def max_abs_curvature(self, s_proj_m: float, s_goal_m: float) -> float:
+        """Maximum over closed [S_proj, S_goal], without spatial sampling.
+
+        An interior lane endpoint belongs to the following lane, as in P(S).
+        The final endpoint belongs to the last validated lane.  A goal exactly
+        at a curve's start therefore includes that curve; a projection exactly
+        after a curve excludes it.  Crossing the validated end is an error.
+        """
+
+        from .lateral_acceleration import finite_real
+
+        start = finite_real(s_proj_m, "S_proj")
+        end = finite_real(s_goal_m, "S_goal")
+        if not self.curvatures_inv_m or not 0.0 <= start <= end <= self.path.total_length:
+            raise GeometryError("curvature interval is outside the finite validated route")
+        starts = self.path.lane_starts
+        first = bisect_right(starts, start) - 1
+        last = bisect_right(starts, end) - 1
+        return max(self.curvatures_inv_m[first:last + 1])
 
 
 @dataclass(frozen=True)
@@ -647,6 +706,8 @@ def _metadata_for_lane(source: MetadataSource, lane: Any, index: int) -> Any:
         return source[index]  # type: ignore[index]
     except (IndexError, KeyError, TypeError):
         return None
+
+
 
 
 def _coerce_metadata(lane: Any, source: MetadataSource, index: int) -> LaneMetadata:
@@ -1889,6 +1950,7 @@ __all__ = [
     "RouteConnection",
     "RouteBuildResult",
     "ReferencePath",
+    "RouteCurvatureProfile",
     "ProjectionCandidate",
     "ProjectionResult",
     "PreviewResult",
