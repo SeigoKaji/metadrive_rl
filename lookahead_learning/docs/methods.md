@@ -127,6 +127,9 @@ reset の直後に、`MetaDrivePreviewProvider` は `Navigation` が持つ計画
 終端までの累積距離を $S_{\mathrm{end}}$ [m] とすると、経路の定義域は
 $0\leq S\leq S_{\mathrm{end}}$ です。
 
+道路・車線・区間の関係、接続の検証条件、累積距離の具体例については、
+補足文書 [固定経路の定義と構築](route_definition.md) を参照してください。
+
 1.2〜1.5 節の図は模式図です。図中では、同じ行動ステップを表す添字 $t$ を省略します。
 
 ![直線と円弧の Lane を接続し、検証できない境界までを固定経路とする模式図](assets/lookahead_path.svg)
