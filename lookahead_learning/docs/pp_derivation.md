@@ -222,8 +222,8 @@ $$
 `MetaDrivePPProvider` は、preview の有効な同じ $q$、車体基準点 `p_xy`、heading
 `psi_rad` を使います。[adapter.py](../adapter.py) で次の値を作り、
 [geometry.py](../geometry.py) の `pure_pursuit_from_rear_coordinates` へ渡します。
-`compute_pp_reference` は
-同じ PP 計算を行う `compute_pure_pursuit` の別名です。
+`compute_pure_pursuit` は、共有する `PreviewResult` と車両位置・向きから
+後輪車軸座標を求め、同じ関数へ渡す純粋幾何APIです。
 
 | 導出の量 | 実装上の値 | 意味・単位 |
 |---|---|---|

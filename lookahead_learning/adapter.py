@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 import numpy as np
 
 from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
+from .geometry import NORMALIZATION_DISTANCE_M, normalize_preview_value
 from .lateral_acceleration import LateralReference, finite_real, planar_speed_mps
 
 if TYPE_CHECKING:
@@ -30,7 +31,6 @@ if TYPE_CHECKING:
 
 
 PREVIEW_FEATURE_DIM: Final[int] = 3
-NORMALIZATION_DISTANCE_M: Final[float] = 10.0
 
 Mode: TypeAlias = Literal["baseline", "lookahead_obs", "lookahead_obs_pp_reward"]
 
@@ -333,8 +333,13 @@ def get_single_agent(env: object) -> object:
     return agent
 
 
-def _read_applied_action_pair(env: object) -> tuple[float, float]:
-    """Read the normalized action pair stored by the verified host vehicle."""
+def read_applied_action(env: object) -> tuple[float, float]:
+    """Read both normalized commands stored by the host policy.
+
+    MetaDrive's EnvInputPolicy decodes/clips the discrete action once, then
+    BaseVehicle.before_step stores the pair in vehicle.current_action before
+    the repeated physics steps. Other action paths need a custom reader.
+    """
 
     vehicle = get_single_agent(env)
     current = getattr(vehicle, "current_action", None)
@@ -363,19 +368,6 @@ def _read_applied_action_pair(env: object) -> tuple[float, float]:
     return steering, throttle
 
 
-def read_applied_action(env: object) -> tuple[float, float]:
-    """Read both normalized commands stored by the host policy.
-
-    In the verified MetaDrive path this is ``vehicle.current_action``:
-    ``EnvInputPolicy.act`` decodes/clips the discrete action once and
-    ``BaseVehicle.before_step`` stores that normalized pair before the repeated
-    physics steps.  A host with a different action path must provide a custom
-    reader instead of being silently interpreted here.
-    """
-
-    return _read_applied_action_pair(env)
-
-
 def read_applied_steering(env: object) -> float:
     """Read the normalized steering command stored by the host policy.
 
@@ -386,7 +378,7 @@ def read_applied_steering(env: object) -> float:
     reader instead of being silently interpreted here.
     """
 
-    return _read_applied_action_pair(env)[0]
+    return read_applied_action(env)[0]
 
 
 def simulation_dt_seconds(env: object) -> float:
@@ -495,7 +487,7 @@ def read_vehicle_state(
             state["checkpoints"] = tuple(str(item) for item in checkpoints)
     lane_index = getattr(vehicle, "lane_index", None)
     if lane_index is not None:
-        state["lane_index"] = _freeze_for_state(lane_index)
+        state["lane_index"] = _freeze_value(lane_index)
     try:
         state["scenario_seed"] = int(getattr(env, "current_seed"))
     except (AttributeError, TypeError, ValueError, RuntimeError):
@@ -503,18 +495,18 @@ def read_vehicle_state(
     return state
 
 
-def _freeze_for_state(value: object) -> object:
-    """Local immutable conversion for adapter state values."""
+def _freeze_value(value: object) -> object:
+    """Freeze host state, provider metadata and recorded actions."""
 
     if isinstance(value, np.ndarray):
         value = value.tolist()
     if isinstance(value, Mapping):
         return tuple(
-            (str(key), _freeze_for_state(item))
+            (str(key), _freeze_value(item))
             for key, item in sorted(value.items(), key=lambda item: str(item[0]))
         )
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_for_state(item) for item in value)
+        return tuple(_freeze_value(item) for item in value)
     if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
         return int(value)
     if isinstance(value, (np.floating, float)):
@@ -998,8 +990,8 @@ def build_fixed_navigation_route(
     The returned object is :class:`lookahead_learning.geometry.RouteBuildResult`.  A
     validated prefix and a diagnostic boundary are retained when a later
     lane is unsupported or disconnected; geometry then marks lookahead that
-    crosses the boundary invalid.  This function imports the pure geometry
-    module lazily so importing the adapter itself never imports a simulator.
+    crosses the boundary invalid. The geometry module has no simulator
+    imports, so route construction works with fake host lanes as well.
     """
 
     (
@@ -1137,11 +1129,7 @@ def _read_direct_policy(env: object, vehicle: object) -> object:
     return policy
 
 
-def _read_vehicle_geometry(
-    env: object,
-    *,
-    verify_direct_policy: bool = True,
-) -> dict[str, float]:
+def _read_vehicle_geometry(env: object) -> dict[str, float]:
     """Read source-audited axle geometry used by the PP provider.
 
     MetaDrive exposes ``FRONT_WHEELBASE`` and ``REAR_WHEELBASE`` in metres and
@@ -1153,12 +1141,7 @@ def _read_vehicle_geometry(
     vehicle = get_single_agent(env)
     module_name = type(vehicle).__module__
     qualname = type(vehicle).__qualname__
-    if not module_name.startswith("metadrive."):
-        raise UnsupportedHostError(
-            "vehicle geometry is verified only for MetaDrive vehicle classes; "
-            f"found {module_name}.{qualname}"
-        )
-    if verify_direct_policy and (
+    if (
         module_name != "metadrive.component.vehicle.vehicle_type"
         or qualname != "DefaultVehicle"
     ):
@@ -1168,7 +1151,7 @@ def _read_vehicle_geometry(
             f"found {module_name}.{qualname}"
         )
 
-    def number(name: str, *fallback: str) -> float:
+    def number(name: str) -> float:
         value = getattr(vehicle, name, None)
         if value is None:
             config = getattr(vehicle, "config", None)
@@ -1177,11 +1160,6 @@ def _read_vehicle_geometry(
             except HostContractError:
                 mapping = {}
             value = mapping.get(name)
-        if value is None:
-            for alternate in fallback:
-                value = getattr(vehicle, alternate, None)
-                if value is not None:
-                    break
         try:
             number_value = float(value)
         except (TypeError, ValueError) as error:
@@ -1197,15 +1175,14 @@ def _read_vehicle_geometry(
     front = number("FRONT_WHEELBASE")
     rear = number("REAR_WHEELBASE")
     max_deg = number("max_steering")
-    if verify_direct_policy:
-        policy = _read_direct_policy(env, vehicle)
-        policy_path = f"{type(policy).__module__}.{type(policy).__qualname__}"
-        if policy_path != "metadrive.policy.env_input_policy.EnvInputPolicy":
-            raise UnsupportedHostError(
-                "Pure Pursuit mode requires metadrive.policy.env_input_policy."
-                "EnvInputPolicy through engine.get_policy; "
-                f"found {policy_path}"
-            )
+    policy = _read_direct_policy(env, vehicle)
+    policy_path = f"{type(policy).__module__}.{type(policy).__qualname__}"
+    if policy_path != "metadrive.policy.env_input_policy.EnvInputPolicy":
+        raise UnsupportedHostError(
+            "Pure Pursuit mode requires metadrive.policy.env_input_policy."
+            "EnvInputPolicy through engine.get_policy; "
+            f"found {policy_path}"
+        )
     return {
         "front_wheelbase_m": front,
         "rear_wheelbase_m": rear,
@@ -1237,7 +1214,6 @@ class MetaDrivePreviewProvider:
         self._radius_reader = radius_reader
         self._curvature_profile: RouteCurvatureProfile | None = None
         self._route: object | None = None
-        self._route_error: str | None = None
         self._episode_key: object = None
         self._target_ordinal: int | None = None
         self._target_ordinal_persistent = False
@@ -1247,7 +1223,6 @@ class MetaDrivePreviewProvider:
 
         self._route = None
         self._curvature_profile = None
-        self._route_error = None
         self._episode_key = None
         self._target_ordinal = None
         self._target_ordinal_persistent = False
@@ -1303,7 +1278,7 @@ class MetaDrivePreviewProvider:
                 speed = state.get("speed_m_s")
         current_checkpoints = tuple(state.get("checkpoints", ()))
         if self._route is None:
-            return self._invalid(self._route_error or "route_unavailable")
+            return self._invalid("route_unavailable")
         if self._episode_key is not None and current_checkpoints != self._episode_key:
             return self._invalid(
                 "navigation_route_changed",
@@ -1544,8 +1519,7 @@ def normalize_preview_coordinate(value_m: float) -> float:
     """Encode a finite metric in metres to the requested [0, 1] value."""
 
     value = _finite_number(value_m, name="preview coordinate")
-    clipped = min(max(value / NORMALIZATION_DISTANCE_M, -1.0), 1.0)
-    return (clipped + 1.0) / 2.0
+    return normalize_preview_value(value)
 
 
 def invalid_preview_values() -> tuple[float, float, float]:

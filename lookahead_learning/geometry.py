@@ -153,18 +153,6 @@ class RouteDiagnostics:
     def route_end(self) -> bool:
         return self.boundary_reason == "route_end"
 
-    @property
-    def validated_prefix_length_m(self) -> float:
-        return self.boundary_s
-
-    @property
-    def valid_prefix_length_m(self) -> float:
-        return self.boundary_s
-
-    @property
-    def first_issue(self) -> Optional[RouteIssue]:
-        return self.issues[0] if self.issues else None
-
     def as_dict(self) -> dict[str, Any]:
         return {
             "total_lanes": self.total_lanes,
@@ -247,10 +235,6 @@ class ReferencePath:
         return self.diagnostics.boundary_s
 
     @property
-    def valid_length(self) -> float:
-        return self.total_length
-
-    @property
     def boundary_reason(self) -> str:
         return self.diagnostics.boundary_reason
 
@@ -282,9 +266,6 @@ class ReferencePath:
             raise ValueError("cumulative distance selected no finite lane interval")
         return segment, local_s
 
-    def lane_at_s(self, s: float) -> Any:
-        return self._segment_for_s(s)[0].lane
-
     def lane_index_at_s(self, s: float) -> int:
         return self._segment_for_s(s)[0].lane_index
 
@@ -295,10 +276,6 @@ class ReferencePath:
     def heading_at(self, s: float) -> float:
         segment, local_s = self._segment_for_s(s)
         return _lane_heading(segment.lane, local_s)
-
-    # Names used by adapters that treat the path as P(S).
-    position = position_at
-    heading_theta_at = heading_at
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -451,18 +428,6 @@ class PreviewResult:
     projection: Optional[ProjectionResult] = None
     forward_speed_mps: Optional[float] = None
 
-    @property
-    def features(self) -> Tuple[float, float, float]:
-        return self.observation
-
-    @property
-    def normalized(self) -> Tuple[float, float, float]:
-        return self.observation
-
-    @property
-    def preview_point(self) -> Optional[Point2]:
-        return self.q
-
     def as_dict(self) -> dict[str, Any]:
         return {
             "valid": self.valid,
@@ -510,10 +475,6 @@ class PurePursuitResult:
     max_steering_deg: Optional[float]
     saturated: bool
     reason: Optional[str]
-
-    @property
-    def observation_preview_valid(self) -> Optional[int]:
-        return None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1055,30 +1016,6 @@ def build_reference_route(
     return RouteBuildResult(path, diagnostics)
 
 
-def build_reference_path(
-    lanes: Iterable[Any],
-    *,
-    metadata: MetadataSource = None,
-    endpoint_tolerance_m: float = DEFAULT_ENDPOINT_TOLERANCE_M,
-    width_tolerance_m: float = DEFAULT_WIDTH_TOLERANCE_M,
-    tangent_tolerance_rad: float = DEFAULT_TANGENT_TOLERANCE_RAD,
-) -> ReferencePath:
-    """Build a fixed route and return its immutable path.
-
-    For callers that need the diagnostic wrapper, use
-    :func:`build_reference_route`; the returned path retains the same
-    ``RouteDiagnostics`` object.
-    """
-
-    return build_reference_route(
-        lanes,
-        metadata=metadata,
-        endpoint_tolerance_m=endpoint_tolerance_m,
-        width_tolerance_m=width_tolerance_m,
-        tangent_tolerance_rad=tangent_tolerance_rad,
-    ).path
-
-
 def _classify_validation_issue(message: str) -> str:
     text = message.lower()
     if "unsupported_lane_type" in text:
@@ -1564,11 +1501,6 @@ def compute_preview(
     )
 
 
-# Descriptive alias used by adapters that call the common feature vector a
-# "forward preview" rather than a generic preview.
-compute_forward_preview = compute_preview
-
-
 def pure_pursuit_from_rear_coordinates(
     x_rear: float,
     y_rear: float,
@@ -1686,13 +1618,12 @@ def compute_pure_pursuit(
     if abs(abs(sign) - 1.0) > 1.0e-12:
         raise ValueError("steering_sign must be +1 or -1")
 
-    point2, nonfinite_point = _point2_state(point)
-    if nonfinite_point:
+    def invalid(reason: str, *, rear: Optional[Point2] = None) -> PurePursuitResult:
         return PurePursuitResult(
             valid=False,
             pp_valid=False,
             q=preview.q,
-            rear_position=None,
+            rear_position=rear,
             x_rear=None,
             y_rear=None,
             wheelbase_m=wheelbase,
@@ -1705,76 +1636,26 @@ def compute_pure_pursuit(
             steering_sign=sign,
             max_steering_deg=max_steering,
             saturated=False,
-            reason="nonfinite_vehicle_geometry",
+            reason=reason,
         )
+
+    point2, nonfinite_point = _point2_state(point)
+    if nonfinite_point:
+        return invalid("nonfinite_vehicle_geometry")
     assert point2 is not None
     psi, nonfinite_heading = _scalar_state(psi_rad, "psi_rad")
     if nonfinite_heading:
-        return PurePursuitResult(
-            valid=False,
-            pp_valid=False,
-            q=preview.q,
-            rear_position=None,
-            x_rear=None,
-            y_rear=None,
-            wheelbase_m=wheelbase,
-            rear_wheelbase_m=rear_offset,
-            kappa_pp=None,
-            delta_pp_rad=None,
-            delta_pp_deg=None,
-            u_pp_unclipped=None,
-            u_pp=None,
-            steering_sign=sign,
-            max_steering_deg=max_steering,
-            saturated=False,
-            reason="nonfinite_vehicle_geometry",
-        )
+        return invalid("nonfinite_vehicle_geometry")
     assert psi is not None
 
     rear2: Optional[Point2] = None
     if rear_position is not None:
         rear2, nonfinite_rear = _point2_state(rear_position, "rear_position")
         if nonfinite_rear:
-            return PurePursuitResult(
-                valid=False,
-                pp_valid=False,
-                q=preview.q,
-                rear_position=None,
-                x_rear=None,
-                y_rear=None,
-                wheelbase_m=wheelbase,
-                rear_wheelbase_m=rear_offset,
-                kappa_pp=None,
-                delta_pp_rad=None,
-                delta_pp_deg=None,
-                u_pp_unclipped=None,
-                u_pp=None,
-                steering_sign=sign,
-                max_steering_deg=max_steering,
-                saturated=False,
-                reason="nonfinite_vehicle_geometry",
-            )
+            return invalid("nonfinite_vehicle_geometry")
         assert rear2 is not None
     if not preview.valid or preview.q is None:
-        return PurePursuitResult(
-            valid=False,
-            pp_valid=False,
-            q=preview.q,
-            rear_position=None,
-            x_rear=None,
-            y_rear=None,
-            wheelbase_m=wheelbase,
-            rear_wheelbase_m=rear_offset,
-            kappa_pp=None,
-            delta_pp_rad=None,
-            delta_pp_deg=None,
-            u_pp_unclipped=None,
-            u_pp=None,
-            steering_sign=sign,
-            max_steering_deg=max_steering,
-            saturated=False,
-            reason="preview_invalid",
-        )
+        return invalid("preview_invalid")
     forward = (math.cos(psi), math.sin(psi))
     if rear2 is None:
         assert rear_offset is not None
@@ -1789,30 +1670,12 @@ def compute_pure_pursuit(
                 point2[1] - rear_offset * forward[1],
             )
             if _distance(rear2, expected) > DEFAULT_ENDPOINT_TOLERANCE_M:
-                return PurePursuitResult(
-                    valid=False,
-                    pp_valid=False,
-                    q=preview.q,
-                    rear_position=rear2,
-                    x_rear=None,
-                    y_rear=None,
-                    wheelbase_m=wheelbase,
-                    rear_wheelbase_m=rear_offset,
-                    kappa_pp=None,
-                    delta_pp_rad=None,
-                    delta_pp_deg=None,
-                    u_pp_unclipped=None,
-                    u_pp=None,
-                    steering_sign=sign,
-                    max_steering_deg=max_steering,
-                    saturated=False,
-                    reason="rear_axle_geometry_mismatch",
-                )
+                return invalid("rear_axle_geometry_mismatch", rear=rear2)
     difference = (preview.q[0] - rear2[0], preview.q[1] - rear2[1])
     left = (-math.sin(psi), math.cos(psi))
     x_rear = difference[0] * forward[0] + difference[1] * forward[1]
     y_rear = difference[0] * left[0] + difference[1] * left[1]
-    result = pure_pursuit_from_rear_coordinates(
+    return pure_pursuit_from_rear_coordinates(
         x_rear,
         y_rear,
         wheelbase_m=wheelbase,
@@ -1822,11 +1685,6 @@ def compute_pure_pursuit(
         rear_position=rear2,
         rear_wheelbase_m=rear_offset,
     )
-    return result
-
-
-# Short alias for adapter code.
-compute_pp_reference = compute_pure_pursuit
 
 
 def pp_penalty_result(
@@ -1915,18 +1773,6 @@ def compute_pp_penalty(
     ).r_pp
 
 
-def compute_pp_reward(*args: Any, **kwargs: Any) -> float:
-    """Alias for :func:`compute_pp_penalty` used by reward wrappers."""
-
-    return compute_pp_penalty(*args, **kwargs)
-
-
-def pp_penalty(*args: Any, **kwargs: Any) -> float:
-    """Alias for :func:`compute_pp_penalty`."""
-
-    return compute_pp_penalty(*args, **kwargs)
-
-
 def _to_dict(value: Any) -> Any:
     if hasattr(value, "as_dict") and callable(value.as_dict):
         return value.as_dict()
@@ -1968,16 +1814,11 @@ __all__ = [
     "validate_lane",
     "connection_measurement",
     "build_reference_route",
-    "build_reference_path",
     "connected_successor_candidates",
     "project_to_path",
     "compute_preview",
-    "compute_forward_preview",
     "pure_pursuit_from_rear_coordinates",
     "compute_pure_pursuit",
-    "compute_pp_reference",
     "pp_penalty_result",
     "compute_pp_penalty",
-    "compute_pp_reward",
-    "pp_penalty",
 ]

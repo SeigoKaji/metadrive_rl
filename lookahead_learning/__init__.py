@@ -20,7 +20,7 @@ PP項なし、正の値はPP不一致ペナルティも追加します。新し�
 ``set_lookahead_model_metadata``、ロード後に
 ``validate_lookahead_model_metadata``を呼び、設定とschema version 2をZIP内属性で
 照合します。schema v1の旧モデルは新項Offとして読み取れます。
-詳細は [追加報酬](docs/lateral_acceleration_reward.md)、 [docs/README](docs/README.md)、[実行手順](docs/run.md)、
+詳細は [追加報酬](docs/lateral_acceleration_reward.md)、 [docs/README](docs/README.md)、
 [移植手順](docs/porting.md)、[仕組みと数式](docs/methods.md) を参照してください。
 """
 

@@ -464,6 +464,60 @@ class PurePursuitTests(unittest.TestCase):
                 rear_position=(math.nan, 0.0),
             )
 
+    def test_nonfinite_vehicle_state_preserves_invalid_pp_diagnostics(self) -> None:
+        preview = self._preview(1.0)
+        for point, heading in (
+            ((math.nan, -1.0), 0.0),
+            ((0.0, -1.0), math.inf),
+        ):
+            with self.subTest(point=point, heading=heading):
+                result = compute_pure_pursuit(
+                    preview,
+                    point,
+                    heading,
+                    wheelbase_m=2.5,
+                    max_steering_deg=30.0,
+                    steering_sign=-1.0,
+                    rear_wheelbase_m=1.5,
+                )
+                self.assertFalse(result.valid)
+                self.assertFalse(result.pp_valid)
+                self.assertEqual(result.reason, "nonfinite_vehicle_geometry")
+                self.assertEqual(result.q, preview.q)
+                self.assertEqual(result.wheelbase_m, 2.5)
+                self.assertEqual(result.rear_wheelbase_m, 1.5)
+                self.assertEqual(result.max_steering_deg, 30.0)
+                self.assertEqual(result.steering_sign, -1.0)
+                self.assertIsNone(result.rear_position)
+                self.assertIsNone(result.u_pp)
+                self.assertIsNone(result.kappa_pp)
+                self.assertFalse(result.saturated)
+
+    def test_explicit_rear_position_must_match_the_confirmed_offset(self) -> None:
+        preview = self._preview(1.0)
+        for rear_position, valid in (((-1.5, -1.0), True), ((0.0, -1.0), False)):
+            with self.subTest(rear_position=rear_position):
+                result = compute_pure_pursuit(
+                    preview,
+                    (0.0, -1.0),
+                    0.0,
+                    wheelbase_m=2.5,
+                    max_steering_deg=30.0,
+                    steering_sign=1.0,
+                    rear_wheelbase_m=1.5,
+                    rear_position=rear_position,
+                )
+                self.assertEqual(result.pp_valid, valid)
+                self.assertEqual(result.rear_position, rear_position)
+                self.assertEqual(result.q, preview.q)
+                if valid:
+                    self.assertIsNone(result.reason)
+                    self.assertGreater(result.u_pp, 0.0)
+                else:
+                    self.assertEqual(result.reason, "rear_axle_geometry_mismatch")
+                    self.assertIsNone(result.x_rear)
+                    self.assertIsNone(result.u_pp)
+
     def test_connected_successor_rejects_ambiguous_candidates(self) -> None:
         previous = StraightLane((0.0, 0.0), (2.0, 0.0))
         candidate_a = StraightLane((2.0, 0.0), (4.0, 0.0))

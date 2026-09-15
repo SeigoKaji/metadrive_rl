@@ -16,6 +16,16 @@ python evaluate.py --config configs/your_experiment.toml
 このrepositoryで動作例として使う設定は
 configs/official_start_lane_return_lookahead.toml です。これは参照用のTOMLであり、
 移植先へconfigs/フォルダを丸ごとコピーする前提ではありません。
+必要横加速度の報酬を有効にする例は
+configs/official_start_lane_return_lookahead_lateral_accel.toml です。
+
+既存TOMLに追加する最小設定は次のとおりです。
+
+~~~toml
+[lookahead]
+lookahead_m = 6.0
+pp_weight = 0.0
+~~~
 
 [lookahead] を省略するとbaselineです。tableがあり pp_weight=0.0ならraw観測へ
 注視点3値を追加し、正のpp_weightなら同じ観測にPP不一致ペナルティも加えます。
@@ -23,6 +33,14 @@ lookahead_mは経路に沿った弧長[m]、pp_weightは追加ペナルティ係
 幅Dは移植先hostで決まり、wrapper後はD+3になります。数を合わせるためのpaddingや
 切り捨ては行いません。新項は lateral_accel_reward_enabled=true かつ正の重みで有効になり、省略時はOffです。
 設定例、数式、旧モデル互換は [新項の仕様](lateral_acceleration_reward.md) にあります。
+
+| キー | 検証 | 意味 |
+|---|---|---|
+| lookahead_m | 有限で正、既定6.0 | 経路に沿った注視距離 [m] |
+| pp_weight | 有限で0以上、既定0.0 | PP不一致ペナルティ係数 |
+| lateral_accel_reward_enabled | bool、既定false | 必要横加速度ペナルティの切り替え |
+| max_lateral_accel | 有限で正、既定0.8 | 許容横加速度 [m/s²] |
+| lateral_accel_weight | 有限で0以上、既定0.1 | 必要横加速度ペナルティ係数 |
 
 checkpoint.py は Python 標準ライブラリだけで動作します。config loaderでは
 次を一度呼びます。
@@ -38,6 +56,11 @@ model.lookahead_schema_version=2 としてPPO.save()前にZIPへ保存します�
 PPO.load()直後に選択TOMLとZIPの設定を照合します。checkpointの属性はZIP内にあり、
 追加ファイルやハッシュ照合をゲートには使いません。注視3値の順序・encoding・
 報酬定義を変更する場合はschema versionを更新してください。旧schema v1は新項Offとして読み取り互換を保ちます。
+
+生成物の場所と名前はTOMLのname、default_model_name、evaluation.output_prefixに従います。
+学習runにはmodel ZIPとtraining_metadata.json、評価runにはevaluation.jsonとstep traceを保存します。
+同じTOMLを使ったrunを単位にmodelとJSONを保管し、設定を変える場合は別run名を使います。
+baselineモデルを評価するときは、[lookahead]を省略したTOMLを指定します。
 
 ## 実装を追う4つの薄いhook
 
@@ -84,7 +107,6 @@ host固有の入力・車両・Navigationの意味と単位はadapterの監査�
 |---|---|
 | [観測入力と報酬関数の仕様](methods.md) | 観測の構成、注視点の生成・正規化、PP 参照と追加報酬の定義 |
 | [必要横加速度の追加報酬](lateral_acceleration_reward.md) | 曲率区間、時刻、単位、On/Off、旧モデル互換、数値例と限界 |
-| [実行手順](run.md) | 通常train/evaluate、軽量テスト |
 | [移植手順](porting.md) | 必要なruntime、4つの薄いhook、移植後の運用確認 |
 | [GitHub Copilot向け移植プロンプト](copilot_porting_prompt.md) | 小さな移植依頼として貼れる指示文 |
 
@@ -93,15 +115,18 @@ host固有の入力・車両・Navigationの意味と単位はadapterの監査�
 本番に必要なのは adapter.py、checkpoint.py、env.py、geometry.py、lateral_acceleration.py、
 __init__.py です。同梱の test_*.py は
 移植後の契約確認用で、本番起動には必要ありません。生成済みモデル、ログ、
-assets、bytecodeは配布物へ含めません。
+Simulator assets、bytecodeは配布物へ含めません。
 
 テストを同梱した場合の最小確認は次のとおりです。
 
 ~~~bash
 python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
+python train.py --help
+python evaluate.py --help
 ~~~
 
 test_checkpoint.py、test_geometry.py、test_lateral_acceleration.pyは標準ライブラリのみです。
 envのfakeテストとrootの train.py/evaluate.py --help にはホストの依存関係が
-必要です。この確認は短時間の契約・幾何テストで、実simやPPOの長時間学習は
+必要です。test_portabilityはフォルダ単独コピーで元rootとMetaDriveのimportを禁止して確認します。
+この確認は短時間の契約・幾何テストで、実simやPPOの長時間学習は
 依存関係を用意した移植先で通常の train.py / evaluate.py を使って別途実行します。

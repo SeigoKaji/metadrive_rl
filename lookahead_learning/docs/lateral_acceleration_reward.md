@@ -203,7 +203,7 @@ TOML root の既存 schema_version とモデルの lookahead_schema_version は�
 ../metadrive_rl-main/.venv/bin/python evaluate.py --config configs/official_start_lane_return_lookahead_lateral_accel.toml --no-record-gif
 ~~~
 
-移植先ではその host の python を使います。検証コマンド・通常入口は [run.md](run.md) を参照してください。
+移植先ではその host の python を使います。検証コマンド・通常入口は [README](README.md#配布と確認) を参照してください。
 
 MetaDrive 0.4.3 と取得済み assets で、通常の make_evaluation_env を使う1環境・8 decisionの
 smoke testも実行しました。raw D=259、wrapper後D+3=262、PP providerなしで、

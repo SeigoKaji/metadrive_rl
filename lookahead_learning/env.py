@@ -25,6 +25,8 @@ import gymnasium as gym
 import numpy as np
 
 from .adapter import (
+    _finite_number as _finite,
+    _freeze_value,
     HostContractError,
     Mode,
     ObservationContract,
@@ -39,6 +41,7 @@ from .adapter import (
     simulation_dt_seconds,
 )
 from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
+from .geometry import pp_penalty_result
 from .lateral_acceleration import (
     LateralEpisodeMetrics, LateralReference, lateral_accel_penalty, planar_speed_mps,
 )
@@ -60,18 +63,6 @@ StateReader: TypeAlias = Callable[[object], Mapping[str, object]]
 AppliedSteeringReader: TypeAlias = Callable[[object], float]
 AppliedActionReader: TypeAlias = Callable[[object], Sequence[float]]
 DtReader: TypeAlias = Callable[[object], float]
-
-
-def _finite(value: object, *, name: str) -> float:
-    if isinstance(value, bool):
-        raise HostContractError(f"{name} must be numeric, not bool")
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as error:
-        raise HostContractError(f"{name} must be numeric") from error
-    if not math.isfinite(number):
-        raise HostContractError(f"{name} must be finite")
-    return number
 
 
 def _strict_bool(value: object, *, name: str) -> bool:
@@ -105,32 +96,6 @@ def _field(value: object, *names: str, default: object = None) -> object:
         if hasattr(value, name):
             return getattr(value, name)
     return default
-
-
-def _freeze_value(value: object) -> object:
-    """Make provider metadata safe from later external mutation."""
-
-    if isinstance(value, Mapping):
-        return tuple(
-            (str(key), _freeze_value(item))
-            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-        )
-    if isinstance(value, np.ndarray):
-        # ``tolist()`` returns a scalar for a zero-dimensional ndarray, which
-        # is exactly what SB3 emits for a single Discrete action.  Recurse on
-        # the converted value so both scalar and vector arrays use the same
-        # immutable representation.
-        return _freeze_value(value.tolist())
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
-    if isinstance(value, (np.integer, int)) and not isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (np.floating, float)):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    if isinstance(value, (str, bool)) or value is None:
-        return value
-    return str(value)
 
 
 def _details_tuple(value: object) -> tuple[tuple[str, object], ...]:
@@ -602,37 +567,13 @@ def _snapshot_flat_fields(
     implementation details or making a second host-state read.
     """
 
-    if snapshot is None:
-        return {
-            "position": None,
-            "heading": None,
-            "speed_mps": None,
-            "progress_m": None,
-            "reference_lane_ids": None,
-            "navigation_reference_ids": None,
-            "preview_valid": None,
-            "preview_invalid_reason": None,
-            "q": None,
-            "x_g": None,
-            "y_g": None,
-            "preview_x_norm": None,
-            "preview_y_norm": None,
-            "S_proj": None,
-            "S_goal": None,
-            "projection_lane": None,
-            "target_lane": None,
-            "heading_error_rad": None,
-            "lateral_error_m": None,
-            "preview_x_clipped": None,
-            "preview_y_clipped": None,
-            "preview_route_boundary": None,
-        }
-    state = dict(snapshot.state)
+    state = {} if snapshot is None else dict(snapshot.state)
     position = state.get("position_xy")
     heading = state.get("heading_theta", state.get("heading_rad"))
     speed = state.get("speed_m_s", state.get("speed_mps"))
     progress = state.get("travelled_length_m", state.get("progress_m"))
-    preview = snapshot.preview
+    preview = None if snapshot is None else snapshot.preview
+    values = (None, None, None) if preview is None else preview.observation_values
     detail_map = {} if preview is None else dict(preview.details)
     fixed_reference_ids = state.get("fixed_reference_lane_ids")
     if fixed_reference_ids is None:
@@ -661,12 +602,8 @@ def _snapshot_flat_fields(
         "q": None if preview is None or preview.q_xy is None else preview.q_xy,
         "x_g": None if preview is None else preview.x_g_m,
         "y_g": None if preview is None else preview.y_g_m,
-        "preview_x_norm": (
-            None if preview is None else preview.observation_values[0]
-        ),
-        "preview_y_norm": (
-            None if preview is None else preview.observation_values[1]
-        ),
+        "preview_x_norm": values[0],
+        "preview_y_norm": values[1],
         "S_proj": None if preview is None else preview.s_proj_m,
         "S_goal": None if preview is None else preview.s_goal_m,
         "projection_lane": None if preview is None else preview.projected_lane_id,
@@ -808,15 +745,12 @@ class LookaheadEnv(gym.Wrapper):
             if self._lateral_effective else read_vehicle_state
         )
         self._run_id = str(run_id)
-        self._raw_observation_space = actual_space
         self._augmented_observation_space = (
             contract.augmented_space() if mode != "baseline" else actual_space
         )
         self._snapshot: PreviewSnapshot | None = None
         self._terminal_snapshot: PreviewSnapshot | None = None
         self._needs_reset = True
-        self._decision = 0
-        self._time_seconds = 0.0
         self._dt_seconds: float | None = None
         self._episode_r_base = 0.0
         self._episode_r_pp = 0.0
@@ -862,8 +796,6 @@ class LookaheadEnv(gym.Wrapper):
         }
 
     def _read_state_snapshot(self, *, initial: bool = False) -> tuple[tuple[str, object], ...]:
-        if self._read_state is None:
-            return ()
         value = self._read_state(self.env)
         if not isinstance(value, Mapping):
             raise HostContractError("state_reader must return a mapping")
@@ -904,7 +836,6 @@ class LookaheadEnv(gym.Wrapper):
         # diagnostics.  It still returns the raw host vector and host reward;
         # the provider is only read once to produce the shared snapshot.
         if self._preview_provider is not None:
-            assert self._preview_provider is not None
             preview = PreviewState.from_object(self._preview_provider(self.env))
             if self._lateral_effective:
                 reference = preview.lateral_reference
@@ -987,13 +918,12 @@ class LookaheadEnv(gym.Wrapper):
         raw_observation: object,
         snapshot: PreviewSnapshot,
     ) -> np.ndarray:
-        raw = self._contract.validate_raw(raw_observation)
         if self._mode == "baseline":
             # Preserve the host array and values exactly for baseline.
-            return raw
+            return self._contract.validate_raw(raw_observation)
         assert snapshot.preview is not None
         return self._contract.append_preview(
-            raw,
+            raw_observation,
             snapshot.preview.observation_values,
         )
 
@@ -1067,6 +997,7 @@ class LookaheadEnv(gym.Wrapper):
             else post_snapshot.preview.s_proj_m
         )
         state_after = dict(post_snapshot.state)
+        yaw_rate = _yaw_rate_after(pre_snapshot, post_snapshot, dt)
         scenario_seed = state_after.get("scenario_seed")
         metric_pp_snapshot = (
             pre_snapshot.pp
@@ -1120,7 +1051,7 @@ class LookaheadEnv(gym.Wrapper):
                 or dt is None
                 else (u_applied - u_previous) / dt
             ),
-            "yaw_rate_after": _yaw_rate_after(pre_snapshot, post_snapshot, dt),
+            "yaw_rate_after": yaw_rate,
             "u_pp": (
                 None
                 if metric_pp_snapshot is None
@@ -1145,7 +1076,7 @@ class LookaheadEnv(gym.Wrapper):
             "state_before": (
                 None if pre_snapshot is None else dict(pre_snapshot.state)
             ),
-            "state_after": dict(post_snapshot.state),
+            "state_after": state_after,
             "terminated": terminated,
             "truncated": truncated,
         }
@@ -1173,9 +1104,7 @@ class LookaheadEnv(gym.Wrapper):
                         "throttle": previous_applied_action[1],
                     }
                 ),
-                "policy_action_raw": None if action is None else _action_record(action),
-                "policy_action_stage": "env" if action is not None else None,
-                "yaw_rate": _yaw_rate_after(pre_snapshot, post_snapshot, dt),
+                "yaw_rate": yaw_rate,
                 "episode_end": bool(terminated or truncated),
                 "lookahead_learning_schema_version": "lookahead_learning.env.v2",
             }
@@ -1321,12 +1250,9 @@ class LookaheadEnv(gym.Wrapper):
         if not isinstance(result, tuple) or len(result) != 2:
             raise HostContractError("host reset must return (observation, info)")
         raw_observation, info = result
-        self._contract.validate_raw(raw_observation)
         self._snapshot = None
         self._terminal_snapshot = None
         self._needs_reset = False
-        self._decision = 0
-        self._time_seconds = 0.0
         self._dt_seconds = None
         self._episode_r_base = 0.0
         self._episode_r_pp = 0.0
@@ -1390,7 +1316,6 @@ class LookaheadEnv(gym.Wrapper):
         raw_observation, reward, terminated_raw, truncated_raw, info = result
         terminated = _strict_bool(terminated_raw, name="terminated")
         truncated = _strict_bool(truncated_raw, name="truncated")
-        self._contract.validate_raw(raw_observation)
         r_base = _finite(reward, name="base reward")
 
         u_applied: float | None = None
@@ -1431,12 +1356,16 @@ class LookaheadEnv(gym.Wrapper):
             )
         if self._mode == "lookahead_obs_pp_reward":
             assert pre_snapshot.pp is not None
-            if pre_snapshot.pp.pp_valid and not (terminated or truncated):
-                assert pre_snapshot.pp.u_pp is not None
-                e_pp = abs(u_applied - pre_snapshot.pp.u_pp) / 2.0
-                r_pp = -self._pp_weight * dt * e_pp
-            else:
-                e_pp = None
+            penalty = pp_penalty_result(
+                u_applied,
+                pre_snapshot.pp.u_pp,
+                dt_s=dt,
+                pp_weight=self._pp_weight,
+                pp_valid=pre_snapshot.pp.pp_valid,
+                terminated=terminated,
+                truncated=truncated,
+            )
+            r_pp, e_pp = penalty.r_pp, penalty.e_pp
         next_decision = pre_snapshot.decision + 1
         assert self._dt_seconds is not None
         next_time = pre_snapshot.t_seconds + self._dt_seconds
@@ -1453,8 +1382,6 @@ class LookaheadEnv(gym.Wrapper):
             r_total += r_lateral_accel
         self._lateral_metrics.observe(lateral_diagnostic, dt)
         observation = self._format_observation(raw_observation, post_snapshot)
-        self._decision = next_decision
-        self._time_seconds = next_time
         self._episode_r_base += r_base
         self._episode_r_pp += r_pp
         self._episode_r_lateral_accel += r_lateral_accel
@@ -1491,9 +1418,6 @@ class LookaheadEnv(gym.Wrapper):
             r_total if self._mode == "lookahead_obs_pp_reward" or self._lateral_effective else reward
         )
         return observation, returned_reward, terminated, truncated, step_info
-
-    def close(self):
-        return self.env.close()
 
 __all__ = [
     "AppliedActionReader",
