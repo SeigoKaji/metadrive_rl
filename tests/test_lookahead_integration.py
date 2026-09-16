@@ -7,6 +7,7 @@ from types import ModuleType
 from typing import Any
 
 import env_factory
+from lookahead_learning.checkpoint import resolve_lookahead_config
 
 
 def test_make_env_wraps_both_raw_host_variants_only_when_config_is_present(
@@ -45,7 +46,7 @@ def test_make_env_wraps_both_raw_host_variants_only_when_config_is_present(
     monkeypatch.setitem(sys.modules, "start_lane_env", start_lane)
     monkeypatch.setitem(sys.modules, "lookahead_learning.adapter", adapter)
 
-    lookahead = {"lookahead_m": 6.0, "pp_weight": 0.0}
+    lookahead = resolve_lookahead_config({"lateral_accel_reward_enabled": True})
     wrapped = env_factory.make_env(
         {"start_lane_objective": "return"},
         lookahead_config=lookahead,
@@ -116,7 +117,7 @@ def test_stage_factories_forward_the_same_lookahead_config_and_keep_monitor_oute
 
     monkeypatch.setattr(env_factory, "make_env", fake_make_env)
     monkeypatch.setattr(env_factory, "Monitor", FakeMonitor)
-    lookahead = {"lookahead_m": 6.0, "pp_weight": 0.0}
+    lookahead = resolve_lookahead_config({"lateral_accel_reward_enabled": True})
 
     training_env = env_factory.make_training_env(
         rank=0,

@@ -12,19 +12,31 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import math
+from typing import TypedDict
 
 
 class CheckpointContractError(ValueError):
     """ZIP-carried lookahead attributes violate the compatibility contract."""
 
 
-LOOKAHEAD_DEFAULTS: dict[str, float] = {
+class LookaheadConfig(TypedDict):
+    lookahead_m: float
+    pp_weight: float
+    lateral_accel_reward_enabled: bool
+    max_lateral_accel: float
+    lateral_accel_weight: float
+
+
+LOOKAHEAD_DEFAULTS: LookaheadConfig = {
     "lookahead_m": 6.0,
     "pp_weight": 0.0,
+    "lateral_accel_reward_enabled": False,
+    "max_lateral_accel": 0.8,
+    "lateral_accel_weight": 0.1,
 }
 """Resolved defaults used whenever an explicit ``[lookahead]`` table exists."""
 
-LOOKAHEAD_MODEL_SCHEMA_VERSION = 1
+LOOKAHEAD_MODEL_SCHEMA_VERSION = 2
 LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE = "lookahead_config"
 LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE = "lookahead_schema_version"
 _LOOKAHEAD_KEYS = frozenset(LOOKAHEAD_DEFAULTS)
@@ -60,13 +72,13 @@ def _lookahead_real(
     return number
 
 
-def resolve_lookahead_config(value: object) -> dict[str, float] | None:
+def resolve_lookahead_config(value: object) -> LookaheadConfig | None:
     """Resolve an optional TOML ``[lookahead]`` table.
 
     ``None`` means that the feature is disabled.  Any mapping, including an
     empty one, means enabled and receives the explicit defaults.  This function
-    deliberately accepts only plain finite numeric values so the same contract
-    can be reused by a copied ``lookahead_learning`` package.
+    accepts a strict bool switch and finite numeric parameters.  Even inactive
+    parameters are validated; their values do not affect model compatibility.
     """
 
     if value is None:
@@ -78,6 +90,11 @@ def resolve_lookahead_config(value: object) -> dict[str, float] | None:
     unknown = sorted(set(value) - _LOOKAHEAD_KEYS)
     if unknown:
         raise ValueError(f"lookahead: 未対応のkeyがあります: {', '.join(unknown)}")
+    enabled = value.get(
+        "lateral_accel_reward_enabled", LOOKAHEAD_DEFAULTS["lateral_accel_reward_enabled"]
+    )
+    if not isinstance(enabled, bool):
+        raise ValueError("lookahead.lateral_accel_reward_enabled: boolで指定してください")
     return {
         "lookahead_m": _lookahead_real(
             value.get("lookahead_m", LOOKAHEAD_DEFAULTS["lookahead_m"]),
@@ -91,6 +108,19 @@ def resolve_lookahead_config(value: object) -> dict[str, float] | None:
             minimum=0.0,
             minimum_inclusive=True,
         ),
+        "lateral_accel_reward_enabled": enabled,
+        "max_lateral_accel": _lookahead_real(
+            value.get("max_lateral_accel", LOOKAHEAD_DEFAULTS["max_lateral_accel"]),
+            key="max_lateral_accel",
+            minimum=0.0,
+            minimum_inclusive=False,
+        ),
+        "lateral_accel_weight": _lookahead_real(
+            value.get("lateral_accel_weight", LOOKAHEAD_DEFAULTS["lateral_accel_weight"]),
+            key="lateral_accel_weight",
+            minimum=0.0,
+            minimum_inclusive=True,
+        ),
     }
 
 
@@ -100,11 +130,12 @@ def set_lookahead_model_metadata(
 ) -> None:
     """Attach resolved settings to attributes serialized inside a PPO ZIP."""
 
+    resolved = resolve_lookahead_config(lookahead_config)
     setattr(model, LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE, LOOKAHEAD_MODEL_SCHEMA_VERSION)
     setattr(
         model,
         LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE,
-        None if lookahead_config is None else dict(lookahead_config),
+        resolved,
     )
 
 
@@ -112,10 +143,24 @@ def validate_lookahead_model_metadata(
     model: object,
     expected: Mapping[str, object] | None,
 ) -> None:
-    """Validate ZIP-carried lookahead settings against the selected TOML."""
+    """Compare effective settings, reading v1 as lateral reward Off.
+
+    Validation never mutates a loaded model.  Off/zero-weight lateral settings
+    ignore their inactive limit/weight, but active reward settings must match.
+    Unknown schemas are rejected even for baseline checkpoints.
+    """
 
     actual = getattr(model, LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE, _MISSING)
-    if expected is None:
+    schema = getattr(model, LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE, _MISSING)
+    if schema is not _MISSING and (type(schema) is not int or schema not in (1, 2)):
+        raise CheckpointContractError(f"unsupported lookahead schema metadata: {schema!r}")
+    if schema is not _MISSING and actual is _MISSING:
+        raise CheckpointContractError("incomplete lookahead schema metadata: config is missing")
+    try:
+        expected_config = resolve_lookahead_config(expected)
+    except ValueError as error:
+        raise CheckpointContractError(f"invalid expected lookahead settings: {error}") from error
+    if expected_config is None:
         # Legacy baseline ZIPs have no custom attributes; newly saved baseline
         # models carry ``None``.  An active checkpoint must not pass solely on
         # an accidentally compatible observation shape.
@@ -125,17 +170,36 @@ def validate_lookahead_model_metadata(
             "checkpoint contains active lookahead settings but the selected "
             "TOML has no [lookahead] table"
         )
-    schema = getattr(model, LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE, None)
-    if schema != LOOKAHEAD_MODEL_SCHEMA_VERSION:
+    if schema is _MISSING:
         raise CheckpointContractError(
             "lookahead config is active but the checkpoint has no supported "
             "lookahead schema metadata"
         )
-    if not isinstance(actual, Mapping) or dict(actual) != dict(expected):
+    if not isinstance(actual, Mapping):
+        raise CheckpointContractError(
+            "checkpoint lookahead settings do not match active TOML (baseline/missing config)"
+        )
+    if schema == 1 and set(actual) != {"lookahead_m", "pp_weight"}:
+        raise CheckpointContractError("schema v1 requires exactly lookahead_m and pp_weight")
+    try:
+        actual_config = resolve_lookahead_config(actual)
+    except ValueError as error:
+        raise CheckpointContractError(f"invalid checkpoint lookahead settings: {error}") from error
+    assert actual_config is not None
+    if _effective_settings(actual_config) != _effective_settings(expected_config):
         raise CheckpointContractError(
             "checkpoint lookahead settings do not match the selected TOML: "
-            f"expected={dict(expected)!r}, found={actual!r}"
+            f"expected={dict(expected_config)!r}, found={dict(actual_config)!r}"
         )
+
+
+def _effective_settings(config: LookaheadConfig) -> tuple[object, ...]:
+    active = config["lateral_accel_reward_enabled"] and config["lateral_accel_weight"] > 0.0
+    return (
+        config["lookahead_m"], config["pp_weight"], active,
+        config["max_lateral_accel"] if active else None,
+        config["lateral_accel_weight"] if active else None,
+    )
 
 
 __all__ = [
@@ -144,6 +208,7 @@ __all__ = [
     "LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE",
     "LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE",
     "LOOKAHEAD_MODEL_SCHEMA_VERSION",
+    "LookaheadConfig",
     "resolve_lookahead_config",
     "set_lookahead_model_metadata",
     "validate_lookahead_model_metadata",

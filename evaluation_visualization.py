@@ -78,6 +78,7 @@ STEP_TELEMETRY_FIELDS: tuple[str, ...] = (
     "status",
     "action_switch_count",
     "action_switches_per_second",
+    "lookahead_learning",
 )
 
 
@@ -467,6 +468,9 @@ def make_step_telemetry(
         "status": step_status(terminated=terminated, truncated=truncated, info=info),
         "action_switch_count": int(action_switch_count),
         "action_switches_per_second": float(action_switches_per_second),
+        # Preserve the portable wrapper's reward decomposition and reference
+        # demand diagnostics verbatim; no reward/curvature formula lives here.
+        "lookahead_learning": info.get("lookahead_learning"),
     }
     if tuple(telemetry) != STEP_TELEMETRY_FIELDS:
         raise AssertionError("step telemetry schema and field declaration diverged")

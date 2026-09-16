@@ -14,6 +14,7 @@ import numpy as np
 
 from .adapter import (
     ActionContract,
+    HostContractError,
     MetaDrivePreviewProvider,
     ObservationContract,
     UnsupportedHostError,
@@ -219,6 +220,46 @@ class ObservationWrapperTests(unittest.TestCase):
         self.assertFalse(terminated)
         self.assertFalse(truncated)
         self.assertEqual(info["lookahead_learning"]["action_env"], 5)
+
+    def test_invalid_raw_observations_are_rejected_on_reset_and_step(self) -> None:
+        from unittest.mock import patch
+
+        malformed = {
+            "shape": np.zeros(5, dtype=np.float32),
+            "dtype": np.zeros(4, dtype=np.float64),
+            "nan": np.full(4, np.nan, dtype=np.float32),
+            "inf": np.full(4, np.inf, dtype=np.float32),
+            "bounds": np.full(4, 4.0, dtype=np.float32),
+        }
+        for mode in ("baseline", "lookahead_obs"):
+            for stage in ("reset", "step"):
+                for case, observation in malformed.items():
+                    with self.subTest(mode=mode, stage=stage, case=case):
+                        raw = FakeRawEnv(observation_dim=4)
+                        wrapped = LookaheadEnv(
+                            raw,
+                            mode=mode,
+                            contract=_contract(raw),
+                            preview_provider=PreviewProbe(),
+                            state_reader=_state,
+                        )
+                        try:
+                            if stage == "step":
+                                wrapped.reset()
+                            host_method = getattr(raw, stage)
+
+                            def corrupt_observation(*args, **kwargs):
+                                result = host_method(*args, **kwargs)
+                                return (observation, *result[1:])
+
+                            with patch.object(raw, stage, side_effect=corrupt_observation):
+                                with self.assertRaises(HostContractError):
+                                    if stage == "reset":
+                                        wrapped.reset()
+                                    else:
+                                        wrapped.step(4)
+                        finally:
+                            wrapped.close()
 
     def test_259_wide_host_is_augmented_without_padding(self) -> None:
         raw = FakeRawEnv(observation_dim=259)

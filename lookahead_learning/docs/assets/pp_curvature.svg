@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-labelledby="title desc">
+  <title id="title">円弧の長さと進行方向の変化から曲率を求める</title>
+  <desc id="desc">左旋回 R&gt;0 の例。中心 C、半径 R の円に沿って後輪車軸が O から P へ進む。緑の円弧の長さが Δs。中心で半径 CO と CP がなす角度と、O と P での接線方向の変化は、ともに Δθ。接線はそれぞれの半径に直交する。Δs = R Δθ より、曲率 κ = Δθ / Δs = 1 / R。PP の半径を代入すると κ = 2y / (x² + y²) となる。</desc>
+  <defs>
+    <marker id="tangent-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <marker id="angle-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <style>
+      text { font-family: sans-serif; font-size: 17px; fill: #172b4d; }
+      .heading { font-size: 22px; font-weight: 700; }
+      .subheading { font-size: 19px; font-weight: 700; }
+      .small { font-size: 15px; }
+      .formula { font-size: 27px; }
+      .radius { stroke: #2563eb; stroke-width: 2; fill: none; }
+      .tangent { stroke: #b45309; stroke-width: 2.5; fill: none; marker-end: url(#tangent-arrow); }
+      .angle { stroke: #b45309; stroke-width: 2; fill: none; marker-end: url(#angle-arrow); }
+      .angle-label { fill: #b45309; font-size: 22px; }
+      .guide { stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 5 5; fill: none; }
+      .right-angle { stroke: #64748b; stroke-width: 1.5; fill: none; }
+      .point { fill: #172b4d; }
+    </style>
+  </defs>
+  <rect width="960" height="540" fill="white"/>
+  <text x="28" y="34" class="heading">円弧の長さと、進行方向の変化</text>
+  <text x="28" y="62">左旋回（R &gt; 0）の例。O から円弧上の点 P へ進む。</text>
+  <line x1="565" y1="86" x2="565" y2="463" stroke="#e2e8f0"/>
+
+  <!-- C = (115, 122), R = 280; P is 50 degrees from O along the circle. -->
+  <path d="M 115 402 A 280 280 0 0 0 390.746 170.621" class="guide"/>
+  <path d="M 115 122 L 115 402 M 115 122 L 329.492 301.981" class="radius"/>
+  <path d="M 115 122 L 115 172 A 50 50 0 0 0 153.302 154.139 Z" fill="#fff7ed"/>
+  <path d="M 115 172 A 50 50 0 0 0 153.302 154.139" class="angle"/>
+  <text x="146" y="190" class="angle-label">Δθ</text>
+  <text x="87" y="269" style="fill:#2563eb;font-size:22px">R</text>
+
+  <path d="M 115 402 A 280 280 0 0 0 329.492 301.981" fill="none" stroke="#0f766e" stroke-width="5"/>
+  <path d="M 256 385 L 243.334 370.082" fill="none" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="262" y="400" style="fill:#0f766e;font-size:24px">Δs</text>
+
+  <path d="M 115 402 L 245 402" class="tangent"/>
+  <path d="M 329.492 301.981 L 413.054 202.395" class="tangent"/>
+  <path d="M 329.492 301.981 L 486 301.981" class="guide"/>
+  <path d="M 384.492 301.981 A 55 55 0 0 0 364.845 259.849" class="angle"/>
+  <text x="398" y="283" class="angle-label">Δθ</text>
+  <path d="M 115 388 L 129 388 L 129 402" class="right-angle"/>
+  <path d="M 318.767 292.982 L 327.766 282.257 L 338.491 291.256" class="right-angle"/>
+
+  <circle cx="115" cy="122" r="4.5" class="point"/>
+  <circle cx="115" cy="402" r="4.5" class="point"/>
+  <circle cx="329.492" cy="301.981" r="4.5" class="point"/>
+  <text x="89" y="114">C</text>
+  <text x="88" y="426">O</text>
+  <text x="339" y="326">P</text>
+  <text x="151" y="432" class="small">初めの進行方向</text>
+  <text x="423" y="198" class="small">進んだ後の</text>
+  <text x="423" y="220" class="small">進行方向</text>
+  <text x="375" y="332" class="small">初めの向きと平行</text>
+  <text x="28" y="466" class="small">青：半径　緑：円弧　橙：接線と角度</text>
+
+  <text x="595" y="124" class="subheading">半径と接線は常に直交</text>
+  <text x="595" y="156">中心角の変化 ＝ 進行方向の変化</text>
+  <text x="595" y="193" class="angle-label">どちらも Δθ</text>
+  <line x1="595" y1="218" x2="928" y2="218" stroke="#e2e8f0"/>
+  <text x="595" y="252" class="subheading">弧長と中心角の関係</text>
+  <text x="595" y="291" class="formula">Δs = R Δθ</text>
+  <text x="595" y="345">曲率 ＝ 向きの変化 / 進んだ距離</text>
+  <text x="595" y="386" class="formula">κ = Δθ / Δs = 1 / R</text>
+  <text x="595" y="437" class="small">Δθ は rad、Δs と R は m</text>
+
+  <rect x="28" y="487" width="904" height="39" rx="6" fill="#f1f5f9"/>
+  <text x="47" y="513" style="font-size:19px">PP の半径 R = (x² + y²) / (2y) を代入すると、κ = 2y / (x² + y²)</text>
+</svg>

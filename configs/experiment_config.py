@@ -354,7 +354,7 @@ def _validate_environment(
     return validated
 
 
-def _validate_lookahead(value: object) -> dict[str, object] | None:
+def _validate_lookahead(value: object) -> Mapping[str, object] | None:
     """Resolve ``[lookahead]`` through the portable package contract."""
 
     if value is None:

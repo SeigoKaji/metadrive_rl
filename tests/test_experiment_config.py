@@ -321,6 +321,7 @@ def test_loader_resolves_present_lookahead_table_and_keeps_absent_table_disabled
     )
     selection = load_experiment_config(with_table)
     assert selection.profile.lookahead_config == {
+        **LOOKAHEAD_DEFAULTS,
         "lookahead_m": 6.0,
         "pp_weight": 0.0,
     }
@@ -346,6 +347,16 @@ def test_loader_resolves_present_lookahead_table_and_keeps_absent_table_disabled
         ("pp_weight = \"0.0\"", "lookahead.pp_weight"),
         ("pp_weight = nan", "lookahead.pp_weight"),
         ("pp_weight = inf", "lookahead.pp_weight"),
+        ("lateral_accel_reward_enabled = 1", "lookahead.lateral_accel_reward_enabled"),
+        ('lateral_accel_reward_enabled = "true"', "lookahead.lateral_accel_reward_enabled"),
+        ("max_lateral_accel = true", "lookahead.max_lateral_accel"),
+        ("max_lateral_accel = 0", "lookahead.max_lateral_accel"),
+        ("max_lateral_accel = nan", "lookahead.max_lateral_accel"),
+        ("max_lateral_accel = inf", "lookahead.max_lateral_accel"),
+        ("lateral_accel_weight = true", "lookahead.lateral_accel_weight"),
+        ("lateral_accel_weight = -1", "lookahead.lateral_accel_weight"),
+        ("lateral_accel_weight = nan", "lookahead.lateral_accel_weight"),
+        ("lateral_accel_weight = inf", "lookahead.lateral_accel_weight"),
     ],
 )
 def test_loader_rejects_invalid_lookahead_settings(

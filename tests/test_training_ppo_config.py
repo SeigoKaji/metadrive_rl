@@ -8,6 +8,7 @@ import pytest
 
 import train as train_module
 from configs.experiment_config import PPO_COMMON_SCALAR_KEYS, canonical_config_path
+from lookahead_learning.checkpoint import resolve_lookahead_config
 
 
 def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
@@ -90,9 +91,11 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     assert training_metadata["ppo_seed_argument"] is None
 
 
+@pytest.mark.parametrize("lateral_enabled", [False, True])
 def test_training_serializes_resolved_lookahead_config_into_ppo_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lateral_enabled: bool,
 ) -> None:
     """active TOML値はPPO ZIPのcustom attributeと通常metadataへ届く。"""
 
@@ -100,15 +103,19 @@ def test_training_serializes_resolved_lookahead_config_into_ppo_checkpoint(
     config_path = tmp_path / "lookahead.toml"
     config_path.write_text(
         source.read_text(encoding="utf-8")
-        + "\n[lookahead]\nlookahead_m = 6.0\npp_weight = 0.25\n",
+        + "\n[lookahead]\nlookahead_m = 6.0\npp_weight = 0.25\n"
+        + f"lateral_accel_reward_enabled = {str(lateral_enabled).lower()}\n"
+        + "max_lateral_accel = 1.2\nlateral_accel_weight = 0.07\n",
         encoding="utf-8",
     )
     captured_metadata: dict[str, object] = {}
     saved_attributes: dict[str, object] = {}
+    worker_configs: list[object] = []
 
     class FakeVecEnv:
         def __init__(self, factories: object) -> None:
             self.factories = factories
+            worker_configs.extend(factory.keywords["lookahead_config"] for factory in factories)
 
         def close(self) -> None:
             pass
@@ -154,10 +161,15 @@ def test_training_serializes_resolved_lookahead_config_into_ppo_checkpoint(
     args = train_module.parse_args(["--config", str(config_path)])
     model_path = train_module._run_training(args, tmp_path / "train.log")
 
-    expected = {"lookahead_m": 6.0, "pp_weight": 0.25}
+    expected = resolve_lookahead_config({
+        "lookahead_m": 6.0, "pp_weight": 0.25,
+        "lateral_accel_reward_enabled": lateral_enabled,
+        "max_lateral_accel": 1.2, "lateral_accel_weight": 0.07,
+    })
     assert saved_attributes == {
-        "lookahead_schema_version": 1,
+        "lookahead_schema_version": 2,
         "lookahead_config": expected,
     }
     assert captured_metadata["lookahead"] == expected
+    assert worker_configs == [expected] * args.num_envs
     assert model_path.is_file()
