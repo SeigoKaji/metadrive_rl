@@ -29,7 +29,6 @@ VALID_TOML = """\
 schema_version = 2
 name = "custom_bundle"
 algorithm = "ppo"
-default_model_name = "custom_model"
 
 [training]
 policy = "MlpPolicy"
@@ -39,7 +38,6 @@ n_steps = 64
 total_timesteps = 512
 log_interval = 2
 device = "cpu"
-model_name = "custom_training.zip"
 log_file = "logs/custom_train.log"
 
 [evaluation]
@@ -146,7 +144,7 @@ def test_example_bundle_drives_both_cli_default_sets() -> None:
     assert training_args.n_steps == 256
     assert training_args.seed == 0
     assert training_args.log_interval == 1
-    assert training_args.model_name == "example_generalization"
+    assert "model_name" not in training_args.experiment.profile.training_config
     assert training_args.experiment.source_sha256 == expected_sha256
 
     assert evaluation_args.profile == "example_generalization"
@@ -180,8 +178,6 @@ def test_cli_options_override_toml_defaults() -> None:
             "9",
             "--device",
             "auto",
-            "--model-name",
-            "override.zip",
             "--log-interval",
             "3",
             "--log-file",
@@ -193,7 +189,6 @@ def test_cli_options_override_toml_defaults() -> None:
     assert training_args.n_steps == 32
     assert training_args.seed == 9
     assert training_args.device == "auto"
-    assert training_args.model_name == "override"
     assert training_args.log_interval == 3
     assert training_args.log_file == Path("logs/override_train.log")
 
@@ -240,28 +235,25 @@ def test_training_cli_rejects_single_item_rollout_after_overrides() -> None:
         )
 
 
-def test_training_model_name_is_the_default_evaluation_model_and_prefix(
+def test_experiment_name_is_the_default_evaluation_model_and_prefix(
     tmp_path: Path,
 ) -> None:
-    """evaluationの両keyを省略しても学習済みmodelと同じ名前を使う。"""
+    """nameだけを変更すると学習の実験名と評価の既定モデル名がそろう。"""
 
     path = _write_config(
         tmp_path,
-        VALID_TOML.replace(
-            "model_name = \"custom_training.zip\"",
-            "model_name = \"linked_training_model\"",
-        )
-        .replace("model_path = \"models/custom_model.zip\"\n", "")
-        .replace("output_prefix = \"custom_evaluation\"\n", ""),
+        VALID_TOML.replace('name = "custom_bundle"', 'name = "renamed_experiment"')
+        .replace('model_path = "models/custom_model.zip"\n', '')
+        .replace('output_prefix = "custom_evaluation"\n', ''),
     )
 
     training_args = parse_training_args(["--config", str(path)])
     evaluation_args = parse_evaluation_args(["--config", str(path)])
 
-    assert training_args.experiment.profile.default_model_name == "custom_model"
-    assert training_args.model_name == "linked_training_model"
-    assert evaluation_args.model == Path("models/linked_training_model.zip")
-    assert evaluation_args.output_prefix == "linked_training_model"
+    assert training_args.experiment.name == "renamed_experiment"
+    assert "model_name" not in training_args.experiment.profile.training_config
+    assert evaluation_args.model == Path("models/renamed_experiment.zip")
+    assert evaluation_args.output_prefix == "renamed_experiment"
 
 
 def test_loader_deep_merges_common_environment_and_records_source(
@@ -291,7 +283,7 @@ def test_loader_deep_merges_common_environment_and_records_source(
         "enable_reverse": False,
         "max_speed": 20,
     }
-    assert selection.profile.training_config["model_name"] == "custom_training"
+    assert "model_name" not in selection.profile.training_config
     assert selection.profile.evaluation_defaults == {
         "model_path": "models/custom_model.zip",
         "record_gif": False,
@@ -505,9 +497,9 @@ def test_loader_allows_an_empty_required_evaluation_table(tmp_path: Path) -> Non
     selection = load_experiment_config(path)
 
     assert selection.profile.evaluation_defaults == {
-        "model_path": "models/custom_training.zip",
+        "model_path": "models/custom_bundle.zip",
         "record_gif": True,
-        "output_prefix": "custom_training",
+        "output_prefix": "custom_bundle",
         "seed": 11,
         "device": "cpu",
         "deterministic": True,
@@ -614,16 +606,6 @@ def test_loader_rejects_unsupported_algorithm_and_unknown_keys(
     ("before", "after", "match"),
     [
         ("name = \"custom_bundle\"", "name = \"../outside\"", "name"),
-        (
-            "default_model_name = \"custom_model\"",
-            "default_model_name = \"../model\"",
-            "default_model_name",
-        ),
-        (
-            "model_name = \"custom_training.zip\"",
-            "model_name = \"../model\"",
-            "training.model_name",
-        ),
         (
             "output_prefix = \"custom_evaluation\"",
             "output_prefix = \"../output\"",
@@ -820,6 +802,35 @@ def test_loader_rejects_single_item_ppo_rollout_batch(tmp_path: Path) -> None:
 
     with pytest.raises(ExperimentConfigError, match="training"):
         load_experiment_config(path)
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [("root", "default_model_name"), ("training", "model_name")],
+)
+def test_loader_rejects_removed_model_name_settings(
+    tmp_path: Path,
+    section: str,
+    key: str,
+) -> None:
+    """廃止したmodel名の設定はnameと同じ値でも黙って受理しない。"""
+
+    declaration = f'{key} = "custom_bundle"\n'
+    text = (
+        declaration + VALID_TOML
+        if section == "root"
+        else VALID_TOML.replace("[training]\n", "[training]\n" + declaration)
+    )
+    with pytest.raises(ExperimentConfigError, match=key):
+        load_experiment_config(_write_config(tmp_path, text))
+
+
+def test_training_cli_rejects_removed_model_name_option() -> None:
+    """モデルの保存名はnameから決まり、CLIで別名を指定できない。"""
+
+    with pytest.raises(SystemExit) as error:
+        parse_training_args(["--model-name", "override"])
+    assert error.value.code == 2
 
 
 def test_evaluation_cli_rejects_removed_count_option() -> None:

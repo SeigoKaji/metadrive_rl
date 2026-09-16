@@ -5,7 +5,6 @@
 schema_version = 2
 name = "official_no_lane_change_scaled_reward"
 algorithm = "ppo"
-default_model_name = "official_no_lane_change_scaled_reward"
 
 [training]
 policy = "MlpPolicy"
@@ -28,7 +27,6 @@ max_grad_norm = 0.5
 
 [evaluation]
 record_gif = true
-output_prefix = "official_no_lane_change_scaled_reward"
 seed = 0
 device = "cpu"
 deterministic = true

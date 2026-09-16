@@ -40,16 +40,11 @@ from project_paths import OUTPUT_DIR, PROJECT_ROOT
 
 
 _OFFICIAL_EXPERIMENT = select_experiment(profile_name="official")
-_OFFICIAL_EVALUATION_DEFAULTS = _OFFICIAL_EXPERIMENT.profile.evaluation_defaults
-_OFFICIAL_OUTPUT_PREFIX = str(_OFFICIAL_EVALUATION_DEFAULTS["output_prefix"])
 _OFFICIAL_SCENARIO_SEED = int(
     _OFFICIAL_EXPERIMENT.profile.evaluation_env_config["start_seed"]
 )
 OFFICIAL_EVALUATION_OUTPUT_DIR = (
-    OUTPUT_DIR
-    / _OFFICIAL_EXPERIMENT.name
-    / "evaluation"
-    / _OFFICIAL_OUTPUT_PREFIX
+    OUTPUT_DIR / _OFFICIAL_EXPERIMENT.name / "evaluation"
 )
 CANONICAL_FRAME_PATH = (
     OFFICIAL_EVALUATION_OUTPUT_DIR

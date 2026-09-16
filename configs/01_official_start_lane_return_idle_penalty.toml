@@ -3,7 +3,6 @@
 schema_version = 2
 name = "official_start_lane_return_idle_penalty"
 algorithm = "ppo"
-default_model_name = "official_start_lane_return_idle_penalty"
 
 [training]
 policy = "MlpPolicy"
@@ -26,7 +25,6 @@ max_grad_norm = 0.5
 
 [evaluation]
 record_gif = true
-output_prefix = "official_start_lane_return_idle_penalty"
 seed = 0
 device = "cpu"
 deterministic = true

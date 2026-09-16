@@ -715,7 +715,6 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
         train_env_config=custom_environment_config,
         evaluation_env_config=custom_environment_config,
         training_config={"seed": 0},
-        default_model_name="custom_range",
     )
     experiment = ExperimentSelection(
         name="custom_range",
@@ -888,7 +887,7 @@ def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(
     model_path.write_bytes(b"fake-model")
     stale_episode_dir = (
         output_dir
-        / "official/evaluation/success_case/episodes/episode_9999_scenario_999999"
+        / "official/evaluation/episodes/episode_9999_scenario_999999"
     )
     stale_episode_dir.mkdir(parents=True)
     (stale_episode_dir / "stale.txt").write_text("old run", encoding="utf-8")
@@ -980,7 +979,7 @@ def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(
     ]
     assert artifact_directories == [
         output_dir
-        / "official/evaluation/success_case/episodes/episode_0001_scenario_000005"
+        / "official/evaluation/episodes/episode_0001_scenario_000005"
     ]
     assert not stale_episode_dir.exists()
 

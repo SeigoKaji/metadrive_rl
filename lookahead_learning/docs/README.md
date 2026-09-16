@@ -57,9 +57,9 @@ PPO.load()直後に選択TOMLとZIPの設定を照合します。checkpointの�
 追加ファイルやハッシュ照合をゲートには使いません。注視3値の順序・encoding・
 報酬定義を変更する場合はschema versionを更新してください。旧schema v1は新項Offとして読み取り互換を保ちます。
 
-生成物の場所と名前はTOMLのname、default_model_name、evaluation.output_prefixに従います。
-学習runにはmodel ZIPとtraining_metadata.json、評価runにはevaluation.jsonとstep traceを保存します。
-同じTOMLを使ったrunを単位にmodelとJSONを保管し、設定を変える場合は別run名を使います。
+学習metadataは `outputs/<name>/training/`、評価JSONとstep traceは `outputs/<name>/evaluation/` に保存します。
+model ZIPは `models/<name>.zip` に保存し、`evaluation.output_prefix` は評価ログ名に使います。
+同じ実験名の再実行は同じ成果物ディレクトリを更新します。設定の異なる結果を残す場合は、別の実験名を使います。
 baselineモデルを評価するときは、[lookahead]を省略したTOMLを指定します。
 
 ## 実装を追う4つの薄いhook

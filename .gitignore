@@ -17,10 +17,7 @@ dist/
 models/*
 !models/.gitkeep
 logs/*
-!logs/monitor/
 !logs/tensorboard/
-logs/monitor/*
-!logs/monitor/.gitkeep
 logs/tensorboard/*
 !logs/tensorboard/.gitkeep
 

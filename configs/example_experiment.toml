@@ -3,7 +3,6 @@
 schema_version = 2
 name = "example_generalization"
 algorithm = "ppo"
-default_model_name = "example_generalization"
 
 [training]
 policy = "MlpPolicy"

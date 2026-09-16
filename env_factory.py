@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import gymnasium as gym
@@ -63,22 +62,20 @@ def make_env(
 def make_training_env(
     rank: int,
     seed: int,
-    monitor_dir: Path | str,
     env_config: Mapping[str, object],
     lookahead_config: Mapping[str, object] | None = None,
 ) -> gym.Env:
-    """rank固有のMonitorログを持つ学習用環境を生成する。
+    """CSVを出力せず、エピソード統計を集計する学習用環境を生成する。
 
     Args:
         rank: SubprocVecEnv内のworker番号。
         seed: Action/Observation spaceの乱数seedの基準値。
-        monitor_dir: ``*.monitor.csv`` の保存先。
         env_config: MetaDriveへ渡す解決済みTOMLの環境設定。
         lookahead_config: Optional resolved ``[lookahead]`` settings.  When
             present, the lookahead wrapper is inserted before ``Monitor``.
 
     Returns:
-        記録専用のSB3 ``Monitor`` で包んだMetaDrive環境。
+        TensorBoard用のエピソード統計を集計するSB3 ``Monitor`` で包んだ環境。
 
     Notes:
         MetaDrive 0.4.3の ``reset(seed=...)`` はscenario indexを意味する。
@@ -88,16 +85,13 @@ def make_training_env(
     if rank < 0:
         raise ValueError(f"rank must be non-negative: {rank}")
 
-    destination = Path(monitor_dir)
-    destination.mkdir(parents=True, exist_ok=True)
-
     env = make_env(env_config, lookahead_config=lookahead_config)
     try:
         worker_seed = seed + rank
         env.action_space.seed(worker_seed)
         env.observation_space.seed(worker_seed)
-        monitor_file = destination / f"env_{rank}.monitor.csv"
-        return Monitor(env, filename=str(monitor_file))
+        # Keep episode statistics for SB3/TensorBoard without writing CSV files.
+        return Monitor(env)
     except Exception:
         # construction途中で失敗した環境はSubprocVecEnv側へ返らず、callerが
         # closeできないため、この場で確実に解放してから元の例外を伝える。

@@ -128,7 +128,7 @@ def test_profile_selector_returns_typed_config_bundles() -> None:
     official = get_experiment_profile("official")
     assert official.train_env_config == official.evaluation_env_config == OFFICIAL_ENV_CONFIG
     assert official.training_config == OFFICIAL_TRAINING_CONFIG
-    assert official.default_model_name == "official_baseline"
+    assert official.evaluation_defaults["model_path"] == "models/official.zip"
     assert {
         key: official.train_env_config[key]
         for key in ("start_seed", "num_scenarios")
@@ -138,7 +138,7 @@ def test_profile_selector_returns_typed_config_bundles() -> None:
     assert generalization.train_env_config == GENERALIZATION_TRAIN_ENV_CONFIG
     assert generalization.evaluation_env_config == GENERALIZATION_EVALUATION_ENV_CONFIG
     assert generalization.training_config == GENERALIZATION_TRAINING_CONFIG
-    assert generalization.default_model_name == "generalization"
+    assert generalization.evaluation_defaults["model_path"] == "models/generalization.zip"
     assert generalization.evaluation_env_config["num_scenarios"] == 200
 
 
@@ -155,17 +155,17 @@ def test_generalization_profile_is_connected_to_both_clis() -> None:
     official_training_args = parse_training_args([])
     assert official_training_args.profile == "official"
     assert official_training_args.timesteps == 300_000
-    assert official_training_args.model_name == "official_baseline"
+    assert not hasattr(official_training_args, "model_name")
 
     official_evaluation_args = parse_evaluation_args([])
-    assert official_evaluation_args.model.name == "official_baseline.zip"
-    assert official_evaluation_args.output_prefix == "official_baseline"
+    assert official_evaluation_args.model.name == "official.zip"
+    assert official_evaluation_args.output_prefix == "official"
 
     training_args = parse_training_args(["--profile", "generalization"])
     assert training_args.timesteps == 1_000_000
     assert training_args.num_envs == 4
     assert training_args.n_steps == 4096
-    assert training_args.model_name == "generalization"
+    assert training_args.experiment.name == "generalization"
 
     evaluation_args = parse_evaluation_args(["--profile", "generalization"])
     assert evaluation_args.model.name == "generalization.zip"
@@ -173,21 +173,21 @@ def test_generalization_profile_is_connected_to_both_clis() -> None:
 
 
 def test_artifact_directories_are_separated_by_profile_and_stage() -> None:
-    """同じrun名でもprofileと学習・評価の組み合わせで衝突しない。"""
+    """成果物はprofileと学習・評価の組み合わせごとに分かれる。"""
 
     paths = {
-        _training_output_directory("official", "shared"),
-        _training_output_directory("generalization", "shared"),
-        _evaluation_output_directory("official", "shared"),
-        _evaluation_output_directory("generalization", "shared"),
+        _training_output_directory("official"),
+        _training_output_directory("generalization"),
+        _evaluation_output_directory("official"),
+        _evaluation_output_directory("generalization"),
     }
 
     assert len(paths) == 4
-    assert _training_output_directory("official", "shared") == (
-        OUTPUT_DIR / "official" / "training" / "shared"
+    assert _training_output_directory("official") == (
+        OUTPUT_DIR / "official" / "training"
     )
-    assert _evaluation_output_directory("generalization", "shared") == (
-        OUTPUT_DIR / "generalization" / "evaluation" / "shared"
+    assert _evaluation_output_directory("generalization") == (
+        OUTPUT_DIR / "generalization" / "evaluation"
     )
 
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.logger import Logger, configure as configure_logger
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
@@ -32,13 +33,11 @@ from configs.experiment_config import (
     PPO_COMMON_SCALAR_KEYS,
     PROFILE_NAMES,
     experiment_selection_from_args,
-    normalize_model_name,
     select_experiment,
 )
 from project_paths import (
     LOG_DIR,
     MODEL_DIR,
-    MONITOR_LOG_DIR,
     OUTPUT_DIR,
     TENSORBOARD_LOG_DIR,
 )
@@ -77,28 +76,19 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _model_stem(value: str) -> str:
-    """Validate a model basename and normalize an optional .zip suffix."""
+def _default_training_log(experiment_name: str) -> Path:
+    """Choose the console log from the experiment name."""
 
-    try:
-        return normalize_model_name(value, "--model-name")
-    except ExperimentConfigError as error:
-        raise argparse.ArgumentTypeError(str(error)) from None
-
-
-def _default_training_log(model_name: str) -> Path:
-    """Keep the requested canonical log names while supporting custom runs."""
-
-    if model_name == "official_baseline":
+    if experiment_name == "official":
         return LOG_DIR / "full_train.log"
-    return LOG_DIR / f"{model_name}_train.log"
+    return LOG_DIR / f"{experiment_name}_train.log"
 
 
-def _resolve_log_path(path: Path | None, model_name: str) -> Path:
+def _resolve_log_path(path: Path | None, experiment_name: str) -> Path:
     """Resolve an optional log path relative to this project."""
 
     if path is None:
-        return _default_training_log(model_name)
+        return _default_training_log(experiment_name)
     if path.is_absolute():
         return path
     return LOG_DIR.parent / path
@@ -130,10 +120,23 @@ def _resolved_ppo_config(
     return ppo_config
 
 
-def _training_output_directory(profile_name: str, model_name: str) -> Path:
-    """Return the profile- and run-specific directory for training metadata."""
+def _training_output_directory(profile_name: str) -> Path:
+    """Return the experiment's training metadata directory."""
 
-    return OUTPUT_DIR / profile_name / "training" / model_name
+    return OUTPUT_DIR / profile_name / "training"
+
+
+def _configure_training_logger(tensorboard_log_dir: Path) -> Logger:
+    """Replace this experiment's TensorBoard events while keeping other files."""
+
+    if tensorboard_log_dir.is_symlink():
+        raise ValueError(
+            f"TensorBoardの保存先にシンボリックリンクは使えません: {tensorboard_log_dir}"
+        )
+    tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
+    for event_path in tensorboard_log_dir.glob("events.out.tfevents.*"):
+        event_path.unlink()
+    return configure_logger(str(tensorboard_log_dir), ["stdout", "tensorboard"])
 
 
 def _distribution_version(*names: str) -> str | None:
@@ -251,12 +254,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="SB3 PPOに明示するdevice（例: cpu, cuda, auto）",
     )
     parser.add_argument(
-        "--model-name",
-        type=_model_stem,
-        default=str(training_config.get("model_name", profile.default_model_name)),
-        help="models/とoutputs/<profile>/training/で使うrun名",
-    )
-    parser.add_argument(
         "--log-interval",
         type=_positive_int,
         default=int(training_config["log_interval"]),
@@ -297,14 +294,11 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     ppo_config = _resolved_ppo_config(args, training_config)
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
-    training_output_dir = _training_output_directory(
-        experiment.name,
-        args.model_name,
-    )
+    training_output_dir = _training_output_directory(experiment.name)
+    tensorboard_log_dir = TENSORBOARD_LOG_DIR / experiment.name
 
     for directory in (
         MODEL_DIR,
-        MONITOR_LOG_DIR,
         TENSORBOARD_LOG_DIR,
         training_output_dir,
         LOG_DIR,
@@ -318,7 +312,6 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             make_training_env,
             rank=rank,
             seed=args.seed,
-            monitor_dir=MONITOR_LOG_DIR,
             env_config=environment_config,
             lookahead_config=lookahead_config,
         )
@@ -326,6 +319,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     ]
 
     train_env: SubprocVecEnv | None = None
+    training_logger: Logger | None = None
     started_at = datetime.now(timezone.utc)
     start_time = time.perf_counter()
     try:
@@ -337,7 +331,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
             **ppo_config,
             verbose=1,
             device=args.device,
-            tensorboard_log=str(TENSORBOARD_LOG_DIR),
+            tensorboard_log=str(tensorboard_log_dir),
         )
         # Stable-Baselines3 serializes custom instance attributes in the PPO
         # ZIP.  Store the resolved TOML values before saving so evaluation can
@@ -361,11 +355,13 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "ppo_config": ppo_config,
             },
         )
+        # A custom logger uses the experiment directory without SB3's run suffix.
+        training_logger = _configure_training_logger(tensorboard_log_dir)
+        model.set_logger(training_logger)
         model.learn(total_timesteps=args.timesteps, log_interval=args.log_interval)
 
-        model_base_path = MODEL_DIR / args.model_name
-        model.save(str(model_base_path))
-        model_path = Path(f"{model_base_path}.zip")
+        model_path = MODEL_DIR / f"{experiment.name}.zip"
+        model.save(str(model_path))
         if not model_path.is_file():
             raise FileNotFoundError(f"保存したモデルが見つかりません: {model_path}")
         model_size = model_path.stat().st_size
@@ -428,7 +424,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                     **ppo_config,
                     "device": args.device,
                     "verbose": 1,
-                    "tensorboard_log": str(TENSORBOARD_LOG_DIR),
+                    "tensorboard_log": str(tensorboard_log_dir),
                 },
                 "ppo_nonconfigured_parameters": "stable-baselines3 defaults",
             },
@@ -438,8 +434,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "model_path": str(model_path.resolve()),
                 "model_size_bytes": model_size,
                 "model_sha256": model_sha256,
-                "monitor_log_directory": str(MONITOR_LOG_DIR.resolve()),
-                "tensorboard_log_directory": str(TENSORBOARD_LOG_DIR.resolve()),
+                "tensorboard_log_directory": str(tensorboard_log_dir.resolve()),
                 "console_log_path": str(log_path.resolve()),
             },
             "reload_verification": {
@@ -456,16 +451,20 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         print(f"model_reload_verified=True metadata={metadata_path}")
         return model_path
     finally:
-        if train_env is not None:
-            train_env.close()
-            print("train_env_closed=True")
+        try:
+            if training_logger is not None:
+                training_logger.close()
+        finally:
+            if train_env is not None:
+                train_env.close()
+                print("train_env_closed=True")
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point with persistent stdout/stderr capture."""
 
     args = parse_args(argv)
-    log_path = _resolve_log_path(args.log_file, args.model_name)
+    log_path = _resolve_log_path(args.log_file, args.experiment.name)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
         tee_stdout = _Tee(sys.stdout, log_file)

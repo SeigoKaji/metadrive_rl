@@ -93,7 +93,7 @@ class _Tee:
 
 
 def _output_prefix(value: str) -> str:
-    """Accept a basename only so generated artifacts remain under outputs/."""
+    """Accept a basename only for the default evaluation log filename."""
 
     if (
         not value
@@ -115,10 +115,8 @@ def _resolve_project_path(path: Path) -> Path:
 
 
 def _default_evaluation_log(output_prefix: str) -> Path:
-    """Use the canonical official log name and a predictable custom fallback."""
+    """Choose the console log from its configured prefix."""
 
-    if output_prefix == "official_baseline":
-        return LOG_DIR / "evaluate_official.log"
     return LOG_DIR / f"evaluate_{output_prefix}.log"
 
 
@@ -264,10 +262,10 @@ def _aggregate_target_lane_metrics(
     }
 
 
-def _evaluation_output_directory(profile_name: str, output_prefix: str) -> Path:
-    """Return the run directory shared by evaluation JSON and artifacts."""
+def _evaluation_output_directory(profile_name: str) -> Path:
+    """Return the experiment's evaluation artifact directory."""
 
-    return OUTPUT_DIR / profile_name / "evaluation" / output_prefix
+    return OUTPUT_DIR / profile_name / "evaluation"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -316,7 +314,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             str(
                 evaluation_defaults.get(
                     "model_path",
-                    MODEL_DIR / f"{profile.default_model_name}.zip",
+                    MODEL_DIR / f"{experiment.name}.zip",
                 )
             )
         ),
@@ -334,8 +332,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-prefix",
         type=_output_prefix,
-        default=str(evaluation_defaults.get("output_prefix", profile.default_model_name)),
-        help="outputs/とlogs/で使うベース名",
+        default=str(evaluation_defaults.get("output_prefix", experiment.name)),
+        help="評価ログ名のベース名",
     )
     parser.add_argument(
         "--seed",
@@ -400,7 +398,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     model = PPO.load(str(model_path), device=args.device)
     validate_lookahead_model_metadata(model, lookahead_config)
     actual_device = str(model.device)
-    run_dir = _evaluation_output_directory(experiment.name, args.output_prefix)
+    run_dir = _evaluation_output_directory(experiment.name)
     _prepare_evaluation_output_directory(run_dir)
     result_path = run_dir / "evaluation.json"
     step_trace_path = run_dir / "evaluation_steps.jsonl"

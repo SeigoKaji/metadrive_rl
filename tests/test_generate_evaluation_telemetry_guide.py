@@ -30,9 +30,8 @@ def test_canonical_generator_inputs_follow_official_toml() -> None:
     """ガイドの既定入力先はPython定数でなくofficial TOMLから導出する。"""
 
     experiment = select_experiment(profile_name="official")
-    output_prefix = str(experiment.profile.evaluation_defaults["output_prefix"])
     scenario_seed = int(experiment.profile.evaluation_env_config["start_seed"])
-    expected_run_dir = OUTPUT_DIR / experiment.name / "evaluation" / output_prefix
+    expected_run_dir = OUTPUT_DIR / experiment.name / "evaluation"
 
     assert OFFICIAL_EVALUATION_OUTPUT_DIR == expected_run_dir
     assert CANONICAL_EVALUATION_PATH == expected_run_dir / "evaluation.json"

@@ -184,7 +184,6 @@ def test_return_config_uses_project_local_objective_without_broken_line_done() -
     """The dedicated TOML selects return mode and preserves upstream rewards."""
 
     assert _RETURN_SELECTION.name == "official_start_lane_return"
-    assert _RETURN_SELECTION.profile.default_model_name == "official_start_lane_return"
     for config in (
         _RETURN_SELECTION.profile.train_env_config,
         _RETURN_SELECTION.profile.evaluation_env_config,
@@ -216,19 +215,13 @@ def test_numbered_start_lane_ablation_configs_keep_unnumbered_artifact_names(
     selection = load_experiment_config(PROJECT_ROOT / "configs" / config_filename)
     assert selection.source_path.name == config_filename
     assert selection.name == profile_name
-    assert selection.profile.default_model_name == profile_name
-    assert selection.profile.training_config["model_name"] == profile_name
     assert selection.profile.evaluation_defaults["model_path"] == (
         f"models/{profile_name}.zip"
     )
     assert selection.profile.evaluation_defaults["output_prefix"] == profile_name
     assert selection.profile.evaluation_defaults["record_gif"] is True
 
-    expected_training = {
-        **_RETURN_SELECTION.profile.training_config,
-        "model_name": profile_name,
-    }
-    assert selection.profile.training_config == expected_training
+    assert selection.profile.training_config == _RETURN_SELECTION.profile.training_config
     expected_evaluation = {
         **_RETURN_SELECTION.profile.evaluation_defaults,
         "model_path": f"models/{profile_name}.zip",

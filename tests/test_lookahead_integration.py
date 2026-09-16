@@ -74,7 +74,6 @@ def test_make_env_wraps_both_raw_host_variants_only_when_config_is_present(
 
 def test_stage_factories_forward_the_same_lookahead_config_and_keep_monitor_outer(
     monkeypatch: Any,
-    tmp_path: Any,
 ) -> None:
     """train/evaluate share one factory setting; training adds Monitor outside it."""
 
@@ -110,9 +109,8 @@ def test_stage_factories_forward_the_same_lookahead_config_and_keep_monitor_oute
     monitored: list[object] = []
 
     class FakeMonitor:
-        def __init__(self, env: object, *, filename: str) -> None:
+        def __init__(self, env: object) -> None:
             self.env = env
-            self.filename = filename
             monitored.append(self)
 
     monkeypatch.setattr(env_factory, "make_env", fake_make_env)
@@ -122,7 +120,6 @@ def test_stage_factories_forward_the_same_lookahead_config_and_keep_monitor_oute
     training_env = env_factory.make_training_env(
         rank=0,
         seed=11,
-        monitor_dir=tmp_path / "monitor",
         env_config={"map": "C"},
         lookahead_config=lookahead,
     )

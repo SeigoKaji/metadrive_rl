@@ -6,7 +6,6 @@
 schema_version = 2
 name = "official_start_lane_return_duckietown_progress"
 algorithm = "ppo"
-default_model_name = "official_start_lane_return_duckietown_progress"
 
 [training]
 policy = "MlpPolicy"
@@ -29,7 +28,6 @@ max_grad_norm = 0.5
 
 [evaluation]
 record_gif = true
-output_prefix = "official_start_lane_return_duckietown_progress"
 seed = 0
 device = "cpu"
 deterministic = true

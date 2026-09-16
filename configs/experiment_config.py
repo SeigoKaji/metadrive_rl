@@ -32,7 +32,6 @@ class ExperimentProfile:
     train_env_config: Mapping[str, object]
     evaluation_env_config: Mapping[str, object]
     training_config: Mapping[str, object]
-    default_model_name: str
     evaluation_defaults: Mapping[str, object] = field(default_factory=dict)
     # ``None`` means the ordinary raw MetaDrive environment.  An explicit
     # ``[lookahead]`` table is retained as a resolved mapping so train/evaluate
@@ -83,7 +82,6 @@ _ROOT_KEYS = frozenset(
         "schema_version",
         "name",
         "algorithm",
-        "default_model_name",
         "training",
         "evaluation",
         "environment",
@@ -127,7 +125,7 @@ PPO_COMMON_SCALAR_DEFAULTS: Final[dict[str, object]] = {
     "max_grad_norm": 0.5,
 }
 _TRAINING_OPTIONAL_KEYS = frozenset(
-    {"device", "model_name", "log_file", *PPO_COMMON_SCALAR_KEYS}
+    {"device", "log_file", *PPO_COMMON_SCALAR_KEYS}
 )
 _EVALUATION_OPTIONAL_KEYS = frozenset(
     {
@@ -256,16 +254,6 @@ def _safe_basename(value: object, location: str) -> str:
     ):
         raise _error(location, "ディレクトリを含まないbasenameを指定してください")
     return name
-
-
-def normalize_model_name(value: object, location: str) -> str:
-    """model basenameを検査し、任意の ``.zip`` suffixを除く。"""
-
-    name = _safe_basename(value, location)
-    stem = name[:-4] if name.endswith(".zip") else name
-    if stem in {"", ".", ".."}:
-        raise _error(location, "有効なmodel名を指定してください")
-    return stem
 
 
 def _path_string(value: object, location: str) -> str:
@@ -525,10 +513,6 @@ def _validate_training(value: object) -> dict[str, object]:
     _validate_ppo_batching(training)
     if "device" in table:
         training["device"] = _require_string(table["device"], "training.device")
-    if "model_name" in table:
-        training["model_name"] = normalize_model_name(
-            table["model_name"], "training.model_name"
-        )
     if "log_file" in table:
         training["log_file"] = _path_string(table["log_file"], "training.log_file")
     return training
@@ -537,7 +521,7 @@ def _validate_training(value: object) -> dict[str, object]:
 def _validate_evaluation(
     value: object,
     *,
-    default_training_model_name: str,
+    experiment_name: str,
     training_seed: int,
 ) -> dict[str, object]:
     table = _table(value, "evaluation")
@@ -549,14 +533,14 @@ def _validate_evaluation(
 
     evaluation: dict[str, object] = {
         "model_path": _path_string(
-            table.get("model_path", f"models/{default_training_model_name}.zip"),
+            table.get("model_path", f"models/{experiment_name}.zip"),
             "evaluation.model_path",
         ),
         "record_gif": _require_bool(
             table.get("record_gif", True), "evaluation.record_gif"
         ),
         "output_prefix": _safe_basename(
-            table.get("output_prefix", default_training_model_name),
+            table.get("output_prefix", experiment_name),
             "evaluation.output_prefix",
         ),
         "seed": _require_rl_seed(
@@ -586,17 +570,12 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
     if algorithm != "ppo":
         raise _error("algorithm", "現在対応しているalgorithmはppoだけです")
 
-    default_model_name = normalize_model_name(
-        root.get("default_model_name", name), "default_model_name"
-    )
     lookahead_config = _validate_lookahead(root.get("lookahead"))
     training = _validate_training(_required_table(root, "training", "training"))
-    if "model_name" not in training:
-        training["model_name"] = default_model_name
 
     evaluation = _validate_evaluation(
         _required_table(root, "evaluation", "evaluation"),
-        default_training_model_name=str(training["model_name"]),
+        experiment_name=name,
         training_seed=int(training["seed"]),
     )
 
@@ -630,7 +609,6 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
         train_env_config=train_env_config,
         evaluation_env_config=evaluation_env_config,
         training_config=training,
-        default_model_name=default_model_name,
         evaluation_defaults=evaluation,
         lookahead_config=lookahead_config,
     )

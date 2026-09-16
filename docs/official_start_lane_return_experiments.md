@@ -19,7 +19,7 @@ baseline の停止解を崩すため、まず一要因ずつ三つの ablation �
 | 評価 | scenario seed `5`、評価 seed `0`、決定論的 action。各設定を1 episode 評価 |
 | 開始レーン設定の基準値 | `start_lane_objective = "return"`、中心係数 `0.25`、wrong-lane 係数 `0.10`、許容幅比 `0.05`、開始レーン終端 penalty `200`、道路外 penalty `200`。各実験では、後述する単一差分だけを変更 |
 
-実験番号は**実行順**です。番号は今後の設定ファイルを選びやすくするためのものであり、TOML 内の `name`、`default_model_name`、`evaluation.output_prefix` と、`default_model_name` から解決される学習モデル名は、既存のモデル・成果物との互換性のため番号なしのままです。
+実験番号は**実行順**です。番号は今後の設定ファイルを選びやすくするためのものであり、TOML 内の `name` と、この名前から決まる学習モデル名は番号なしのままです。
 
 ## 採用基準
 
@@ -119,19 +119,21 @@ r_t = driving_reward × d_t
 
 各profileの内部名は番号なしで固定しているため、モデルと成果物ディレクトリも番号なしです。各評価フォルダには `evaluation.json` と `evaluation_steps.jsonl`、記録を有効にした実行では可視化成果物が置かれます。
 
+以下の表は実験別の標準の保存先です。この作業環境の既存成果物は新形式へ移行済みです。開始レーン実験の通常版と penalty200 版はそれぞれ `outputs/official_start_lane_return/` と `outputs/official_start_lane_return_penalty200/` に分けて保持しています。後者は `configs/official_start_lane_return_penalty200.toml` で選択できます。移行では参照パスを更新し、実行当時の `command`、`config_source`、学習設定、評価値は保持しています。
+
 | 実験 | モデル | 学習metadata | 評価フォルダ |
 | --- | --- | --- | --- |
-| baseline | `models/official_start_lane_return.zip` | `outputs/official_start_lane_return/training/official_start_lane_return/training_metadata.json` | `outputs/official_start_lane_return/evaluation/official_start_lane_return/` |
-| 01 | `models/official_start_lane_return_idle_penalty.zip` | `outputs/official_start_lane_return_idle_penalty/training/official_start_lane_return_idle_penalty/training_metadata.json` | `outputs/official_start_lane_return_idle_penalty/evaluation/official_start_lane_return_idle_penalty/` |
-| 02 | `models/official_start_lane_return_progress_balance.zip` | `outputs/official_start_lane_return_progress_balance/training/official_start_lane_return_progress_balance/training_metadata.json` | `outputs/official_start_lane_return_progress_balance/evaluation/official_start_lane_return_progress_balance/` |
-| 03 | `models/official_start_lane_return_timeout_penalty.zip` | `outputs/official_start_lane_return_timeout_penalty/training/official_start_lane_return_timeout_penalty/training_metadata.json` | `outputs/official_start_lane_return_timeout_penalty/evaluation/official_start_lane_return_timeout_penalty/` |
-| 04 | `models/official_start_lane_return_duckietown_progress.zip` | `outputs/official_start_lane_return_duckietown_progress/training/official_start_lane_return_duckietown_progress/training_metadata.json` | `outputs/official_start_lane_return_duckietown_progress/evaluation/official_start_lane_return_duckietown_progress/` |
+| baseline | `models/official_start_lane_return.zip` | `outputs/official_start_lane_return/training/training_metadata.json` | `outputs/official_start_lane_return/evaluation/` |
+| 01 | `models/official_start_lane_return_idle_penalty.zip` | `outputs/official_start_lane_return_idle_penalty/training/training_metadata.json` | `outputs/official_start_lane_return_idle_penalty/evaluation/` |
+| 02 | `models/official_start_lane_return_progress_balance.zip` | `outputs/official_start_lane_return_progress_balance/training/training_metadata.json` | `outputs/official_start_lane_return_progress_balance/evaluation/` |
+| 03 | `models/official_start_lane_return_timeout_penalty.zip` | `outputs/official_start_lane_return_timeout_penalty/training/training_metadata.json` | `outputs/official_start_lane_return_timeout_penalty/evaluation/` |
+| 04 | `models/official_start_lane_return_duckietown_progress.zip` | `outputs/official_start_lane_return_duckietown_progress/training/training_metadata.json` | `outputs/official_start_lane_return_duckietown_progress/evaluation/` |
 
-既存成果物は番号付け前に生成したため、metadata の `config_source.path` には実行当時の番号なしのsource pathが残っています。TOML本文と内部profile / artifact名は変更しておらず、各metadataの `config_source.sha256` は現在の番号付き設定ファイルのSHA-256と一致します。
+既存成果物は番号付け前に生成したため、metadata の `config_source.path` には実行当時の番号なしのsource pathが残っています。番号付け時にはTOML本文を変更していませんでしたが、その後の命名設定の整理で `default_model_name` と重複する評価ログ名を削除したため、各metadataの `config_source.sha256` は現在の設定ファイルのSHA-256とは一致しません。環境・学習条件と内部profile名は維持しています。
 
 ## 再現方法
 
-以下はこのREADMEがあるプロジェクトrootから実行します。同じ内部profile名のモデル・出力先を使うため、既存成果物を保持する場合は事前に退避してください。
+以下はこのREADMEがあるプロジェクトrootから実行します。モデルは従来と同じ保存先を使い、学習・評価の成果物は上記の新形式へ保存します。同じ実験の再実行ではモデルと新形式の成果物が更新されるため、それらを保持する場合は事前に退避してください。
 
 ```bash
 # baseline

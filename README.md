@@ -39,7 +39,7 @@ python3 -m venv .venv
 .venv/bin/python train.py --config configs/official.toml
 ```
 
-学習が完了すると、モデルは `models/official_baseline.zip`、実行メタデータは `outputs/official/training/official_baseline/training_metadata.json` に保存されます。Monitor ログと TensorBoard ログはそれぞれ `logs/monitor/`、`logs/tensorboard/` に保存されます。
+学習が完了すると、モデルは `models/official.zip`、実行メタデータは `outputs/official/training/training_metadata.json` に保存されます。TensorBoard ログは TOML の `name` を使った `logs/tensorboard/<name>/`（この例では `logs/tensorboard/official/`）に保存され、連番は付きません。同じ `name` で再学習すると、その実験フォルダ内の前回のイベントファイルを学習開始時に削除し、最新の学習曲線に置き換えます。実際の保存先はメタデータの `artifacts.tensorboard_log_directory` に記録します。Monitor はエピソード統計の集計に使用し、CSV ファイルは出力しません。
 
 ## 評価方法
 
@@ -49,7 +49,7 @@ python3 -m venv .venv
 .venv/bin/python evaluate.py --config configs/official.toml
 ```
 
-この設定では `models/official_baseline.zip` を読み込み、`outputs/official/evaluation/official_baseline/` に `evaluation.json`、`evaluation_steps.jsonl`、可視化成果物を保存します。可視化を出力しない場合は次を実行します。
+この設定では `models/official.zip` を読み込み、`outputs/official/evaluation/` に `evaluation.json`、`evaluation_steps.jsonl`、可視化成果物を保存します。可視化を出力しない場合は次を実行します。
 
 ```bash
 .venv/bin/python evaluate.py --config configs/official.toml --no-record-gif
@@ -57,14 +57,19 @@ python3 -m venv .venv
 
 別のモデルを指定する場合は、`--model models/<model-name>.zip` を追加します。
 
+学習・評価の成果物は、TOML の `name` を使った `outputs/<name>/training/` と `outputs/<name>/evaluation/` に保存します。同じ `name` で再実行すると同じ保存先を更新します。評価対象のモデルや `evaluation.output_prefix` を変えても、成果物ディレクトリは変わりません。この作業環境の既存成果物もこの構成へ移行済みです。同居していた `official_start_lane_return_penalty200` は別の実験フォルダに分けて保持しています。
+
 ## configファイル
 
-設定は TOML で記述します。
+設定は TOML で記述します。実験名と学習モデル名は `name` 一つで管理し、モデルは `models/<name>.zip` に保存します。
+
+`default_model_name`、`training.model_name`、学習 CLI の `--model-name` は廃止しました。旧設定を使う場合はこれらの項目を削除し、`name` に実験名を指定してください。この作業環境の既存公式モデルも `models/official.zip` に移行済みです。別の保存済みモデルを評価する場合は `--model` でパスを指定できます。
 
 - `configs/official.toml`: MetaDrive公式の Stable-Baselines3 サンプル相当の例です。
 - `configs/generalization.toml`: 手続き生成道路で学習し、別の scenario 範囲で評価する設定です。
 - `configs/example_experiment.toml`: 新しい実験を作るためのテンプレートです。
 - `configs/official_start_lane_return.toml`: reset 時の開始レーンを維持して到着することを目指す baseline です。
+- `configs/official_start_lane_return_penalty200.toml`: 保存済みの penalty200 実験を同名で学習・評価する設定です。
 - `configs/official_start_lane_return_lookahead.toml`: `lookahead_m = 6.0`、
   `pp_weight = 0.0` の前方注視入力例です。
 - `configs/01_official_start_lane_return_idle_penalty.toml`: 低速 penalty の一要因実験です。
@@ -87,9 +92,8 @@ cp configs/example_experiment.toml configs/my_experiment.toml
 | 項目 | 必須 | 意味 |
 | --- | --- | --- |
 | `schema_version` | はい | 設定形式の識別子です。テンプレートの値を変更しません。 |
-| `name` | はい | 実験設定の名前です。成果物の `outputs/<name>/` に使われます。 |
+| `name` | はい | 実験名とモデル名です。`models/<name>.zip`、成果物の `outputs/<name>/`、TensorBoard の `logs/tensorboard/<name>/` に使われます。 |
 | `algorithm` | はい | 学習アルゴリズムです。`ppo` を指定します。 |
-| `default_model_name` | いいえ | 学習モデルの標準 basename です。`training.model_name` を省略した場合に使われます。 |
 | `[training]` | はい | PPO の学習設定です。 |
 | `[evaluation]` | はい | 保存済みモデルの評価設定です。table 自体は必須で、内部 key はすべて任意です。 |
 | `[environment]` | はい | MetaDrive 環境設定です。 |
@@ -105,7 +109,6 @@ cp configs/example_experiment.toml configs/my_experiment.toml
 | `total_timesteps` | はい | `model.learn()` に要求する最小環境 step 数です。 |
 | `log_interval` | はい | `model.learn()` のログ出力間隔です。 |
 | `device` | いいえ | PPO に渡す計算デバイスです。例: `cpu`、`cuda`、`auto`。 |
-| `model_name` | いいえ | `models/<model_name>.zip` と学習成果物ディレクトリに使う basename です。 |
 | `log_file` | いいえ | 標準出力と標準エラーの複製先です。相対パスはプロジェクト直下から解決されます。 |
 | `learning_rate` | いいえ | PPO optimizer の学習率です。 |
 | `batch_size` | いいえ | PPO 更新時の mini-batch サイズです。 |
@@ -124,9 +127,9 @@ cp configs/example_experiment.toml configs/my_experiment.toml
 
 | 項目 | 必須 | 意味 |
 | --- | --- | --- |
-| `model_path` | いいえ | 読み込む `.zip` モデルのパスです。省略時は学習モデル名から `models/` 配下を選びます。 |
+| `model_path` | いいえ | 読み込む `.zip` モデルのパスです。省略時は `models/<name>.zip` を読み込みます。 |
 | `record_gif` | いいえ | 各評価 episode の GIF、MP4、PNG を記録するかどうかです。 |
-| `output_prefix` | いいえ | `outputs/<name>/evaluation/` とログに使う basename です。 |
+| `output_prefix` | いいえ | 評価ログ名のベース名です。省略時は `name` を使います。評価成果物は `outputs/<name>/evaluation/` に保存します。 |
 | `seed` | いいえ | 評価時の乱数 seed です。省略時は `training.seed` を使います。 |
 | `device` | いいえ | `PPO.load()` に渡す計算デバイスです。省略時は `cpu` です。 |
 | `log_file` | いいえ | 標準出力と標準エラーの複製先です。相対パスはプロジェクト直下から解決されます。 |

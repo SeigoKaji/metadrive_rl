@@ -15,7 +15,7 @@
 
 既存仮想環境`../metadrive_rl-main/.venv`を使用。Python 3.12.3、MetaDrive 0.4.3、SB3 2.9.0、torch 2.13.0、Gymnasium 1.3.0、numpy 2.5.2、Pillow 12.3.0。実際のimport絶対pathは各manifestの`adapter.runtime.libraries`に保存。
 
-- モデル: `models/official_baseline.zip`（既存モデルへのローカルsymlink）。SHA-256: `254b19aea772480133e19eb5db68b0fb5e1bdadfa221890a68494c8eb5d513e6`。実行後も一致。
+- モデル: `models/official.zip`（検証時は `models/official_baseline.zip` という既存モデルへのローカルsymlink。命名統一時に移行）。SHA-256: `254b19aea772480133e19eb5db68b0fb5e1bdadfa221890a68494c8eb5d513e6`。実行後も一致。
 - MetaDrive source: `85e5dadc6c7436d324348f6e3d8f8e680c06b4db`、実行後もclean。259 schemaの根拠となる実source file hashも照合。
 - D=259、K=9、1次元float32 Box、Discrete、PPO MlpPolicy。canonical `configs/official.toml`、map=C、scenario/policy seed=5、horizon=500、deterministic=True。
 - raw観測からモデル入力まではidentity。SB3の非画像Box／FlattenExtractor経路で、`policy.mlp_extractor.policy_net`の一時forward pre-hookがMLP入口を捕捉。対象値と非対象値を実際の入口で検証し、hookは必ず解除する。

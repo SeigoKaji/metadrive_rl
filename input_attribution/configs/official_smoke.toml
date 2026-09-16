@@ -1,6 +1,6 @@
 # Two-pattern official MetaDrive smoke configuration.
 backend = "metadrive"
-model_path = "models/official_baseline.zip"
+model_path = "models/official.zip"
 environment_config = "configs/official.toml"
 schema = "input_schema_259.toml"
 output_dir = "outputs/official/input_attribution/official_smoke"

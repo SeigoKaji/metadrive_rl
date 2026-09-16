@@ -1,7 +1,7 @@
 # Official MetaDrive 259-wide fixed-stress preset.
 # Run from the repository root after the official model has been trained.
 backend = "metadrive"
-model_path = "models/official_baseline.zip"
+model_path = "models/official.zip"
 environment_config = "configs/official.toml"
 schema = "input_schema_259.toml"
 output_dir = "outputs/official/input_attribution/official_fixed_stress"
