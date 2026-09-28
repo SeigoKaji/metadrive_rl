@@ -1,28 +1,27 @@
 # 通常入口への移植と既存接続の差分更新
 
 最初に渡す文書は [copilot_porting_prompt.md](copilot_porting_prompt.md) です。
-移植用ファイルは **incoming/lookahead_learning/** に一時配置します。
+移植用ファイルは **lookahead_learning_update/** に一時配置します。
 実際の稼働フォルダとの比較・バックアップ前に上書きしません。
 仕様を確認する必要がある場合だけ [time_prediction.md](time_prediction.md) の該当節を読みます。
 
 ## 配布範囲と保護
 
 [../PORTABLE_FILES.txt](../PORTABLE_FILES.txt) は移植元rootからの相対パスです。
-そのファイル群を同じ構造で運ぶだけで、実行コード・必要テスト・3設定例・最小文書がそろいます。
+そのファイル群を同じ構造で運ぶだけで、実行コード・必要テスト・4設定例・最小文書がそろいます。
 rootのtrain.py/evaluate.py/env_factory.py/start_lane_env.pyはコピー対象ではありません。
 モデル・動画・画像・Excel・assets・無関係なレポートも含みません。
 
-移植先rootでコードを直接上書きするコピーコマンドは使いません。
-次は比較用配置の例です（SOURCE_BUNDLEはPORTABLE_FILESだけを含む配布root）。
+移植元で `python -B -m lookahead_learning.pack --output /tmp/lookahead_learning_update.zip` を実行します。
+ZIP内のファイルはすべてlookahead_learning_update/配下にあり、稼働中lookahead_learning/と別名です。
+ZIPを別PCで空の場所へ展開し、そのlookahead_learning_update/を既存lookahead_learning/の隣へ配置します。
+同名の更新フォルダが既にあれば上書きせず、別の配置先を選んでCopilotへパスを伝えます。
 
-```bash
-mkdir -p incoming
-cp -a /path/to/SOURCE_BUNDLE/lookahead_learning incoming/
-git status --short
-git diff -- lookahead_learning
-```
+manifestの各パスは適用後の配置（lookahead_learning/...）を表します。
+比較時は `lookahead_learning_update/相対パス` と `lookahead_learning/相対パス` を対応させます。
+フォルダ全体のコピー置換・リネーム、更新フォルダのruntime importは行いません。
+配置後は `lookahead_learning_update/docs/copilot_porting_prompt.md` の指示で必要差分だけ移植します。
 
-incomingに既存配置がある場合も上書きせず、新しい一時ディレクトリを使います。
 Copilotは変更予定を特定してから、新しい空のバックアップ先へ原本・未コミットdiff・HEAD・元から無かったファイル一覧を保存します。
 適用後のdiffとハッシュも保管します。独自adapterを丸ごと置換しません。
 
@@ -94,7 +93,10 @@ MetaDrive固有の意味・単位を移植先ソースで確認してくださ�
 独自reader/providerの契約は [仕様1・5節](time_prediction.md) にあります。
 契約不明ならその箇所を保留し、推測で速度・位置・曲率を作りません。
 開始車線クラス名が異なるhostに、移植元start_lane_env.pyの必須importを追加しません。
-既存の横加速度報酬を使用中なら、そのLateralReference/radius_reader接続も保持します。
+既存の横加速度報酬を使用中なら、式、On/Off、max_lateral_accel、lateral_accel_weight、LateralReference/radius_reader接続を保持します。
+今回追加するのは予測位置誤差の項です。例の `lateral_accel_reward_enabled=false` を使用中設定へ上書きしません。
+host自身に既存の横加速度項がある場合はr_base内に残し、wrapper側で同じ項を再加算しません。
+同じTで予測Off/Onを比較し、既存横加速度項が同一で、返却rewardの差がr_predictionだけであることを確認します。
 今回の予測報酬は半径・PP・操舵モデルAPIを新たに要求しません。
 
 ## 確認と今回差分だけの撤去

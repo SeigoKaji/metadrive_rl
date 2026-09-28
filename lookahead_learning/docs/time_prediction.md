@@ -103,6 +103,11 @@ prediction_reward_weight = 0.1
 prediction_error_scale_m = 1.0
 ```
 
+上の設定は機能1・2だけを比較する例です。既存横加速度報酬を使う場合はOn/Off・上限・重みを保持し、予測項だけ追加します。
+併用設定例は `examples/time_prediction_lateral.toml`、既存横加速度の式は [lateral_acceleration_reward.md](lateral_acceleration_reward.md) を参照してください。
+共有previewが時間指定に変わると横加速度項の参照区間もL=vTへ変わりますが、その式・設定値・時刻契約は維持します。
+同じ時間指定のもとで予測報酬だけをOnにしても、横加速度項は変わりません。
+
 T指定時は **時間優先でlookahead_mは未使用**。T省略は従来の距離指定です。
 T/scaleは正の有限値、weightは0以上の有限値、enabledは厳密なbool。
 未知キー、数値欄のbool、NaN/Infは拒否します。内部の解決済みmappingではT省略をNoneで表します。

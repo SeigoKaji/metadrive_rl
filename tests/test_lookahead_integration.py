@@ -152,15 +152,19 @@ def test_portable_examples_use_normal_cli_and_identical_experiment_conditions():
     from evaluate import parse_args as evaluate_args
 
     base = load_experiment_config("configs/official_start_lane_return_lookahead.toml").profile
-    for filename in ("distance.toml", "time_only.toml", "time_prediction.toml"):
+    for filename in ("distance.toml", "time_only.toml", "time_prediction.toml", "time_prediction_lateral.toml"):
         path = str(Path("lookahead_learning/examples") / filename)
         training = train_args(["--config", path])
         evaluation = evaluate_args(["--config", path])
         config = training.experiment.profile.lookahead_config
         assert config == evaluation.experiment.profile.lookahead_config
         assert config["lookahead_time_s"] == (None if filename == "distance.toml" else 1)
-        assert config["prediction_reward_enabled"] == (filename == "time_prediction.toml")
+        assert config["prediction_reward_enabled"] == (filename in ("time_prediction.toml", "time_prediction_lateral.toml"))
         assert config["pp_weight"] == 0
-        assert config["lateral_accel_reward_enabled"] is False
+        assert config["lateral_accel_reward_enabled"] == (filename == "time_prediction_lateral.toml")
+        if filename == "time_prediction_lateral.toml":
+            old = load_experiment_config("configs/official_start_lane_return_lookahead_lateral_accel.toml").profile.lookahead_config
+            for key in ("pp_weight", "lateral_accel_reward_enabled", "max_lateral_accel", "lateral_accel_weight"):
+                assert config[key] == old[key]
         for key in ("train_env_config", "evaluation_env_config", "training_config"):
             assert getattr(training.experiment.profile, key) == getattr(base, key)

@@ -10,22 +10,25 @@
 実測横加速度、実際の車両軌跡の曲率、PP が注視点へ結ぶ円弧の曲率とは異なります。
 PP の kappa_pp は使いません。将来その場所へ到達した時の速度や横加速度も予測しません。
 
-共通の経路・投影・注視点は [既存の幾何仕様](methods.md) と
-[固定経路の定義](route_definition.md) を引き継ぎます。
+共通の経路・投影・注視点は [geometry.py](../geometry.py) の既存実装を引き継ぎます。
+時間指定と予測報酬の追加契約は [time_prediction.md](time_prediction.md) を参照してください。
+この横加速度項は引き続き利用でき、予測報酬は独立した項として加算します。
 
 ## 区間と曲率
 
 行動前の状態を $s_t$、開始車線の固定参照経路を $P(S)$、その弧長座標を $S$ [m] とします。
-自車投影点から、既存の lookahead_m だけ先の注視点までを評価します。
+自車投影点から、共有previewの距離 $L_t$ だけ先の注視点までを評価します。
+時間指定を省略した従来設定では $L_t=\mathrm{lookahead\_m}$、時間指定時は $L_t=v_tT$ です。
+既存の式・上限・重み・pre区間/post速度の時刻契約を維持します。
 
 $$
-S_{\mathrm{goal},t}=S_{\mathrm{proj},t}+\mathrm{lookahead\_m},\qquad
+S_{\mathrm{goal},t}=S_{\mathrm{proj},t}+L_t,\qquad
 K_t=\max_{S\in[S_{\mathrm{proj},t},S_{\mathrm{goal},t}]}
 |\kappa_{\mathrm{route}}(S)|.
 $$
 
 注視点自体が直線上でも、その手前の短いカーブを検出するための区間です。
-新たな先読み距離パラメータは追加しません。
+この横加速度項専用の先読み距離は追加せず、距離指定・時間指定とも共通の注視点を使います。
 
 | 車線形状 | 曲率の絶対値 [1/m] | 取得元 |
 |---|---:|---|
@@ -68,7 +71,7 @@ $$
 A_{\mathrm{req},t}&=v_{t+1}^2K_t,\\
 E_t&=\max(0,A_{\mathrm{req},t}/A_{\max}-1),\\
 r_{\mathrm{lat},t}&=-w_{\mathrm{lat}}\Delta t\,E_t^2,\\
-r_{\mathrm{total},t}&=r_{\mathrm{base},t}+r_{\mathrm{pp},t}+r_{\mathrm{lat},t}.
+r_{\mathrm{total},t}&=r_{\mathrm{base},t}+r_{\mathrm{pp},t}+r_{\mathrm{lat},t}+r_{\mathrm{prediction},t}.
 \end{aligned}
 $$
 
@@ -112,7 +115,7 @@ signed=True を指定します。横滑り中の前後方向速度だけでは�
   PP の pp_valid は新項の有効条件に使いません。
 - NaN/Inf、文字列・bool の数値、単位不明、曲率や速度 API の恒常的欠落はエラーです。
   欠損や契約違反を曲率・加速度 0 に置換しません。
-- enabled=false と enabled=true/weight=0 は新しい半径・速度契約を要求せず、
+- enabled=false と enabled=true/weight=0 はこの横加速度項から半径・速度契約を要求せず、
   新項を 0 にします。旧コンストラクタと2キーの wrap_lookahead_env 呼出しも利用できます。
 - 閾値以下・停止・直線では新項は 0 です。低速や停止に正のボーナスは与えません。
 
@@ -159,7 +162,7 @@ max_lateral_accel = 0.8
 lateral_accel_weight = 0.1
 ~~~
 
-| pp_weight | lateral_accel_reward_enabled | 返す報酬（新項の weight>0） |
+| pp_weight | lateral_accel_reward_enabled | 返す報酬（予測Off、横加速度weight>0） |
 |---:|---|---|
 | 0 | false | r_base |
 | 正 | false | r_base + r_pp |
@@ -174,8 +177,8 @@ PP Off の場合は MetaDrivePPProvider や PP 用の車両・policy 契約を�
 
 時間指定・予測報酬の追加契約と旧schema1/2互換は [time_prediction.md](time_prediction.md) を参照してください。
 新モデルの ZIP 属性は lookahead_config と lookahead_schema_version=3 です。
-version 1 の2キー旧モデルは新項 Off として読むため、lookahead_m/pp_weight が同一なら
-評価を続けられます。Off 時の上限・重み差は互換性を妨げません。
+version 1 の2キー旧モデルは時間指定なし・横加速度報酬Off・予測報酬Offとして読むため、
+同じモードでlookahead_m/pp_weightが同一なら評価を続けられます。Off 時の上限・重み差は互換性を妨げません。
 enabled=true/weight=0 も実効 Off として互換です。正の重みで On の場合は
 上限・重み・On/Off を含む実効設定の一致が必要で、旧モデルを On で学習済み扱いにはしません。
 未知 schema、baseline/active の不一致は拒否します。
@@ -189,7 +192,8 @@ TOML root の既存 schema_version とモデルの lookahead_schema_version は�
 実験名・保存モデル名・評価出力名も分けています。移植先には root の設定をコピーせず、
 その host の設定へ上記5キーを接続してください。
 
-作業環境にはこの worktree 内の .venv がなく、隣の既存 Python 3.12 環境を利用しました。
+以下は横加速度報酬を最初に導入した時点の記録です。最新の検証結果は [README](README.md#検証記録) を参照してください。
+その作業環境にはこの worktree 内の .venv がなく、隣の既存 Python 3.12 環境を利用しました。
 次の通常入口の --help と設定解決を確認しています。長時間学習やモデル評価完走を実施したという意味ではありません。
 
 ~~~bash
@@ -204,7 +208,7 @@ TOML root の既存 schema_version とモデルの lookahead_schema_version は�
 ../metadrive_rl-main/.venv/bin/python evaluate.py --config configs/official_start_lane_return_lookahead_lateral_accel.toml --no-record-gif
 ~~~
 
-移植先ではその host の python を使います。検証コマンド・通常入口は [README](README.md#配布と確認) を参照してください。
+移植先ではその host の python を使います。検証コマンド・通常入口は [README](README.md#軽量検証) を参照してください。
 
 MetaDrive 0.4.3 と取得済み assets で、通常の make_evaluation_env を使う1環境・8 decisionの
 smoke testも実行しました。raw D=259、wrapper後D+3=262、PP providerなしで、
@@ -264,11 +268,12 @@ min_curve_velocity、人工的な曲率下限、減速・ジャーク処理や�
 学習比較を行うまでは速度維持やふらつき抑制の改善を断定できません。
 
 Off へ戻すには lateral_accel_reward_enabled=false とし、その実効設定で学習したモデルを使います。
-旧 v1 モデルは同じ lookahead_m/pp_weight の Off 設定で評価できます。
+旧 v1 モデルは時間指定なし・予測報酬Offで、同じ lookahead_m/pp_weight の横加速度Off設定で評価できます。
 On モデルを Off でそのまま評価すると設定不一致で停止します。受入検証を迂回しないでください。
 
-更新ファイルは incoming/lookahead_learning/ へ一時配置し、実接続と比較してください。適用前に旧 lookahead_learning/ と host 独自変更・未コミット差分を別の場所へバックアップし、不足差分だけ適用してください。
+更新ファイルは lookahead_learning_update/ へ一時配置し、実接続と比較してください。適用前に旧 lookahead_learning/ と host 独自変更・未コミット差分を別の場所へバックアップし、不足差分だけ適用してください。
 **差し替えで既に消えた独自変更は、このプロンプトだけでは復元できません。**
-接続を戻す場合も、バックアップした host ファイル・TOML・対応するモデルを組み合わせます。
+接続を戻す場合は原本・適用差分・現在の状態を比較し、今回の差分だけを戻します。
+バックアップを無条件で復元せず、後続の独自変更と対応する設定・モデルを保持します。
 新規移植・差分更新の入口は共通の [copilot_porting_prompt.md](copilot_porting_prompt.md)、
 バックアップと接続判定の詳細は [porting.md](porting.md) です。

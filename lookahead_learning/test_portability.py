@@ -7,9 +7,59 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
+
+from .pack import STAGING_DIRECTORY, create_archive
 
 
 class PackageCopyTests(unittest.TestCase):
+    def test_archive_extracts_beside_existing_package_without_overwriting(self):
+        package = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(prefix='lookahead-delivery-') as directory:
+            root = Path(directory)
+            active = root / 'host' / 'lookahead_learning'
+            active.mkdir(parents=True)
+            existing = {'adapter.py': b'custom host adapter', 'env.py': b'custom reward',
+                        'user_change.txt': b'local uncommitted change'}
+            for name, data in existing.items():
+                (active / name).write_bytes(data)
+            archive = create_archive(root / 'update.zip')
+            paths = [line for line in (package / 'PORTABLE_FILES.txt').read_text().splitlines()
+                     if line and not line.startswith('#')]
+            with zipfile.ZipFile(archive) as bundle:
+                expected = {name.replace('lookahead_learning/', STAGING_DIRECTORY + '/', 1)
+                            for name in paths}
+                self.assertEqual(set(bundle.namelist()), expected)
+                self.assertFalse(any(name.startswith('lookahead_learning/') for name in bundle.namelist()))
+                bundle.extractall(root / 'host')  # archive produced locally, paths checked above
+            for name, data in existing.items():
+                self.assertEqual((active / name).read_bytes(), data)
+            self.assertEqual(set(p.name for p in active.iterdir()), set(existing))
+            incoming = root / 'host' / STAGING_DIRECTORY
+            for name in paths:
+                suffix = Path(name).relative_to('lookahead_learning')
+                self.assertEqual((incoming / suffix).read_bytes(), (package / suffix).read_bytes())
+            self.assertTrue((incoming / 'docs/copilot_porting_prompt.md').is_file())
+
+    def test_archive_refuses_to_replace_an_existing_output(self):
+        with tempfile.TemporaryDirectory(prefix='lookahead-existing-') as directory:
+            output = Path(directory) / 'existing.zip'
+            output.write_bytes(b'keep existing delivery')
+            with self.assertRaises(FileExistsError):
+                create_archive(output)
+            self.assertEqual(output.read_bytes(), b'keep existing delivery')
+
+    def test_archive_rejects_paths_outside_package_before_writing(self):
+        with tempfile.TemporaryDirectory(prefix='lookahead-manifest-') as directory:
+            package = Path(directory) / 'package'
+            package.mkdir()
+            output = Path(directory) / 'update.zip'
+            for path in ('lookahead_learning/../adapter.py', '/tmp/adapter.py', 'env_factory.py'):
+                (package / 'PORTABLE_FILES.txt').write_text(path + '\n')
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    create_archive(output, package_dir=package)
+                self.assertFalse(output.exists())
+
     def test_manifest_dependency_closure_and_isolated_imports(self):
         package = Path(__file__).resolve().parent
         paths = [line for line in (package / 'PORTABLE_FILES.txt').read_text().splitlines()
@@ -53,6 +103,7 @@ class BlockSourceHost(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BlockSourceHost())
 import lookahead_learning
 from lookahead_learning.checkpoint import resolve_lookahead_config
+from lookahead_learning.pack import create_archive
 assert Path(lookahead_learning.__file__).resolve().parent == Path.cwd() / 'lookahead_learning'
 for example in Path('lookahead_learning/examples').glob('*.toml'):
     resolve_lookahead_config(tomllib.loads(example.read_text())['lookahead'])

@@ -257,6 +257,47 @@ class PredictionWrapperTests(unittest.TestCase):
         finally:
             vec.close()
 
+    def test_public_factory_preserves_existing_lateral_reward_when_prediction_is_added(self):
+        from .test_lateral_acceleration import mixed_route
+        from .checkpoint import resolve_lookahead_config
+        config = resolve_lookahead_config({
+            'lookahead_time_s': 1., 'lateral_accel_reward_enabled': True,
+            'max_lateral_accel': 1.2, 'lateral_accel_weight': 0.07,
+        })
+        envs = []
+        results = []
+        try:
+            for prediction in (False, True):
+                raw = MotionHost(positions=((0., 1.), (1., 1.)))
+                graph = {}
+                for index, lane in enumerate(mixed_route().path.lanes):
+                    lane.index = (str(index), str(index + 1), 0)
+                    graph[str(index)] = {str(index + 1): [lane]}
+                raw.vehicle.lane_index = ('0', '1', 0)
+                raw.vehicle.navigation = FakeNavigation(('0', '1', '2', '3'), graph)
+                env = wrap_lookahead_env(raw, **{**config, 'prediction_reward_enabled': prediction})
+                envs.append(env)
+                env.reset(seed=42)
+                results.append(env.step(4))
+            old, added = [result[4]['lookahead_learning'] for result in results]
+            self.assertLess(old['r_lateral_accel'], 0)
+            self.assertEqual(old['lateral_accel'], added['lateral_accel'])
+            self.assertEqual(old['r_lateral_accel'], added['r_lateral_accel'])
+            self.assertEqual(added['lateral_accel']['max_lateral_accel_mps2'], 1.2)
+            self.assertEqual(added['lateral_accel']['weight'], 0.07)
+            self.assertLess(added['r_prediction'], 0)
+            self.assertAlmostEqual(results[1][1], results[0][1] + added['r_prediction'])
+            self.assertAlmostEqual(results[1][1], sum(added[k] for k in
+                ('r_base', 'r_pp', 'r_lateral_accel', 'r_prediction')))
+            np.testing.assert_array_equal(results[0][0], results[1][0])
+            self.assertEqual(results[0][2:4], results[1][2:4])
+            for env in envs:
+                self.assertEqual(env.env.step_calls, 1)
+                self.assertEqual(env.observation_space.shape, (10,))
+        finally:
+            for env in envs:
+                env.close()
+
     def test_pp_lateral_prediction_terms_compose_once_with_existing_timing(self):
         from .lateral_acceleration import LateralReference
         from .test_env import PPProbe

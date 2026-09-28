@@ -1,13 +1,14 @@
 # GitHub Copilotへ最初に渡す移植依頼
 
-移植用コードを `incoming/lookahead_learning/` に配置しました。稼働中の `lookahead_learning/` は比較前に上書きしないでください。
+移植用コードを `lookahead_learning_update/` に配置しました。稼働中の `lookahead_learning/` とは別フォルダです。両者の同じ相対パスを比較し、必要差分だけ適用してください。フォルダ全体のコピー・リネームによる置換は禁止です。
 単一エージェントで調査・差分適用・軽量検証を行い、既存の独自変更を保護してください。
 対象は時間指定の注視点（機能1）と等速・一定曲率の予測位置報酬（機能2）です。加速度推定・加速度付き予測は対象外です。
+更新フォルダをruntime import/PYTHONPATHへ追加せず、適用後は既存の通常入口とlookahead_learning/を使います。
 元GitHub、元チャット、移植元root全体、Excel・画像・実験出力を読む必要はありません。
 
 ## 1. 比較してからバックアップする
 
-branch・HEAD・git statusと未コミット差分を確認してください。まずこの文書、次に必要時だけ `docs/porting.md` の接続例を読みます。
+branch・HEAD・git statusと未コミット差分を確認してください。まずこの文書、次に必要時だけ更新フォルダ内の `docs/porting.md` の接続例を読みます。
 `rg`で下記シンボルと呼出し元を探し、「未導入／既存版／独自改変・部分適用／適用済み」を根拠付きで判定してください。
 フォルダの存在やschema番号だけでは判定しません。全コード通読・数式の再設計は不要です。
 
@@ -24,7 +25,20 @@ branch・HEAD・git statusと未コミット差分を確認してください。
 host adapterは丸ごと上書きせず、独自の入力・開始車線参照・報酬を保持してください。
 モデル、認証、共有設定、AGENTS、無関係なファイルは変更しません。
 
-## 2. 不足差分だけ接続する
+## 2. 既存横加速度報酬を残し、新しい予測項だけ追加する
+
+使用中の横加速度報酬がどこで加算されるか（LookaheadEnv、別wrapper、hostのreward_function）を確認してください。
+その式、実効On/Off、上限値、重み、host固有実装を保持します。更新用サンプルのOff設定で上書きしません。
+今回の `r_prediction` を既存の返却報酬へ1回だけ加える構成にします。
+host側で既に横加速度項を計上している場合はそれをr_base内に残し、同梱の横加速度項をさらに有効にして二重加算しないでください。
+既存wrapper側の横加速度項を使っている場合は、その設定とLateralReference/radius_reader接続を引き継ぎます。
+独自報酬を同梱lateral_acceleration.pyの式へ置換しません。
+
+`examples/time_prediction_lateral.toml` は同梱の横加速度項と予測項を両方Onにする例です。
+例の上限・重みを移植先の値に強制変更しません。従来3条件の横加速度Offは比較実験用の設定です。
+既存横加速度の詳細が必要なときだけ `docs/lateral_acceleration_reward.md` を参照してください。
+
+## 3. 不足差分だけ接続する
 
 - 未導入なら `docs/porting.md` の4接続を通常入口へ追加します。既存版なら同じ接続を再利用し、不足したキー保持・metadata・ログだけを補います。
 - 適用済みなら検証だけ行います。重複wrapper、D+6、同梱コードの再実装、報酬の二重加算を禁止します。
@@ -35,11 +49,11 @@ host adapterは丸ごと上書きせず、独自の入力・開始車線参照�
 - hostソースで車体中心位置[m]、heading[rad]、平面速度[m/s]、符号付き前進速度、dtを確認します。単位を推測しません。独自reader/providerの契約は必要時だけ `docs/time_prediction.md` の1・5節を読みます。
 - 報酬のpost起点・マスク・未クリップ座標・Off/重み0は同文書2〜5節と同梱実装が正です。既存PP・横加速度報酬の時刻を変更しません。
 - step出力がinfo全体を保持していれば接続を増やしません。episode選択リストには既存値に加えて `episode_r_prediction` と `prediction_episode` を渡します。rootに数式・集計処理を複製しません。
-- 同梱examplesは通常CLIで読める独立TOMLです。移植先の学習条件を上書きせず、別名の比較設定へ必要差分だけ反映します。設定優先順位と3条件はREADMEを参照します。
+- 同梱examplesは通常CLIで読める独立TOMLです。移植先の学習条件を上書きせず、別名の比較設定へ必要差分だけ反映します。設定優先順位・3比較条件・横加速度との併用例はREADMEを参照します。
 
 契約不明なら推測せず、その接続だけ保留し、不足する根拠を報告してください。他の確認済み作業は進めます。
 
-## 3. 最小検証と報告
+## 4. 最小検証と報告
 
 ```bash
 python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
@@ -50,6 +64,7 @@ python evaluate.py --help
 通常CLIの設定読込とfactory/worker保持も確認します。`test_portability` はPORTABLE_FILESのみを一時コピーし、元root・MetaDrive・SB3のimportを禁止して設定・純粋関数・fake hostを実行します。
 SB3依存のMonitor/VecEnvテストはこの隔離環境でのみskipし、hostの通常環境では実行してください。
 D+3、Off/重み0と同じaction列での観測・報酬・終了・乱数同値、post参照、単一加算、旧モデル互換、reset/terminal履歴分離を確認します。
+同じT・同じaction列で予測Off/Onを比較し、既存横加速度項が変わらず、報酬差がr_predictionだけであることも確認してください。
 利用可能な既存assetsがあれば、単一環境で数stepのsmokeまで行います。長時間学習、依存更新、assets download、元rootの丸ごとコピーは行いません。
 commit/pushは移植先利用者から明示的な指示がある場合だけ行います。
 
