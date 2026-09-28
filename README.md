@@ -4,6 +4,13 @@ MetaDrive 環境を Stable-Baselines3 の PPO で学習・評価するための�
 
 前方注視を使う実験も、専用CLIではなく通常の `train.py` / `evaluate.py` に同じ TOML を渡して実行します。`[lookahead]` を省略するとbaseline、tableがあり `pp_weight = 0.0` なら注視点3値だけ、正値ならPP不一致ペナルティも追加します。詳しくは [lookahead_learning の手順](lookahead_learning/docs/README.md) を参照してください。
 
+## 別PCへlookahead_learningを移植する
+
+配布ZIPをリポジトリ直下の [lookahead_learning_update.zip](lookahead_learning_update.zip) に配置しています。
+別PCで空の場所へ展開し、出てきた `lookahead_learning_update/` を既存 `lookahead_learning/` の隣に置いてください。
+Copilotには **「lookahead_learning_update/START_HERE.md を読んで実施してください」** と伝えるだけで進められます。
+依頼の詳細はZIP内のファイルに保存済みです。既存フォルダを上書きせず、バックアップ・不足差分の適用・軽量検証まで指示しています。
+
 ## 環境構築
 
 `requirements.txt` は `../metadrive` を editable install します。このリポジトリと `metadrive/` を同じ親ディレクトリの直下に配置してください。

@@ -1,6 +1,6 @@
 # 通常入口への移植と既存接続の差分更新
 
-最初に渡す文書は [copilot_porting_prompt.md](copilot_porting_prompt.md) です。
+最初に実施を依頼する文書は配布フォルダ直下の [START_HERE.md](../START_HERE.md) です。そこから詳細な [copilot_porting_prompt.md](copilot_porting_prompt.md) を読み、差分適用と検証まで進めます。
 移植用ファイルは **lookahead_learning_update/** に一時配置します。
 実際の稼働フォルダとの比較・バックアップ前に上書きしません。
 仕様を確認する必要がある場合だけ [time_prediction.md](time_prediction.md) の該当節を読みます。
@@ -12,7 +12,8 @@
 rootのtrain.py/evaluate.py/env_factory.py/start_lane_env.pyはコピー対象ではありません。
 モデル・動画・画像・Excel・assets・無関係なレポートも含みません。
 
-移植元で `python -B -m lookahead_learning.pack --output /tmp/lookahead_learning_update.zip` を実行します。
+移植元リポジトリ直下に配布済みの `lookahead_learning_update.zip` があります。
+再生成する場合は `python -B -m lookahead_learning.pack --output /tmp/lookahead_learning_update.zip` を実行し、未作成の出力先を指定します。
 ZIP内のファイルはすべてlookahead_learning_update/配下にあり、稼働中lookahead_learning/と別名です。
 ZIPを別PCで空の場所へ展開し、そのlookahead_learning_update/を既存lookahead_learning/の隣へ配置します。
 同名の更新フォルダが既にあれば上書きせず、別の配置先を選んでCopilotへパスを伝えます。
@@ -20,7 +21,7 @@ ZIPを別PCで空の場所へ展開し、そのlookahead_learning_update/を既�
 manifestの各パスは適用後の配置（lookahead_learning/...）を表します。
 比較時は `lookahead_learning_update/相対パス` と `lookahead_learning/相対パス` を対応させます。
 フォルダ全体のコピー置換・リネーム、更新フォルダのruntime importは行いません。
-配置後は `lookahead_learning_update/docs/copilot_porting_prompt.md` の指示で必要差分だけ移植します。
+配置後はCopilotへ「lookahead_learning_update/START_HERE.md を読んで実施してください」と依頼するだけで、必要差分の移植と検証まで進められます。
 
 Copilotは変更予定を特定してから、新しい空のバックアップ先へ原本・未コミットdiff・HEAD・元から無かったファイル一覧を保存します。
 適用後のdiffとハッシュも保管します。独自adapterを丸ごと置換しません。

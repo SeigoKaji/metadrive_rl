@@ -5,7 +5,7 @@
 従来の距離指定、PP、必要横加速度報酬の接続を維持しています。加速度推定・加速度付き予測は含みません。
 
 [設計仕様・数値例・ログの読み方](time_prediction.md) は実装に対応しています。
-別PCへ渡すときは [Copilot用の最初の1本](copilot_porting_prompt.md) と [必要時の接続手順](porting.md) を使います。
+別PCへ渡すときは配布フォルダ直下の [START_HERE.md](../START_HERE.md) をCopilotへ読ませて実施を依頼します。詳細な [移植指示](copilot_porting_prompt.md) と [接続手順](porting.md) も同梱しています。
 
 ## 通常train/evaluateで比較・併用する
 
@@ -80,12 +80,13 @@ r_total = r_base + r_pp + r_lateral_accel + r_prediction
 
 ## 配布するファイル
 
-[PORTABLE_FILES.txt](../PORTABLE_FILES.txt) に、移植元rootからの相対パスで26ファイルを列挙しています。
+[PORTABLE_FILES.txt](../PORTABLE_FILES.txt) に、移植元rootからの相対パスで27ファイルを列挙しています。
 実行コード7本、標準ライブラリだけの配布ツール、必要テスト、4設定例、最小文書です。
 モデル・動画・Excel・画像・assets・無関係なレポート・移植元rootの実装は含みません。
 既存横加速度の仕様も配布します。追加の既存解説（methods.md、route_definition.md、pp_derivation.md）は元repoに残し、今回の最小配布には含めません。
 
-配布ZIPを生成するコマンドです（出力先は未作成のファイルを指定します）。
+配布済みZIPは移植元リポジトリ直下の `lookahead_learning_update.zip` です。そのZIPだけを別PCへ運べます。
+更新版を再生成する場合は次を使います（出力先は未作成のファイルを指定します）。
 
 ```bash
 python -B -m lookahead_learning.pack --output /tmp/lookahead_learning_update.zip
@@ -99,6 +100,7 @@ ZIPの最上位は **lookahead_learning_update/** だけです。展開先で既
 移植先root/
 ├── lookahead_learning/          ← 稼働中。比較・バックアップ後に必要差分だけ適用
 ├── lookahead_learning_update/   ← 今回の配布物。配置しただけでは実行コードは切り替わらない
+│   ├── START_HERE.md            ← Copilotへ読ませて実施を依頼するファイル
 │   ├── PORTABLE_FILES.txt
 │   ├── docs/copilot_porting_prompt.md
 │   └── ...
@@ -110,15 +112,8 @@ manifestのlookahead_learning/は適用先の論理パスです。pack.pyはそ�
 配布フォルダをPYTHONPATHへ追加したり、そこから学習を実行したりしません。適用後は通常のlookahead_learningを使います。
 テストで、ZIPの展開が既存adapter・報酬コード・未コミットファイルを変更しないことと、元root・MetaDrive/SB3なしの依存閉包を確認します。
 
-導入・更新時に最初に貼る文面:
-
-```text
-lookahead_learning_update/docs/copilot_porting_prompt.md を最初に読み、単一エージェントで導入/更新してください。
-実接続から未導入・既存版・独自改変・適用済みを判定し、変更予定ファイルと未コミット差分を先にバックアップしてください。
-既存の横加速度報酬の式・有効設定・上限・重み、観測・開始車線・host adapter・モデルを保持し、lookahead_learning_updateとの差分から不足分だけ適用してください。
-既存の報酬へ今回の予測項を1回だけ追記してください。同梱実装を再実装せず、通常train/evaluate/factory/workerと既存metadata helperを再利用し、二重wrapper・D+6・二重加算を防いでください。
-契約不明な接続だけ保留し、適用済みなら検証のみ。軽量テスト・CLI設定読込・可能なら数step smokeを実行し、根拠、バックアップ、変更、未検証事項、今回差分だけの戻し方を報告してください。
-```
+導入・更新時は、Copilotに **「lookahead_learning_update/START_HERE.md を読んで実施してください」** と伝えてください。
+長い依頼文のコピーは不要です。START_HERE.mdから詳細指示を読み、比較・バックアップ・不足差分の適用・軽量検証・報告まで進めます。
 
 今回差分の撤去・復元時に貼る文面:
 
@@ -143,7 +138,7 @@ hostの通常入口への引数保持はrootの関連テストで別に確認し
 
 ## 検証記録
 
-別フォルダ配布・横加速度併用の追加確認（2026-09-29）:
+別フォルダ配布・横加速度併用の追加確認（コミット3c34c1b、2026-09-29）:
 
 - 関連pytest: **24 passed、17 subtests passed**。配布ZIPの安全な展開、出力の上書き拒否、範囲外manifestの拒否、26ファイルの隔離コピー、4設定例の通常CLI読込を含みます。
 - ZIPを模擬hostへ展開し、既存lookahead_learning/のadapter・報酬コード・独自ファイルの内容とファイル一覧が不変であることを確認しました。
