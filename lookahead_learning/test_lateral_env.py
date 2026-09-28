@@ -180,7 +180,7 @@ class LateralWrapperTests(unittest.TestCase):
                 env.step(4)
             _, reset_info = env.reset()
             self.assertEqual(env.episode_totals, {
-                "r_base": 0, "r_pp": 0, "r_lateral_accel": 0, "r_total": 0
+                "r_base": 0, "r_pp": 0, "r_lateral_accel": 0, "r_prediction": 0, "r_total": 0
             })
             self.assertEqual(reset_info["lookahead_learning"]["lateral_accel"]["skip_reason"], "reset")
             self.assertIsNone(env.terminal_snapshot)
@@ -229,8 +229,11 @@ class LateralWrapperTests(unittest.TestCase):
         self.assertEqual(a.step(4)[1], b.step(4)[1])
 
     def test_monitor_and_multi_env_autoreset_keep_totals_and_snapshots_separate(self):
-        from stable_baselines3.common.monitor import Monitor
-        from stable_baselines3.common.vec_env import DummyVecEnv
+        try:
+            from stable_baselines3.common.monitor import Monitor
+            from stable_baselines3.common.vec_env import DummyVecEnv
+        except ImportError:
+            self.skipTest("SB3 unavailable; pure/fake-host portability tests remain active")
 
         envs = [
             make_wrapped(raw=SpeedHost(speed=10, terminal_after=2)),

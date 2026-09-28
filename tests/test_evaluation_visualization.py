@@ -508,9 +508,12 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
                 "crash_object": False,
                 "max_step": False,
                 "lookahead_learning": {
-                    "episode_r_base": float(self.step_number) + 0.0225,
+                    "episode_r_base": float(self.step_number) + 0.0325,
                     "episode_r_pp": 0.0,
                     "episode_r_lateral_accel": -0.0225,
+                    "episode_r_prediction": -0.01,
+                    "prediction_episode": {"evaluated_seconds": 0.1, "invalid_seconds": 0.0,
+                                           "valid_time_ratio": 1.0, "observation_saturation_rate": 0.5},
                     "episode_r_total": float(self.step_number),
                     "lateral_accel_episode": {
                         "required_lateral_accel_max_mps2": 2.0,
@@ -620,6 +623,8 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
     ]
     assert result["step_telemetry"]["row_count"] == 2
     lookahead_episode = result["episodes"][0]["lookahead_learning"]
+    assert lookahead_episode["episode_r_prediction"] == -0.01
+    assert lookahead_episode["prediction_episode"]["valid_time_ratio"] == 1.0
     assert lookahead_episode["episode_r_lateral_accel"] == -0.0225
     assert lookahead_episode["episode_r_total"] == result["episodes"][0]["total_reward"]
     assert lookahead_episode["lateral_accel_episode"]["required_lateral_accel_max_mps2"] == 2.0

@@ -21,6 +21,10 @@ class CheckpointContractError(ValueError):
 
 class LookaheadConfig(TypedDict):
     lookahead_m: float
+    lookahead_time_s: float | None
+    prediction_reward_enabled: bool
+    prediction_reward_weight: float
+    prediction_error_scale_m: float
     pp_weight: float
     lateral_accel_reward_enabled: bool
     max_lateral_accel: float
@@ -29,6 +33,10 @@ class LookaheadConfig(TypedDict):
 
 LOOKAHEAD_DEFAULTS: LookaheadConfig = {
     "lookahead_m": 6.0,
+    "lookahead_time_s": None,
+    "prediction_reward_enabled": False,
+    "prediction_reward_weight": 0.1,
+    "prediction_error_scale_m": 1.0,
     "pp_weight": 0.0,
     "lateral_accel_reward_enabled": False,
     "max_lateral_accel": 0.8,
@@ -36,7 +44,7 @@ LOOKAHEAD_DEFAULTS: LookaheadConfig = {
 }
 """Resolved defaults used whenever an explicit ``[lookahead]`` table exists."""
 
-LOOKAHEAD_MODEL_SCHEMA_VERSION = 2
+LOOKAHEAD_MODEL_SCHEMA_VERSION = 3
 LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE = "lookahead_config"
 LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE = "lookahead_schema_version"
 _LOOKAHEAD_KEYS = frozenset(LOOKAHEAD_DEFAULTS)
@@ -95,7 +103,23 @@ def resolve_lookahead_config(value: object) -> LookaheadConfig | None:
     )
     if not isinstance(enabled, bool):
         raise ValueError("lookahead.lateral_accel_reward_enabled: boolで指定してください")
-    return {
+    prediction_enabled = value.get("prediction_reward_enabled", False)
+    if type(prediction_enabled) is not bool:
+        raise ValueError("lookahead.prediction_reward_enabled: boolで指定してください")
+    time = value.get("lookahead_time_s")
+    resolved: LookaheadConfig = {
+        "lookahead_time_s": None if time is None else _lookahead_real(
+            time, key="lookahead_time_s", minimum=0.0, minimum_inclusive=False,
+        ),
+        "prediction_reward_enabled": prediction_enabled,
+        "prediction_reward_weight": _lookahead_real(
+            value.get("prediction_reward_weight", LOOKAHEAD_DEFAULTS["prediction_reward_weight"]),
+            key="prediction_reward_weight", minimum=0.0, minimum_inclusive=True,
+        ),
+        "prediction_error_scale_m": _lookahead_real(
+            value.get("prediction_error_scale_m", LOOKAHEAD_DEFAULTS["prediction_error_scale_m"]),
+            key="prediction_error_scale_m", minimum=0.0, minimum_inclusive=False,
+        ),
         "lookahead_m": _lookahead_real(
             value.get("lookahead_m", LOOKAHEAD_DEFAULTS["lookahead_m"]),
             key="lookahead_m",
@@ -123,6 +147,11 @@ def resolve_lookahead_config(value: object) -> LookaheadConfig | None:
         ),
     }
 
+    if (resolved["prediction_reward_enabled"] and resolved["prediction_reward_weight"] > 0
+            and resolved["lookahead_time_s"] is None):
+        raise ValueError("lookahead.lookahead_time_s: 実効Onの予測報酬には時間指定が必要です")
+    return resolved
+
 
 def set_lookahead_model_metadata(
     model: object,
@@ -143,7 +172,7 @@ def validate_lookahead_model_metadata(
     model: object,
     expected: Mapping[str, object] | None,
 ) -> None:
-    """Compare effective settings, reading v1 as lateral reward Off.
+    """Compare effective settings; v1/v2 mean distance and prediction Off.
 
     Validation never mutates a loaded model.  Off/zero-weight lateral settings
     ignore their inactive limit/weight, but active reward settings must match.
@@ -152,7 +181,7 @@ def validate_lookahead_model_metadata(
 
     actual = getattr(model, LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE, _MISSING)
     schema = getattr(model, LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE, _MISSING)
-    if schema is not _MISSING and (type(schema) is not int or schema not in (1, 2)):
+    if schema is not _MISSING and (type(schema) is not int or schema not in (1, 2, 3)):
         raise CheckpointContractError(f"unsupported lookahead schema metadata: {schema!r}")
     if schema is not _MISSING and actual is _MISSING:
         raise CheckpointContractError("incomplete lookahead schema metadata: config is missing")
@@ -181,6 +210,12 @@ def validate_lookahead_model_metadata(
         )
     if schema == 1 and set(actual) != {"lookahead_m", "pp_weight"}:
         raise CheckpointContractError("schema v1 requires exactly lookahead_m and pp_weight")
+    if schema == 2 and (
+        not {"lookahead_m", "pp_weight"} <= set(actual)
+        or set(actual) - {"lookahead_m", "pp_weight", "lateral_accel_reward_enabled",
+                          "max_lateral_accel", "lateral_accel_weight"}
+    ):
+        raise CheckpointContractError("schema v2 requires legacy distance/lateral settings")
     try:
         actual_config = resolve_lookahead_config(actual)
     except ValueError as error:
@@ -195,10 +230,16 @@ def validate_lookahead_model_metadata(
 
 def _effective_settings(config: LookaheadConfig) -> tuple[object, ...]:
     active = config["lateral_accel_reward_enabled"] and config["lateral_accel_weight"] > 0.0
+    prediction = config["prediction_reward_enabled"] and config["prediction_reward_weight"] > 0.0
+    time = config["lookahead_time_s"]
     return (
-        config["lookahead_m"], config["pp_weight"], active,
+        ("distance", config["lookahead_m"]) if time is None else ("time", time),
+        config["pp_weight"], active,
         config["max_lateral_accel"] if active else None,
         config["lateral_accel_weight"] if active else None,
+        prediction,
+        config["prediction_reward_weight"] if prediction else None,
+        config["prediction_error_scale_m"] if prediction else None,
     )
 
 

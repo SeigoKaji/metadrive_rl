@@ -1,0 +1,25 @@
+# Paths relative to the source/bundle root. Preserve this directory structure.
+# Stage at incoming/lookahead_learning; compare and back up before applying.
+lookahead_learning/PORTABLE_FILES.txt
+lookahead_learning/__init__.py
+lookahead_learning/adapter.py
+lookahead_learning/checkpoint.py
+lookahead_learning/env.py
+lookahead_learning/geometry.py
+lookahead_learning/lateral_acceleration.py
+lookahead_learning/prediction.py
+lookahead_learning/test_checkpoint.py
+lookahead_learning/test_geometry.py
+lookahead_learning/test_env.py
+lookahead_learning/test_lateral_acceleration.py
+lookahead_learning/test_lateral_env.py
+lookahead_learning/test_prediction.py
+lookahead_learning/test_prediction_env.py
+lookahead_learning/test_portability.py
+lookahead_learning/examples/distance.toml
+lookahead_learning/examples/time_only.toml
+lookahead_learning/examples/time_prediction.toml
+lookahead_learning/docs/README.md
+lookahead_learning/docs/copilot_porting_prompt.md
+lookahead_learning/docs/porting.md
+lookahead_learning/docs/time_prediction.md

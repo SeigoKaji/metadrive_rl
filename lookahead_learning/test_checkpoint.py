@@ -62,7 +62,7 @@ class LookaheadConfigTests(unittest.TestCase):
         set_lookahead_model_metadata(model, expected)
         validate_lookahead_model_metadata(model, expected)
         self.assertEqual(model.lookahead_config, resolve_lookahead_config(expected))
-        self.assertEqual(model.lookahead_schema_version, 2)
+        self.assertEqual(model.lookahead_schema_version, 3)
 
         with self.assertRaisesRegex(CheckpointContractError, "do not match"):
             validate_lookahead_model_metadata(
@@ -128,7 +128,7 @@ class LookaheadConfigTests(unittest.TestCase):
                 validate_lookahead_model_metadata(model, {**on, **changed})
         set_lookahead_model_metadata(model, {})
         validate_lookahead_model_metadata(model, {"max_lateral_accel": 2, "lateral_accel_weight": 0})
-        for schema in (0, 3, True, 2.0, "2", None):
+        for schema in (0, 4, True, 2.0, "2", None):
             for expected in ({}, None):
                 malformed = SimpleNamespace(
                     lookahead_schema_version=schema, lookahead_config=expected

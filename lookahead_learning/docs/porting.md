@@ -1,155 +1,110 @@
-# 新規移植と既存移植の差分更新
+# 通常入口への移植と既存接続の差分更新
 
-更新した lookahead_learning/ を移植先rootへ配置したあと、
-[Copilot向けプロンプト](copilot_porting_prompt.md) の内容をそのまま渡してください。
-新規・既存更新・部分移植・対応済みを同じプロンプトで扱います。
-報酬の詳細は [参照経路の必要横加速度](lateral_acceleration_reward.md)、
-既存観測とPPは [methods.md](methods.md) に同梱しています。元repositoryや外部サイトを開くことは移植作業の前提ではありません。
+最初に渡す文書は [copilot_porting_prompt.md](copilot_porting_prompt.md) です。
+移植用ファイルは **incoming/lookahead_learning/** に一時配置します。
+実際の稼働フォルダとの比較・バックアップ前に上書きしません。
+仕様を確認する必要がある場合だけ [time_prediction.md](time_prediction.md) の該当節を読みます。
 
-## 差し替える前のバックアップ
+## 配布範囲と保護
 
-**旧 lookahead_learning/、host独自adapter、変更予定hostファイル、未コミット差分を、上書き前に別の場所へ保存してください。**
-更新済みフォルダを置いた後に旧独自変更が消えていた場合、プロンプトからは復元できません。
-モデルと既存設定は保管し、別の比較設定・出力名を使います。認証・共有設定・AGENTSは変更対象外です。
+[../PORTABLE_FILES.txt](../PORTABLE_FILES.txt) は移植元rootからの相対パスです。
+そのファイル群を同じ構造で運ぶだけで、実行コード・必要テスト・3設定例・最小文書がそろいます。
+rootのtrain.py/evaluate.py/env_factory.py/start_lane_env.pyはコピー対象ではありません。
+モデル・動画・画像・Excel・assets・無関係なレポートも含みません。
 
-フォルダコピーの例です。BACKUP_DIRは新しい空の退避先を指定します。
+移植先rootでコードを直接上書きするコピーコマンドは使いません。
+次は比較用配置の例です（SOURCE_BUNDLEはPORTABLE_FILESだけを含む配布root）。
 
-~~~bash
-SOURCE_ROOT=/path/to/source
-HOST_ROOT=/path/to/host
-BACKUP_DIR=/path/to/backup-before-lookahead-update
-mkdir -p "$BACKUP_DIR"
-if [ -d "$HOST_ROOT/lookahead_learning" ]; then
-    cp -a "$HOST_ROOT/lookahead_learning" "$BACKUP_DIR/"
-fi
-cp -a "$SOURCE_ROOT/lookahead_learning" "$HOST_ROOT/"
-~~~
+```bash
+mkdir -p incoming
+cp -a /path/to/SOURCE_BUNDLE/lookahead_learning incoming/
+git status --short
+git diff -- lookahead_learning
+```
 
-host側で書き換えるファイルの一覧が分かったら、その原本と対象ファイルの git diff も保存します。
-バックアップ先に既存バックアップを重ねて上書きしないでください。
-host固有adapterは今後可能な範囲でパッケージの外へ配置し、コピー更新で消えない構成にします。
-今回のためだけに既存hostを大きく再配置する必要はありません。
+incomingに既存配置がある場合も上書きせず、新しい一時ディレクトリを使います。
+Copilotは変更予定を特定してから、新しい空のバックアップ先へ原本・未コミットdiff・HEAD・元から無かったファイル一覧を保存します。
+適用後のdiffとハッシュも保管します。独自adapterを丸ごと置換しません。
 
-## コピーする範囲
+| 実接続の状態 | 作業 |
+|---|---|
+| 未導入 | 下記4接続を既存の通常入口に追加 |
+| 既存版 | 設定・wrapper・metadata接続を再利用し、新機能の不足差分だけ追加 |
+| 独自改変/部分適用 | hostの契約・独自処理を保持して必要箇所だけ調整 |
+| 適用済み | 検証のみ |
 
-次を含む **lookahead_learning/ フォルダ全体** を持ち運びます。
+## 4つの接続
 
-~~~text
-lookahead_learning/
-├── __init__.py
-├── checkpoint.py
-├── adapter.py
-├── env.py
-├── geometry.py
-├── lateral_acceleration.py
-├── test_checkpoint.py
-├── test_geometry.py
-├── test_env.py
-├── test_lateral_acceleration.py
-├── test_lateral_env.py
-├── test_portability.py
-└── docs/  （仕様、移植プロンプト、既存の図・用語集）
-~~~
+### 1. config loader
 
-共通の実行コード6ファイル、設定解決、仕様、テストがこの範囲でそろいます。
-移植元rootの configs/、train.py、evaluate.py、env_factory.py、start_lane_env.py を必須コピーにしません。
-モデル、実行ログ、bytecode、Simulator assetsは配布物に含めません。
-docs/assetsの既存の図や編集用資料は同梱資料です。
-
-## フォルダの存在では判定しない
-
-更新済みフォルダを置いた時点で新schemaは既に存在します。完了状態はhostの実接続から判定します。
-
-| 状態 | host側の根拠 | 作業 |
-|---|---|---|
-| 新規 | 設定・wrapper・metadata接続が未導入 | 通常の入口へ1回だけ接続 |
-| 既存版からの更新 | D+3とwrapperは接続済み、新3キーやmetadata検証・出力の一部が不足 | 不足箇所だけ補う |
-| 部分移植／独自改変 | 接続が片側だけ、キー再構築、独自providerや報酬処理が存在 | 独自変更を保ち、必要な契約だけ補う |
-| 既に今回仕様を満たす | 5キーが全経路へ届き、schema互換・ログ・単一wrapperが動く | 検証のみ、不要な変更を作らない |
-
-限定して読むのは config loader の許可キーとresolver、train/evaluateの呼出し、
-共通factory/worker、実際のwrapper、checkpoint helper、host固有adapterです。
-全repositoryの再設計や全資料の調査は不要です。
-
-## 共有する接続契約
-
-### 設定とmetadata
-
-~~~python
-from lookahead_learning.checkpoint import (
-    resolve_lookahead_config,
-    set_lookahead_model_metadata,
-    validate_lookahead_model_metadata,
-)
-
+```python
+from lookahead_learning.checkpoint import resolve_lookahead_config
 lookahead_config = resolve_lookahead_config(raw.get("lookahead"))
-# このmapping全体をprofile、train/evaluate、factory/workerで保持する。
-set_lookahead_model_metadata(model, lookahead_config)  # PPO.save前
-validate_lookahead_model_metadata(model, lookahead_config)  # PPO.load直後
-~~~
+```
 
-loaderが許可キーを旧2つに限定していないか、factory引数を2つに再構築していないかを確認します。
-boolを含む型でmapping全体を運び、既定値・数式は同梱resolver/helperを共通源とします。
-新項の設定例とv1/v2互換規則は [新報酬の設定節](lateral_acceleration_reward.md) を参照してください。
-旧モデルはOffとして読み、検証時には変更しません。active/baselineや有効設定の不一致を無視しません。
+[lookahead]なしはNone、ありは解決済みmappingです。
+このmapping全体をprofile→通常train/evaluate→factory→workerへ渡します。
+閉じた許可キーや辞書再構築が旧キーだけになっていないか確認します。
+T指定時はlookahead_mが未使用です。T省略・予測Offは従来動作です。
 
-### 共通factory
+### 2. 共通env factory
 
-~~~python
+```python
 from lookahead_learning.adapter import wrap_lookahead_env
-
-# 既存のhost生成処理で作ったraw_envを使う。
 if lookahead_config is not None:
     raw_env = wrap_lookahead_env(raw_env, **lookahead_config)
-~~~
+```
 
-既存移植でこの接続があれば再利用します。新たなwrapperを重ねてD+6にしたり、報酬を二重加算したりしません。
-raw Env → LookaheadEnv → 既存Monitor → VecEnv の順序を保ち、評価にはMonitorを新設しません。
-reset/stepは既存wrapperチェーンを通します。内部属性の読み取りはenv.unwrappedでも構いませんが、
-unwrapped.step/resetで既存wrapperを迂回してはいけません。
+既存の接続があれば再利用します。raw Env → LookaheadEnv → 既存Monitor → VecEnvの順序です。
+評価へMonitorを新設する必要はありません。外側が返却rewardを集計するため、Monitorにも新項が1回だけ反映されます。
+reset/stepをunwrappedから直接呼ばず、既存host wrapperを通します。
+Dは実観測から取得し、既存prefix・Action・報酬・終了条件・開始車線特徴を保持します。
 
-既存hostの入力生成・開始車線特徴・reward_function・終了条件・Action・シナリオ・並列数を保ちます。
-raw幅Dは実際のflat float32 Boxから読み、既存prefixへ3値を一度だけ追加します。
+### 3. trainの保存 / evaluateの読込み
 
-### host adapterと評価出力
+```python
+from lookahead_learning.checkpoint import (
+    set_lookahead_model_metadata, validate_lookahead_model_metadata,
+)
+set_lookahead_model_metadata(model, lookahead_config)      # PPO.save前
+validate_lookahead_model_metadata(model, lookahead_config) # PPO.load直後
+```
 
-StartLane系クラス名やファイル配置が異なっても、同じ意味の接続点を探します。
-同梱MetaDrive adapterの任意のstart-lane resolverはfallback可能ですが、
-その特定ファイル名を別hostへの新たな必須依存にしてはいけません。
-別のhost固有providerから [LookaheadEnv](../env.py) を直接構成することもできます。
+保存後再読込の確認にもvalidateを使います。既存接続があれば変更不要です。
+ZIP内schema3、旧1/2の読み取り互換はhelperに任せます。旧ZIPは書き換えません。
+移植先が独自のモデル属性保存除外を持つ場合、上記2属性が実際のZIPへ入ることを確認します。
 
-座標・速度単位と意味・decision dt・開始車線参照をソースで監査します。
-新項Onでは既存previewと同じS_proj/S_goalの LateralReference を追加し、
-state_reader は平面速度の大きさ speed_m_s を返します。
-半径APIが異なる場合は MetaDrivePreviewProvider(radius_reader=...) で
-対象中心線の半径[m]を明示します。PPの曲率やlane.lengthから推測しません。
-Offとゼロ重みでは新APIを要求しません。PP OffではMetaDrivePPProviderを構築しません。
+### 4. 既存ログ
 
-既存の評価traceへ info["lookahead_learning"] を渡し、episode出力には
-episode_r_base、episode_r_pp、episode_r_lateral_accel、episode_r_total、
-lateral_accel_episodeを渡します。host側で報酬式・集計式を再実装する必要はありません。
+step traceで `info["lookahead_learning"]` をそのまま保存していれば変更不要です。
+episodeで選択して保存する場合だけ既存リストに以下を追加します。
 
-## 移植後の確認と戻し方
+```python
+"episode_r_prediction", "prediction_episode",
+```
 
-hostの既存Python環境で実行します。新たな依存更新やassets downloadは行いません。
+この移植元でもruntimeのroot変更は **evaluate.pyのepisode出力リストへの上記2キー追加だけ** です。
+その他のroot差分は既存の通常入口・worker保持を検証するテストです。rootの実装を配布物へコピーする必要はありません。
+成功率・速度・進捗・横ずれ・操舵変化量は既存評価出力/step traceを使い、新規レポート基盤は作りません。
 
-~~~bash
-python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
-python train.py --help
-python evaluate.py --help
-~~~
+## host adapterを維持する
 
-test_checkpoint、test_geometry、test_lateral_accelerationは標準ライブラリのみです。
-envのfakeテストはNumPy/Gymnasium、Monitor/VecEnv確認はSB3を使います。
-test_portabilityはこのフォルダのみを一時コピーし、元root・MetaDriveのimportを禁止した状態で
-設定・純粋関数・fake hostテストを実行します。コピー側の依存環境はhostの既存環境を使います。
+`MetaDrivePreviewProvider`はreset時の固定参照経路と開始車線を継続利用します。
+MetaDrive固有の意味・単位を移植先ソースで確認してください。
+独自reader/providerの契約は [仕様1・5節](time_prediction.md) にあります。
+契約不明ならその箇所を保留し、推測で速度・位置・曲率を作りません。
+開始車線クラス名が異なるhostに、移植元start_lane_env.pyの必須importを追加しません。
+既存の横加速度報酬を使用中なら、そのLateralReference/radius_reader接続も保持します。
+今回の予測報酬は半径・PP・操舵モデルAPIを新たに要求しません。
 
-hostでも、旧schema v1モデル＋Off、PP Off＋新項On、On/Offとゼロ重み、
-単一wrapper・D/D+3・報酬単一加算・Monitor合計を確認します。
-同梱fixtureは新規、旧版接続、更新済み接続を模した境界テストであり、
-実際の移植先やGitHub Copilotを実行した証明ではありません。
-Simulatorが利用可能なら1環境をresetし数stepで確認します。長時間学習は別の比較実験です。
+## 確認と今回差分だけの撤去
 
-今回仕様を満たすhostで同じプロンプトを再実行した場合は検証のみで済ませます。
-接続を戻す場合は、変更前に退避したhostファイルと対応TOMLを戻し、対応する旧モデルを使います。
-新項だけをOffにする手順とモデル設定の整合は [新報酬の戻し方](lateral_acceleration_reward.md) を参照してください。
+READMEの軽量テスト、CLI設定読込、可能なら既存assetsで数stepのsmokeを実行します。
+import隔離やfake hostの成功は別PCの実接続確認とは分けて報告します。
+
+撤去時は適用前原本・適用差分・現在の状態を三者比較します。
+今回追加した行だけを戻し、元からあったlookahead・host接続・独自変更・後続変更を残します。
+今回の新規ファイルも後続利用がないと確認したものだけ削除します。
+競合時にバックアップを無条件で復元せず、その箇所を保留して報告します。
+機能をOffにするだけなら設定を変更できますが、保存モデルとの実効設定の照合は引き続き必須です。
+距離指定へ戻すにはTを省略し、対応する距離指定モデルを使用します。

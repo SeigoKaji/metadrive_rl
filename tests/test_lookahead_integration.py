@@ -46,7 +46,11 @@ def test_make_env_wraps_both_raw_host_variants_only_when_config_is_present(
     monkeypatch.setitem(sys.modules, "start_lane_env", start_lane)
     monkeypatch.setitem(sys.modules, "lookahead_learning.adapter", adapter)
 
-    lookahead = resolve_lookahead_config({"lateral_accel_reward_enabled": True})
+    lookahead = resolve_lookahead_config({
+        "lateral_accel_reward_enabled": True, "lookahead_time_s": 1.2,
+        "prediction_reward_enabled": True, "prediction_reward_weight": 0.3,
+        "prediction_error_scale_m": 2.0,
+    })
     wrapped = env_factory.make_env(
         {"start_lane_objective": "return"},
         lookahead_config=lookahead,
@@ -115,7 +119,11 @@ def test_stage_factories_forward_the_same_lookahead_config_and_keep_monitor_oute
 
     monkeypatch.setattr(env_factory, "make_env", fake_make_env)
     monkeypatch.setattr(env_factory, "Monitor", FakeMonitor)
-    lookahead = resolve_lookahead_config({"lateral_accel_reward_enabled": True})
+    lookahead = resolve_lookahead_config({
+        "lateral_accel_reward_enabled": True, "lookahead_time_s": 1.2,
+        "prediction_reward_enabled": True, "prediction_reward_weight": 0.3,
+        "prediction_error_scale_m": 2.0,
+    })
 
     training_env = env_factory.make_training_env(
         rank=0,
@@ -135,3 +143,24 @@ def test_stage_factories_forward_the_same_lookahead_config_and_keep_monitor_oute
     assert evaluation_env is raw_envs[1]
     assert raw_envs[0].action_space.seeds == [11]
     assert raw_envs[1].observation_space.seeds == [12]
+
+
+def test_portable_examples_use_normal_cli_and_identical_experiment_conditions():
+    from pathlib import Path
+    from configs.experiment_config import load_experiment_config
+    from train import parse_args as train_args
+    from evaluate import parse_args as evaluate_args
+
+    base = load_experiment_config("configs/official_start_lane_return_lookahead.toml").profile
+    for filename in ("distance.toml", "time_only.toml", "time_prediction.toml"):
+        path = str(Path("lookahead_learning/examples") / filename)
+        training = train_args(["--config", path])
+        evaluation = evaluate_args(["--config", path])
+        config = training.experiment.profile.lookahead_config
+        assert config == evaluation.experiment.profile.lookahead_config
+        assert config["lookahead_time_s"] == (None if filename == "distance.toml" else 1)
+        assert config["prediction_reward_enabled"] == (filename == "time_prediction.toml")
+        assert config["pp_weight"] == 0
+        assert config["lateral_accel_reward_enabled"] is False
+        for key in ("train_env_config", "evaluation_env_config", "training_config"):
+            assert getattr(training.experiment.profile, key) == getattr(base, key)

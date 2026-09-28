@@ -171,11 +171,13 @@ def test_training_logger_does_not_clear_events_through_a_directory_symlink(
     assert event_path.read_bytes() == b"keep these events"
 
 
+@pytest.mark.parametrize("time_s", [None, 1.0])
 @pytest.mark.parametrize("lateral_enabled", [False, True])
 def test_training_serializes_resolved_lookahead_config_into_ppo_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     lateral_enabled: bool,
+    time_s: float | None,
 ) -> None:
     """active TOML値はPPO ZIPのcustom attributeと通常metadataへ届く。"""
 
@@ -185,7 +187,10 @@ def test_training_serializes_resolved_lookahead_config_into_ppo_checkpoint(
         source.read_text(encoding="utf-8")
         + "\n[lookahead]\nlookahead_m = 6.0\npp_weight = 0.25\n"
         + f"lateral_accel_reward_enabled = {str(lateral_enabled).lower()}\n"
-        + "max_lateral_accel = 1.2\nlateral_accel_weight = 0.07\n",
+        + "max_lateral_accel = 1.2\nlateral_accel_weight = 0.07\n"
+        + ("" if time_s is None else f"lookahead_time_s = {time_s}\n")
+        + f"prediction_reward_enabled = {str(time_s is not None).lower()}\n"
+        + "prediction_reward_weight = 0.13\nprediction_error_scale_m = 2.0\n",
         encoding="utf-8",
     )
     captured_metadata: dict[str, object] = {}
@@ -247,9 +252,11 @@ def test_training_serializes_resolved_lookahead_config_into_ppo_checkpoint(
         "lookahead_m": 6.0, "pp_weight": 0.25,
         "lateral_accel_reward_enabled": lateral_enabled,
         "max_lateral_accel": 1.2, "lateral_accel_weight": 0.07,
+        "lookahead_time_s": time_s, "prediction_reward_enabled": time_s is not None,
+        "prediction_reward_weight": 0.13, "prediction_error_scale_m": 2.0,
     })
     assert saved_attributes == {
-        "lookahead_schema_version": 2,
+        "lookahead_schema_version": 3,
         "lookahead_config": expected,
     }
     assert captured_metadata["lookahead"] == expected

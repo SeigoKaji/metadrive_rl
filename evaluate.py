@@ -595,6 +595,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                         for key in (
                             "episode_r_base", "episode_r_pp", "episode_r_lateral_accel",
                             "episode_r_total", "lateral_accel_episode",
+                            "episode_r_prediction", "prediction_episode",
                         )
                         if key in lookahead_info
                     }

@@ -41,7 +41,8 @@ from .adapter import (
     simulation_dt_seconds,
 )
 from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
-from .geometry import pp_penalty_result
+from .geometry import NORMALIZATION_DISTANCE_M, pp_penalty_result
+from .prediction import MotionState, PredictionEpisodeMetrics, PredictionResult, prediction_penalty
 from .lateral_acceleration import (
     LateralEpisodeMetrics, LateralReference, lateral_accel_penalty, planar_speed_mps,
 )
@@ -643,6 +644,12 @@ class LookaheadEnv(gym.Wrapper):
             preview object and must return an explicit ``pp_valid`` result.
         pp_weight: Non-negative PP coefficient.  It is required for ``lookahead_obs_pp_reward``
             even when zero, so a zero-weight equivalence test is explicit.
+        lookahead_time_s: Optional positive horizon. The preview provider must
+            use this same horizon from each snapshot's planar speed. Omission
+            preserves the existing distance-provider contract.
+        prediction_reward_enabled: Opt in to post-origin position prediction.
+        prediction_reward_weight: Non-negative coefficient; zero skips prediction.
+        prediction_error_scale_m: Positive metre scale for the unnormalized error.
         lateral_accel_reward_enabled: Opt in to the route lateral-demand term.
         max_lateral_accel: Positive allowable reference demand in m/s².
         lateral_accel_weight: Non-negative coefficient; zero preserves the old
@@ -660,6 +667,10 @@ class LookaheadEnv(gym.Wrapper):
         preview_provider: PreviewProvider | None = None,
         pp_provider: PPProvider | None = None,
         pp_weight: float | None = None,
+        lookahead_time_s: float | None = None,
+        prediction_reward_enabled: bool = LOOKAHEAD_DEFAULTS["prediction_reward_enabled"],
+        prediction_reward_weight: float = LOOKAHEAD_DEFAULTS["prediction_reward_weight"],
+        prediction_error_scale_m: float = LOOKAHEAD_DEFAULTS["prediction_error_scale_m"],
         lateral_accel_reward_enabled: bool = LOOKAHEAD_DEFAULTS["lateral_accel_reward_enabled"],
         max_lateral_accel: float = LOOKAHEAD_DEFAULTS["max_lateral_accel"],
         lateral_accel_weight: float = LOOKAHEAD_DEFAULTS["lateral_accel_weight"],
@@ -675,6 +686,20 @@ class LookaheadEnv(gym.Wrapper):
             if isinstance(wrapped, LookaheadEnv):
                 raise HostContractError("LookaheadEnv is already connected; refusing double wrapping")
             wrapped = wrapped.env
+        prediction_config = resolve_lookahead_config({
+            "lookahead_time_s": lookahead_time_s,
+            "prediction_reward_enabled": prediction_reward_enabled,
+            "prediction_reward_weight": prediction_reward_weight,
+            "prediction_error_scale_m": prediction_error_scale_m,
+        })
+        assert prediction_config is not None
+        self._lookahead_time_s = prediction_config["lookahead_time_s"]
+        self._prediction_enabled = prediction_config["prediction_reward_enabled"]
+        self._prediction_weight = prediction_config["prediction_reward_weight"]
+        self._prediction_scale = prediction_config["prediction_error_scale_m"]
+        self._prediction_effective = self._prediction_enabled and self._prediction_weight > 0
+        if mode == "baseline" and self._lookahead_time_s is not None:
+            raise ValueError("time preview requires an active lookahead observation mode")
         lateral_config = resolve_lookahead_config({
             "lateral_accel_reward_enabled": lateral_accel_reward_enabled,
             "max_lateral_accel": max_lateral_accel,
@@ -741,6 +766,8 @@ class LookaheadEnv(gym.Wrapper):
         self._read_applied_steering = applied_steering_reader or read_applied_steering
         self._read_dt = dt_reader or simulation_dt_seconds
         self._read_state = state_reader or (
+            partial(read_vehicle_state, require_motion=True)
+            if self._lookahead_time_s is not None else
             partial(read_vehicle_state, require_planar_speed=True)
             if self._lateral_effective else read_vehicle_state
         )
@@ -755,6 +782,8 @@ class LookaheadEnv(gym.Wrapper):
         self._episode_r_base = 0.0
         self._episode_r_pp = 0.0
         self._episode_r_lateral_accel = 0.0
+        self._episode_r_prediction = 0.0
+        self._prediction_metrics = PredictionEpisodeMetrics()
         self._lateral_metrics = LateralEpisodeMetrics()
         self._episode_r_total = 0.0
         self._previous_applied_steering: float | None = None
@@ -792,6 +821,7 @@ class LookaheadEnv(gym.Wrapper):
             "r_base": self._episode_r_base,
             "r_pp": self._episode_r_pp,
             "r_lateral_accel": self._episode_r_lateral_accel,
+            "r_prediction": self._episode_r_prediction,
             "r_total": self._episode_r_total,
         }
 
@@ -799,6 +829,11 @@ class LookaheadEnv(gym.Wrapper):
         value = self._read_state(self.env)
         if not isinstance(value, Mapping):
             raise HostContractError("state_reader must return a mapping")
+        if self._lookahead_time_s is not None:
+            try:
+                MotionState.from_mapping(value)
+            except ValueError as error:
+                raise HostContractError(str(error)) from error
         if self._lateral_effective:
             if value.get("speed_unit", "m/s") != "m/s":
                 raise HostContractError("state_reader speed_m_s requires explicit conversion to m/s")
@@ -837,6 +872,8 @@ class LookaheadEnv(gym.Wrapper):
         # the provider is only read once to produce the shared snapshot.
         if self._preview_provider is not None:
             preview = PreviewState.from_object(self._preview_provider(self.env))
+            if self._prediction_effective and preview.preview_valid and preview.q_xy is None:
+                raise HostContractError("prediction reward requires the shared preview world goal q_xy")
             if self._lateral_effective:
                 reference = preview.lateral_reference
                 if reference is None:
@@ -913,6 +950,59 @@ class LookaheadEnv(gym.Wrapper):
         diagnostic["skip_reason"] = reason
         return diagnostic
 
+    def _prediction_diagnostic(
+        self, pre: PreviewSnapshot | None, post: PreviewSnapshot, *, episode_end: bool
+    ) -> dict[str, object]:
+        preview = post.preview
+        time = self._lookahead_time_s
+        result = PredictionResult()
+        diagnostic: dict[str, object] = {
+            "enabled": self._prediction_enabled,
+            "effective_enabled": self._prediction_effective,
+            "time_s": time,
+            "origin_time_s": post.t_seconds,
+            "target_time_s": None if time is None else post.t_seconds + time,
+            "goal_xy": None if preview is None else preview.q_xy,
+            "preview_invalid_reason": None if preview is None else preview.invalid_reason,
+            "weight": self._prediction_weight,
+            "error_scale_m": self._prediction_scale,
+            "dt_seconds": self._dt_seconds,
+        }
+        if not self._prediction_enabled:
+            result = PredictionResult(skip_reason="disabled")
+        elif not self._prediction_effective:
+            result = PredictionResult(skip_reason="zero_weight")
+        elif pre is None:
+            result = PredictionResult(skip_reason="reset")
+        elif episode_end:
+            result = PredictionResult(skip_reason="episode_end")
+        else:
+            assert time is not None and self._dt_seconds is not None
+            try:
+                result = prediction_penalty(
+                    MotionState.from_mapping(dict(pre.state)),
+                    MotionState.from_mapping(dict(post.state)),
+                    None if preview is None else preview.q_xy,
+                    preview_valid=preview is not None and preview.preview_valid,
+                    time_s=time, dt_seconds=self._dt_seconds,
+                    weight=self._prediction_weight, error_scale_m=self._prediction_scale,
+                )
+            except ValueError as error:
+                raise HostContractError(str(error)) from error
+        diagnostic.update(result.as_dict())
+        return diagnostic
+
+    def _observe_preview_saturation(self, snapshot: PreviewSnapshot) -> None:
+        preview = snapshot.preview
+        if preview is not None:
+            self._prediction_metrics.observe_preview(
+                valid=preview.preview_valid,
+                saturated=preview.preview_valid and (
+                    abs(preview.x_g_m) > NORMALIZATION_DISTANCE_M
+                    or abs(preview.y_g_m) > NORMALIZATION_DISTANCE_M
+                ),
+            )
+
     def _format_observation(
         self,
         raw_observation: object,
@@ -946,6 +1036,7 @@ class LookaheadEnv(gym.Wrapper):
         applied_throttle: float | None,
         previous_applied_action: tuple[float, float] | None,
         lateral_diagnostic: dict[str, object],
+        prediction_diagnostic: dict[str, object],
     ) -> dict[str, object]:
         if not isinstance(info, Mapping):
             raise HostContractError("host reset/step info must be a mapping")
@@ -1066,11 +1157,23 @@ class LookaheadEnv(gym.Wrapper):
             "r_base": r_base,
             "r_pp": r_pp,
             "r_lateral_accel": r_lateral_accel,
+            "r_prediction": prediction_diagnostic["reward"],
             "r_total": r_total,
             "episode_r_base": self._episode_r_base,
             "episode_r_pp": self._episode_r_pp,
             "episode_r_lateral_accel": self._episode_r_lateral_accel,
+            "episode_r_prediction": self._episode_r_prediction,
             "episode_r_total": self._episode_r_total,
+            "prediction": prediction_diagnostic,
+            "prediction_goal_xy": prediction_diagnostic["goal_xy"],
+            "prediction_episode": self._prediction_metrics.as_dict(),
+            "lookahead_time_s": self._lookahead_time_s,
+            "lookahead_mode": "time" if self._lookahead_time_s is not None else "distance",
+            "lookahead_priority": "time_over_distance" if self._lookahead_time_s is not None else "distance",
+            "effective_lookahead_m": (
+                None if post_snapshot.preview is None else
+                dict(post_snapshot.preview.details).get("effective_lookahead_m")
+            ),
             "lateral_accel": lateral_diagnostic,
             "lateral_accel_episode": self._lateral_metrics.as_dict(),
             "state_before": (
@@ -1106,7 +1209,7 @@ class LookaheadEnv(gym.Wrapper):
                 ),
                 "yaw_rate": yaw_rate,
                 "episode_end": bool(terminated or truncated),
-                "lookahead_learning_schema_version": "lookahead_learning.env.v2",
+                "lookahead_learning_schema_version": "lookahead_learning.env.v3",
             }
         )
         # Preserve host-defined task telemetry exactly.  In particular,
@@ -1257,6 +1360,8 @@ class LookaheadEnv(gym.Wrapper):
         self._episode_r_base = 0.0
         self._episode_r_pp = 0.0
         self._episode_r_lateral_accel = 0.0
+        self._episode_r_prediction = 0.0
+        self._prediction_metrics = PredictionEpisodeMetrics()
         self._lateral_metrics = LateralEpisodeMetrics()
         self._episode_r_total = 0.0
         self._previous_applied_steering = None
@@ -1279,6 +1384,7 @@ class LookaheadEnv(gym.Wrapper):
         snapshot = self._make_snapshot(decision=0, time_seconds=0.0)
         self._snapshot = snapshot
         observation = self._format_observation(raw_observation, snapshot)
+        self._observe_preview_saturation(snapshot)
         reset_info = self._namespace_info(
             info,
             action=None,
@@ -1296,11 +1402,12 @@ class LookaheadEnv(gym.Wrapper):
             applied_throttle=None,
             previous_applied_action=None,
             lateral_diagnostic=self._lateral_diagnostic(None, snapshot, episode_end=False),
+            prediction_diagnostic=self._prediction_diagnostic(None, snapshot, episode_end=False),
         )
         return observation, reset_info
 
     def step(self, action: object):
-        """Apply one decision; use pre-action references and post-action speed."""
+        """One host step: preserve PP/lateral timing, predict from post."""
 
         if self._needs_reset or self._snapshot is None:
             raise RuntimeError("LookaheadEnv.step() called before reset or after done")
@@ -1317,6 +1424,10 @@ class LookaheadEnv(gym.Wrapper):
         terminated = _strict_bool(terminated_raw, name="terminated")
         truncated = _strict_bool(truncated_raw, name="truncated")
         r_base = _finite(reward, name="base reward")
+        if (self._prediction_effective and (terminated or truncated)
+                and isinstance(info, Mapping)
+                and any(key in info for key in ("final_observation", "final_obs"))):
+            raise HostContractError("same-step autoreset below LookaheadEnv mixes states; place autoreset outside")
 
         u_applied: float | None = None
         applied_throttle: float | None = None
@@ -1376,15 +1487,24 @@ class LookaheadEnv(gym.Wrapper):
         lateral_diagnostic = self._lateral_diagnostic(
             pre_snapshot, post_snapshot, episode_end=terminated or truncated
         )
+        prediction_diagnostic = self._prediction_diagnostic(
+            pre_snapshot, post_snapshot, episode_end=terminated or truncated
+        )
+        r_prediction = float(prediction_diagnostic["reward"])
         r_lateral_accel = float(lateral_diagnostic["reward"])
         r_total = r_base + r_pp if self._mode == "lookahead_obs_pp_reward" else r_base
         if self._lateral_effective:
             r_total += r_lateral_accel
+        if self._prediction_effective:
+            r_total += r_prediction
+        self._prediction_metrics.observe_reward(prediction_diagnostic, dt)
+        self._observe_preview_saturation(post_snapshot)
         self._lateral_metrics.observe(lateral_diagnostic, dt)
         observation = self._format_observation(raw_observation, post_snapshot)
         self._episode_r_base += r_base
         self._episode_r_pp += r_pp
         self._episode_r_lateral_accel += r_lateral_accel
+        self._episode_r_prediction += r_prediction
         self._episode_r_total += r_total
         self._previous_applied_steering = u_applied
         self._previous_applied_action = (
@@ -1413,9 +1533,11 @@ class LookaheadEnv(gym.Wrapper):
             applied_throttle=applied_throttle,
             previous_applied_action=previous_applied_action,
             lateral_diagnostic=lateral_diagnostic,
+            prediction_diagnostic=prediction_diagnostic,
         )
         returned_reward = (
-            r_total if self._mode == "lookahead_obs_pp_reward" or self._lateral_effective else reward
+            r_total if (self._mode == "lookahead_obs_pp_reward" or self._lateral_effective
+                        or self._prediction_effective) else reward
         )
         return observation, returned_reward, terminated, truncated, step_info
 

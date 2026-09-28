@@ -402,7 +402,10 @@ class ObservationWrapperTests(unittest.TestCase):
         self.assertIsNone(namespace["pp_valid"])
 
     def test_sb3_check_env_accepts_generic_host_wrapper(self) -> None:
-        from stable_baselines3.common.env_checker import check_env
+        try:
+            from stable_baselines3.common.env_checker import check_env
+        except ImportError:
+            self.skipTest("SB3 unavailable; pure/fake-host portability tests remain active")
 
         raw = FakeRawEnv()
         wrapped = LookaheadEnv(
@@ -547,7 +550,10 @@ class ObservationWrapperTests(unittest.TestCase):
         self.assertAlmostEqual(info_b["r_total"], info_a["r_total"] - 0.01)
 
     def test_monitor_episode_return_equals_returned_rewards(self) -> None:
-        from stable_baselines3.common.monitor import Monitor
+        try:
+            from stable_baselines3.common.monitor import Monitor
+        except ImportError:
+            self.skipTest("SB3 unavailable; pure/fake-host portability tests remain active")
 
         raw = FakeRawEnv(terminal_after=2)
         wrapped = LookaheadEnv(
@@ -578,7 +584,10 @@ class ObservationWrapperTests(unittest.TestCase):
         )
 
     def test_vecenv_keeps_terminal_observation_separate_from_autoreset(self) -> None:
-        from stable_baselines3.common.vec_env import DummyVecEnv
+        try:
+            from stable_baselines3.common.vec_env import DummyVecEnv
+        except ImportError:
+            self.skipTest("SB3 unavailable; pure/fake-host portability tests remain active")
 
         raw_holder: list[FakeRawEnv] = []
         provider_holder: list[PreviewProbe] = []

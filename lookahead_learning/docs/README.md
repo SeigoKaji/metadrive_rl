@@ -1,132 +1,133 @@
-# 前方注視を使う強化学習
+# 前方注視の学習拡張
 
-lookahead_learning は、ホストの既存環境を包んで前方注視点の3値と任意の
-Pure Pursuit（PP）不一致ペナルティと、独立に切り替える参照経路の必要横加速度ペナルティを追加するruntimeです。運用時の入口は
-ホスト直下の通常の train.py と evaluate.py です。
+既存hostのraw観測Dに注視点3値を追加する `LookaheadEnv` です。
+今回、時間Tと平面速度で参照点を選ぶ機能1と、post状態からの等速・一定曲率予測位置の誤差を加える機能2を追加しました。
+従来の距離指定、PP、必要横加速度報酬の接続を維持しています。加速度推定・加速度付き予測は含みません。
 
-## 通常の実行
+[設計仕様・数値例・ログの読み方](time_prediction.md) は実装に対応しています。
+別PCへ渡すときは [Copilot用の最初の1本](copilot_porting_prompt.md) と [必要時の接続手順](porting.md) を使います。
 
-同じTOMLを学習と評価へ渡します。移植後の最小例は次のとおりです。
+## 通常train/evaluateで3条件を実行する
 
-~~~bash
-python train.py --config configs/your_experiment.toml
-python evaluate.py --config configs/your_experiment.toml
-~~~
+3つのTOMLは `configs/official_start_lane_return_lookahead.toml` と同じ学習・環境条件を持つ独立した設定です。
+PP重み0、既存必要横加速度報酬Offでそろえ、元設定を上書きしていません。条件ごとに異なる実験名でモデル・出力を分けます。
+時間を使う2条件は同じT=1sです。weight=0.1、scale=1mとともに検証用初期値であり最適値ではありません。
 
-このrepositoryで動作例として使う設定は
-configs/official_start_lane_return_lookahead.toml です。これは参照用のTOMLであり、
-移植先へconfigs/フォルダを丸ごとコピーする前提ではありません。
-必要横加速度の報酬を有効にする例は
-configs/official_start_lane_return_lookahead_lateral_accel.toml です。
+| 条件 | 設定ファイル（rootから） | 実験名 |
+|---|---|---|
+| 従来の距離指定6m | lookahead_learning/examples/distance.toml | lookahead_distance |
+| 機能1のみ | lookahead_learning/examples/time_only.toml | lookahead_time_only |
+| 機能1＋2 | lookahead_learning/examples/time_prediction.toml | lookahead_time_prediction |
 
-既存TOMLに追加する最小設定は次のとおりです。
+hostの既存Python環境で、同じ設定を学習と評価へ渡します。
 
-~~~toml
+```bash
+python train.py --config lookahead_learning/examples/distance.toml
+python evaluate.py --config lookahead_learning/examples/distance.toml
+python train.py --config lookahead_learning/examples/time_only.toml
+python evaluate.py --config lookahead_learning/examples/time_only.toml
+python train.py --config lookahead_learning/examples/time_prediction.toml
+python evaluate.py --config lookahead_learning/examples/time_prediction.toml
+```
+
+上記trainは比較実験を実行するコマンドで、軽量テストではありません（設定の300,000stepを学習します）。
+この変更の検証では長時間学習を実行しません。別PCでは固有の学習・環境条件を保ち、比較用に別名TOMLを作ってください。
+通常出力は `models/<name>.zip`、`outputs/<name>/training/` と `outputs/<name>/evaluation/` です。
+同じ実験名での再実行は既存成果物を更新するため、保持する実験には別名を使います。
+
+## 設定と優先順位
+
+```toml
 [lookahead]
 lookahead_m = 6.0
+lookahead_time_s = 1.0
 pp_weight = 0.0
-~~~
+lateral_accel_reward_enabled = false
+prediction_reward_enabled = true
+prediction_reward_weight = 0.1
+prediction_error_scale_m = 1.0
+```
 
-[lookahead] を省略するとbaselineです。tableがあり pp_weight=0.0ならraw観測へ
-注視点3値を追加し、正のpp_weightなら同じ観測にPP不一致ペナルティも加えます。
-lookahead_mは経路に沿った弧長[m]、pp_weightは追加ペナルティ係数です。raw観測の
-幅Dは移植先hostで決まり、wrapper後はD+3になります。数を合わせるためのpaddingや
-切り捨ては行いません。新項は lateral_accel_reward_enabled=true かつ正の重みで有効になり、省略時はOffです。
-設定例、数式、旧モデル互換は [新項の仕様](lateral_acceleration_reward.md) にあります。
+Tがあれば **時間指定優先** でlookahead_mは未使用です。T省略・予測Offは従来の距離指定です。
+[lookahead]自体を省略すればbaseline D、ありならD+3です。
+予測の実効Onはenabledかつweight>0。Off/重み0は新項を計算・加算しません。
+新項は `-weight * dt * 未クリップ位置誤差[m] / scale[m]`。
+詳細な型・マスク・近似の限界は仕様書にまとめています。
 
-| キー | 検証 | 意味 |
-|---|---|---|
-| lookahead_m | 有限で正、既定6.0 | 経路に沿った注視距離 [m] |
-| pp_weight | 有限で0以上、既定0.0 | PP不一致ペナルティ係数 |
-| lateral_accel_reward_enabled | bool、既定false | 必要横加速度ペナルティの切り替え |
-| max_lateral_accel | 有限で正、既定0.8 | 許容横加速度 [m/s²] |
-| lateral_accel_weight | 有限で0以上、既定0.1 | 必要横加速度ペナルティ係数 |
+モデルはZIP内schema3で実効設定を照合します。旧schema1/2は距離指定・予測Offとして読み取り互換を保ちます。
+同じ観測次元でもTや実効報酬設定が違うモデルは評価できません。時間指定中の未使用lookahead_mは照合対象外です。
 
-checkpoint.py は Python 標準ライブラリだけで動作します。config loaderでは
-次を一度呼びます。
+## 配布するファイル
 
-~~~python
-from lookahead_learning.checkpoint import resolve_lookahead_config
+[PORTABLE_FILES.txt](../PORTABLE_FILES.txt) に、移植元rootからの相対パスで23ファイルを列挙しています。
+パッケージ内の実行コード7本、必要テスト、3設定例、最小文書です。
+モデル・動画・Excel・画像・assets・無関係なレポート・移植元rootの実装は含みません。
+追加の既存解説（methods.md、route_definition.md、pp_derivation.md、lateral_acceleration_reward.md）は元repoに残し、今回の最小配布には含めません。
 
-lookahead_config = resolve_lookahead_config(raw.get("lookahead"))
-~~~
+配布物から移植先の **incoming/lookahead_learning/** へ配置してください。
+実際の稼働フォルダを上書きしてからCopilotへ依頼しないでください。
+同梱テストはmanifestだけを一時コピーし、元rootとMetaDrive/SB3なしで依存閉包を確認します。
 
-学習時は解決済み設定を model.lookahead_config と
-model.lookahead_schema_version=2 としてPPO.save()前にZIPへ保存します。評価時は
-PPO.load()直後に選択TOMLとZIPの設定を照合します。checkpointの属性はZIP内にあり、
-追加ファイルやハッシュ照合をゲートには使いません。注視3値の順序・encoding・
-報酬定義を変更する場合はschema versionを更新してください。旧schema v1は新項Offとして読み取り互換を保ちます。
+導入・更新時に最初に貼る文面:
 
-学習metadataは `outputs/<name>/training/`、評価JSONとstep traceは `outputs/<name>/evaluation/` に保存します。
-model ZIPは `models/<name>.zip` に保存し、`evaluation.output_prefix` は評価ログ名に使います。
-同じ実験名の再実行は同じ成果物ディレクトリを更新します。設定の異なる結果を残す場合は、別の実験名を使います。
-baselineモデルを評価するときは、[lookahead]を省略したTOMLを指定します。
+```text
+incoming/lookahead_learning/docs/copilot_porting_prompt.md を最初に読み、単一エージェントで導入/更新してください。
+実接続から未導入・既存版・独自改変・適用済みを判定し、変更予定ファイルと未コミット差分を先にバックアップしてください。
+既存の観測・報酬・開始車線・host adapter・設定・モデルを保持し、incomingとの差分から不足分だけ適用してください。
+同梱実装を再実装せず、通常train/evaluate/factory/workerと既存metadata helperを再利用し、二重wrapper・D+6・二重加算を防いでください。
+契約不明な接続だけ保留し、適用済みなら検証のみ。軽量テスト・CLI設定読込・可能なら数step smokeを実行し、根拠、バックアップ、変更、未検証事項、今回差分だけの戻し方を報告してください。
+```
 
-## 実装を追う4つの薄いhook
+今回差分の撤去・復元時に貼る文面:
 
-移植先で確認・編集する範囲は、既存rootの config loader、共通env factory、
-train.py、evaluate.py の4つです。
+```text
+今回の時間指定/予測報酬の導入差分だけを撤去してください。まずbranch・HEAD・git statusと適用前バックアップ・適用差分・現在の状態を比較してください。
+元からあったlookahead、独自adapter、既存host接続、既存設定・モデル、利用者の後続変更を残し、今回追加した行/ファイルのうち後続変更と競合しない部分だけ戻してください。
+稼働フォルダ全体の削除、reset --hard、バックアップの無条件復元はしないでください。競合箇所は保留して根拠を報告してください。
+対応する旧設定・旧モデルのmetadata互換とD+3、通常CLI、関連軽量テストを確認し、戻した差分と残った項目を報告してください。
+```
 
-1. **config loader**: configs.experiment_config.select_experiment() が
-   [lookahead]を検証し、ExperimentProfile.lookahead_configにdictまたはNoneを
-   保存します。
-2. **train.py**: profileのlookahead_configを
-   make_training_env(..., lookahead_config=...)へ渡し、PPO.save()前に
-   lookahead_learning.checkpoint.set_lookahead_model_metadata(model, config)を呼びます。
-3. **evaluate.py**: 同じlookahead_configを
-   make_evaluation_env(..., lookahead_config=...)へ渡し、PPO.load()直後に
-   lookahead_learning.checkpoint.validate_lookahead_model_metadata(model, config)を
-   呼びます。reset/stepはwrapperを通し、MetaDrive固有の属性やrenderは
-   env.unwrappedから読みます。
-4. **共通env factory**: raw Envを作ったあと、設定がある場合だけ次の処理を行い、
-   training側の既存factoryがその結果をMonitorで包みます。
+## 軽量検証
 
-   ~~~python
-   from lookahead_learning.adapter import wrap_lookahead_env
-
-   if lookahead_config is not None:
-       raw_env = wrap_lookahead_env(raw_env, **lookahead_config)
-   ~~~
-
-   既存の学習用Monitorはこのwrapperの外側へ置き、評価側にMonitorを新設しません。
-   evaluatorの単一環境はwrapperを直接使います。factoryは既存Envの生成責務を保ち、
-   hostの StartLane系Subclass と LookaheadEnv の順序を変更しません。
-
-adapter.py の MetaDrivePreviewProvider は有効なlookahead全てで使い、
-MetaDrivePPProvider は pp_weight>0 の場合だけ使います。LookaheadEnvは基底環境の
-reset/step返却値を使って追加値を計算し、既存のobservation prefix、報酬、終了条件、
-Action適用経路やreward_functionを再実装・再呼出ししません。
-
-host固有の入力・車両・Navigationの意味と単位はadapterの監査対象です。
-注視座標の観測正規化はruntimeで10mを基準に行いますが、raw prefixの正規化や
-車両単位を推測して変更しません。
-
-## 文書
-
-| 文書 | 内容 |
-|---|---|
-| [観測入力と報酬関数の仕様](methods.md) | 観測の構成、注視点の生成・正規化、PP 参照と追加報酬の定義 |
-| [必要横加速度の追加報酬](lateral_acceleration_reward.md) | 曲率区間、時刻、単位、On/Off、旧モデル互換、数値例と限界 |
-| [移植手順](porting.md) | 必要なruntime、4つの薄いhook、移植後の運用確認 |
-| [GitHub Copilot向け移植プロンプト](copilot_porting_prompt.md) | 小さな移植依頼として貼れる指示文 |
-
-## 配布と確認
-
-本番に必要なのは adapter.py、checkpoint.py、env.py、geometry.py、lateral_acceleration.py、
-__init__.py です。同梱の test_*.py は
-移植後の契約確認用で、本番起動には必要ありません。生成済みモデル、ログ、
-Simulator assets、bytecodeは配布物へ含めません。
-
-テストを同梱した場合の最小確認は次のとおりです。
-
-~~~bash
+```bash
 python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
 python train.py --help
 python evaluate.py --help
-~~~
+```
 
-test_checkpoint.py、test_geometry.py、test_lateral_acceleration.pyは標準ライブラリのみです。
-envのfakeテストとrootの train.py/evaluate.py --help にはホストの依存関係が
-必要です。test_portabilityはフォルダ単独コピーで元rootとMetaDriveのimportを禁止して確認します。
-この確認は短時間の契約・幾何テストで、実simやPPOの長時間学習は
-依存関係を用意した移植先で通常の train.py / evaluate.py を使って別途実行します。
+純粋な設定・幾何・予測テストは標準ライブラリのみです。fake hostはNumPy/Gymnasium、Monitor/VecEnv/ZIP確認は既存SB3を使います。
+依存関係の追加・更新は不要です。テスト時にSB3をimport禁止にした隔離ケースではSB3部分だけskipします。
+hostの通常入口への引数保持はrootの関連テストで別に確認しています。
+
+## 検証記録
+
+2026-09-29、既存 `.venv` (Python 3.12.3) で確認しました。
+
+- 関連pytest: **237 passed、191 subtests passed、1 deselected**。数値・設定・旧schema・fake host・通常CLI設定読込・factory/worker・モデル属性・既存評価ログを含みます。
+- 実SB3の小さな未学習PPOを一時ZIPへ保存/読込みし、schema3と旧schema1属性の互換、旧ZIP非変更を確認しました。利用者のモデルは使用していません。
+- 実SubprocVecEnvの2workerでT/weight/scaleの保持と返却報酬を確認しました。AIへの委譲はありません。
+- PORTABLE_FILESの23ファイルだけを一時コピーし、元root・MetaDrive・SB3禁止でfake hostが成立しました。純粋テストではさらにNumPy/Gymnasiumも禁止しています。SB3固有テストだけ隔離中にskipし、通常pytestでは実行しています。
+- `train.py --help` と `evaluate.py --help` は成功。3設定例の通常CLI読込と学習/環境条件一致もテストしています。
+
+実MetaDriveでは既存assetsの整合を先に確認し、ダウンロードを禁止して、各条件を順番に単一環境・描画なし・seed=5・action=7固定で12stepずつ実行しました。
+実測のraw幅は259、wrapper後は262（D+3）、dt=0.1sでした。時間指定2条件と重み0は同じT=1sです。
+
+| 条件 | 実行step | 予測有効step | 新項合計 |
+|---|---:|---:|---:|
+| 距離6m | 12 | 対象外（Off） | 0 |
+| 時間指定のみ | 12 | 対象外（Off） | 0 |
+| 時間指定＋予測報酬 | 12 | 12 | -2.0798709945e-7 |
+| 時間指定＋enabled=true/weight=0 | 12 | 対象外（重み0） | 0 |
+
+時間指定のみと重み0で、全stepの観測・報酬・終了フラグが一致しました。
+予測Onではpostのqと時刻、未クリップ座標からの報酬再計算、返却reward=r_totalを確認しました。
+この短い直進区間の結果から走行性能・報酬の有効性は評価していません。
+
+再実行したpytestの範囲:
+
+```bash
+python -B -m pytest -q -p no:cacheprovider lookahead_learning tests/test_lookahead_integration.py tests/test_experiment_config.py tests/test_training_ppo_config.py tests/test_evaluation_visualization.py -k 'not one_step_connects_to_metadrive'
+```
+
+描画を伴う既存MetaDrive/GIFテスト1本はこの選択から外し、実環境は上記headless smokeで別に確認しました。
+実描画・GIF生成、長時間学習、学習改善、別PCでの実移植は未検証です。

@@ -172,7 +172,8 @@ PP Off の場合は MetaDrivePPProvider や PP 用の車両・policy 契約を�
 未知キー、文字列の数値、数値としての bool、NaN/Inf を拒否します。
 正規化の唯一の入口は [resolve_lookahead_config](../checkpoint.py) です。
 
-新モデルの ZIP 属性は lookahead_config と lookahead_schema_version=2 です。
+時間指定・予測報酬の追加契約と旧schema1/2互換は [time_prediction.md](time_prediction.md) を参照してください。
+新モデルの ZIP 属性は lookahead_config と lookahead_schema_version=3 です。
 version 1 の2キー旧モデルは新項 Off として読むため、lookahead_m/pp_weight が同一なら
 評価を続けられます。Off 時の上限・重み差は互換性を妨げません。
 enabled=true/weight=0 も実効 Off として互換です。正の重みで On の場合は
@@ -266,7 +267,7 @@ Off へ戻すには lateral_accel_reward_enabled=false とし、その実効設�
 旧 v1 モデルは同じ lookahead_m/pp_weight の Off 設定で評価できます。
 On モデルを Off でそのまま評価すると設定不一致で停止します。受入検証を迂回しないでください。
 
-フォルダ差し替え前には旧 lookahead_learning/ と host 独自変更を別の場所へバックアップしてください。
+更新ファイルは incoming/lookahead_learning/ へ一時配置し、実接続と比較してください。適用前に旧 lookahead_learning/ と host 独自変更・未コミット差分を別の場所へバックアップし、不足差分だけ適用してください。
 **差し替えで既に消えた独自変更は、このプロンプトだけでは復元できません。**
 接続を戻す場合も、バックアップした host ファイル・TOML・対応するモデルを組み合わせます。
 新規移植・差分更新の入口は共通の [copilot_porting_prompt.md](copilot_porting_prompt.md)、

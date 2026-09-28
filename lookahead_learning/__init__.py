@@ -18,10 +18,11 @@ PP項なし、正の値はPP不一致ペナルティも追加します。新し�
 既存ホストの観測生成、reward_function、終了条件、Action適用、車両とNavigationの
 意味はホストとadapterの責務です。PPO保存前に
 ``set_lookahead_model_metadata``、ロード後に
-``validate_lookahead_model_metadata``を呼び、設定とschema version 2をZIP内属性で
-照合します。schema v1の旧モデルは新項Offとして読み取れます。
-詳細は [追加報酬](docs/lateral_acceleration_reward.md)、 [docs/README](docs/README.md)、
+``validate_lookahead_model_metadata``を呼び、設定とschema version 3をZIP内属性で
+照合します。schema v1/2の旧モデルは距離指定・予測報酬Offとして読み取れます。
+時間指定lookahead_time_sと等速予測位置報酬も同じ接続を使います。
+詳細は [時間指定と予測](docs/time_prediction.md)、[追加報酬](docs/lateral_acceleration_reward.md)、 [docs/README](docs/README.md)、
 [移植手順](docs/porting.md)、[仕組みと数式](docs/methods.md) を参照してください。
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
