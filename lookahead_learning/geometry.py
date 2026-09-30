@@ -1317,8 +1317,13 @@ def compute_preview(
     endpoint_tolerance_m: float = DEFAULT_ENDPOINT_TOLERANCE_M,
     ambiguity_tolerance_m: float = DEFAULT_AMBIGUITY_TOLERANCE_M,
     normalization_distance_m: float = NORMALIZATION_DISTANCE_M,
+    projection: Optional[ProjectionResult] = None,
 ) -> PreviewResult:
-    """Compute the common preview point and ``(x_g, y_g, valid)`` values."""
+    """Compute the common preview point and ``(x_g, y_g, valid)`` values.
+
+    A supplied projection must belong to this exact path and point. Providers
+    may reuse it to read a second distance without changing the input preview.
+    """
 
     if not isinstance(path, ReferencePath):
         raise TypeError("path must be a ReferencePath")
@@ -1380,12 +1385,15 @@ def compute_preview(
             forward_speed_mps=speed,
         )
 
-    projection = project_to_path(
-        path,
-        point2,
-        endpoint_tolerance_m=endpoint_tolerance_m,
-        ambiguity_tolerance_m=ambiguity_tolerance_m,
-    )
+    if projection is None:
+        projection = project_to_path(
+            path,
+            point2,
+            endpoint_tolerance_m=endpoint_tolerance_m,
+            ambiguity_tolerance_m=ambiguity_tolerance_m,
+        )
+    elif not isinstance(projection, ProjectionResult):
+        raise TypeError("projection must be a ProjectionResult for this path and point")
     if not projection.valid or projection.s_proj is None:
         return _invalid_preview(
             p=point2,

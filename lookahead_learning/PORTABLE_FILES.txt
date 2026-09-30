@@ -28,3 +28,5 @@ lookahead_learning/docs/copilot_porting_prompt.md
 lookahead_learning/docs/porting.md
 lookahead_learning/docs/time_prediction.md
 lookahead_learning/docs/lateral_acceleration_reward.md
+lookahead_learning/examples/time_prediction_acceleration.toml
+lookahead_learning/examples/time_prediction_acceleration_lateral.toml

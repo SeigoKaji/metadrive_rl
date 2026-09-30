@@ -49,7 +49,7 @@ def test_make_env_wraps_both_raw_host_variants_only_when_config_is_present(
     lookahead = resolve_lookahead_config({
         "lateral_accel_reward_enabled": True, "lookahead_time_s": 1.2,
         "prediction_reward_enabled": True, "prediction_reward_weight": 0.3,
-        "prediction_error_scale_m": 2.0,
+        "prediction_error_scale_m": 2.0, "prediction_motion_model": "constant_acceleration",
     })
     wrapped = env_factory.make_env(
         {"start_lane_objective": "return"},
@@ -122,7 +122,7 @@ def test_stage_factories_forward_the_same_lookahead_config_and_keep_monitor_oute
     lookahead = resolve_lookahead_config({
         "lateral_accel_reward_enabled": True, "lookahead_time_s": 1.2,
         "prediction_reward_enabled": True, "prediction_reward_weight": 0.3,
-        "prediction_error_scale_m": 2.0,
+        "prediction_error_scale_m": 2.0, "prediction_motion_model": "constant_acceleration",
     })
 
     training_env = env_factory.make_training_env(
@@ -152,19 +152,34 @@ def test_portable_examples_use_normal_cli_and_identical_experiment_conditions():
     from evaluate import parse_args as evaluate_args
 
     base = load_experiment_config("configs/official_start_lane_return_lookahead.toml").profile
-    for filename in ("distance.toml", "time_only.toml", "time_prediction.toml", "time_prediction_lateral.toml"):
+    for filename in ("distance.toml", "time_only.toml", "time_prediction.toml", "time_prediction_lateral.toml",
+                     "time_prediction_acceleration.toml", "time_prediction_acceleration_lateral.toml"):
         path = str(Path("lookahead_learning/examples") / filename)
         training = train_args(["--config", path])
         evaluation = evaluate_args(["--config", path])
         config = training.experiment.profile.lookahead_config
         assert config == evaluation.experiment.profile.lookahead_config
         assert config["lookahead_time_s"] == (None if filename == "distance.toml" else 1)
-        assert config["prediction_reward_enabled"] == (filename in ("time_prediction.toml", "time_prediction_lateral.toml"))
+        assert config["prediction_reward_enabled"] == filename.startswith("time_prediction")
+        assert config["prediction_motion_model"] == ("constant_acceleration" if "acceleration" in filename else "constant_speed")
         assert config["pp_weight"] == 0
-        assert config["lateral_accel_reward_enabled"] == (filename == "time_prediction_lateral.toml")
-        if filename == "time_prediction_lateral.toml":
+        assert config["lateral_accel_reward_enabled"] == filename.endswith("_lateral.toml")
+        if filename.endswith("_lateral.toml"):
             old = load_experiment_config("configs/official_start_lane_return_lookahead_lateral_accel.toml").profile.lookahead_config
             for key in ("pp_weight", "lateral_accel_reward_enabled", "max_lateral_accel", "lateral_accel_weight"):
                 assert config[key] == old[key]
         for key in ("train_env_config", "evaluation_env_config", "training_config"):
             assert getattr(training.experiment.profile, key) == getattr(base, key)
+
+
+def test_acceleration_examples_only_change_model_and_output_name():
+    import tomllib
+    from pathlib import Path
+    root = Path('lookahead_learning/examples')
+    for old, new in (('time_prediction', 'time_prediction_acceleration'),
+                     ('time_prediction_lateral', 'time_prediction_acceleration_lateral')):
+        before = tomllib.loads((root / (old + '.toml')).read_text())
+        after = tomllib.loads((root / (new + '.toml')).read_text())
+        assert before.pop('name') != after.pop('name')
+        assert after['lookahead'].pop('prediction_motion_model') == 'constant_acceleration'
+        assert before == after

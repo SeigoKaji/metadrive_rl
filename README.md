@@ -6,9 +6,11 @@ MetaDrive 環境を Stable-Baselines3 の PPO で学習・評価するための�
 
 ## 別PCへlookahead_learningを移植する
 
-配布ZIPをリポジトリ直下の [lookahead_learning_update.zip](lookahead_learning_update.zip) に配置しています。
+配布ZIPをリポジトリ直下の [lookahead_learning_update_acceleration.zip](lookahead_learning_update_acceleration.zip) に配置しています。
 別PCで空の場所へ展開し、出てきた `lookahead_learning_update/` を既存 `lookahead_learning/` の隣に置いてください。
 Copilotには **「lookahead_learning_update/START_HERE.md を読んで実施してください」** と伝えるだけで進められます。
+機能1・2を保持して機能3（等加速度予測）を追加する版です。旧 [lookahead_learning_update.zip](lookahead_learning_update.zip) は機能1・2版としてそのまま保存しています。
+報酬の意味・数式・限界は [報酬解説](lookahead_learning/docs/time_prediction.md)、4条件と併用例の実行方法は [比較手順](lookahead_learning/docs/README.md) にあります。
 依頼の詳細はZIP内のファイルに保存済みです。既存フォルダを上書きせず、バックアップ・不足差分の適用・軽量検証まで指示しています。
 
 ## 環境構築

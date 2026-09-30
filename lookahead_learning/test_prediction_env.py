@@ -333,8 +333,9 @@ class PredictionWrapperTests(unittest.TestCase):
         from .checkpoint import (set_lookahead_model_metadata, validate_lookahead_model_metadata,
                                  CheckpointContractError)
         with tempfile.TemporaryDirectory(prefix='lookahead-zip-') as directory:
-            config = {'lookahead_time_s': 1., 'prediction_reward_enabled': True}
-            env = wrap()
+            config = {'lookahead_time_s': 1., 'prediction_reward_enabled': True,
+                      'prediction_motion_model':'constant_acceleration'}
+            env = wrap(prediction_motion_model='constant_acceleration')
             model = PPO('MlpPolicy', env, n_steps=2, batch_size=2, seed=0,
                         policy_kwargs={'net_arch': [8]}, device='cpu')
             set_lookahead_model_metadata(model, config)
@@ -345,6 +346,17 @@ class PredictionWrapperTests(unittest.TestCase):
             with self.assertRaises(CheckpointContractError):
                 validate_lookahead_model_metadata(loaded, {**config, 'lookahead_time_s': 2})
             env.close()
+            # A real schema3 ZIP is speed mode, and loading never rewrites it.
+            model.lookahead_schema_version = 3
+            model.lookahead_config = {'lookahead_time_s':1., 'prediction_reward_enabled':True}
+            v3_path = Path(directory) / 'legacy-v3.zip'
+            model.save(v3_path)
+            v3_hash = hashlib.sha256(v3_path.read_bytes()).hexdigest()
+            v3 = PPO.load(v3_path, device='cpu')
+            validate_lookahead_model_metadata(v3, model.lookahead_config)
+            with self.assertRaises(CheckpointContractError):
+                validate_lookahead_model_metadata(v3, config)
+            self.assertEqual(hashlib.sha256(v3_path.read_bytes()).hexdigest(), v3_hash)
             old_env = wrap_lookahead_env(MotionHost())
             old_model = PPO('MlpPolicy', old_env, n_steps=2, batch_size=2, seed=0,
                             policy_kwargs={'net_arch': [8]}, device='cpu')
@@ -366,6 +378,7 @@ class PredictionWrapperTests(unittest.TestCase):
             self.skipTest('SB3 unavailable; pure/fake-host portability tests remain active')
         from functools import partial
         config = {'lookahead_time_s': 1.2, 'prediction_reward_enabled': True,
+                  'prediction_motion_model': 'constant_acceleration',
                   'prediction_reward_weight': 0.3, 'prediction_error_scale_m': 2.}
         # Worker processes are deterministic test runners, not AI agents.
         vec = SubprocVecEnv([partial(wrap_lookahead_env, MotionHost(offset=1), **config)
@@ -379,6 +392,7 @@ class PredictionWrapperTests(unittest.TestCase):
                 self.assertEqual(data['lookahead_time_s'], 1.2)
                 self.assertEqual(data['effective_lookahead_m'], 12)
                 self.assertEqual(data['prediction']['weight'], 0.3)
+                self.assertEqual(data['prediction']['motion_model'], 'constant_acceleration')
                 self.assertEqual(data['prediction']['error_scale_m'], 2)
         finally:
             vec.close()
@@ -424,6 +438,235 @@ class PredictionWrapperTests(unittest.TestCase):
         self.assertEqual((chain.reset_calls, chain.step_calls, raw.reset_calls, raw.step_calls), (1, 1, 1, 1))
         with self.assertRaisesRegex(HostContractError, 'already connected'):
             wrap(env)
+
+
+
+class AccelerationWrapperTests(unittest.TestCase):
+    def accelerated(self, raw=None, **kwargs):
+        return wrap(raw, prediction_motion_model='constant_acceleration', **kwargs)
+
+    def test_accelerating_decelerating_straight_and_unclipped_offset(self):
+        for pre_speed in (9.8, 10., 10.2):
+            for offset in (0, 1, -1, 12):
+                env = self.accelerated(MotionHost(offset=offset, velocities=((pre_speed,0),(10,0))))
+                env.reset(seed=42)
+                obs, reward, _, _, info = env.step(4)
+                data = info['lookahead_learning']; pred=data['prediction']
+                self.assertTrue(pred['valid'])
+                self.assertEqual(pred['motion_model'], 'constant_acceleration')
+                self.assertEqual(data['q'], (10 + pre_speed,0))
+                self.assertEqual(data['post_step']['preview']['q_xy'], [21,0])
+                self.assertEqual(data['effective_lookahead_m'],10)
+                self.assertEqual(data['prediction_goal_xy'],pred['goal_xy'])
+                self.assertAlmostEqual(pred['error_m'],abs(offset))
+                self.assertAlmostEqual(pred['goal_xy'][0],11+pred['distance_m'])
+                self.assertAlmostEqual(pred['acceleration_mps2'],(10-pre_speed)/.1)
+                self.assertAlmostEqual(reward,2-.01*abs(offset))
+                self.assertAlmostEqual(pred['reward'],-pred['weight']*pred['dt_seconds']*
+                                       math.dist(pred['predicted_xy'],pred['goal_xy'])/pred['error_scale_m'])
+                self.assertEqual(obs.shape,(10,))
+                json.dumps(info,allow_nan=False)
+                env.close()
+
+    def test_independent_distance_validity_and_common_invalidity(self):
+        for pre_speed, length, obs_valid, reward_valid in ((9.8,21.5,1,False),(10.2,20.5,0,True)):
+            env=self.accelerated(MotionHost(offset=1,velocities=((pre_speed,0),(10,0)),length=length))
+            env.reset()
+            obs,reward,_,_,info=env.step(4)
+            data=info['lookahead_learning']; pred=data['prediction']
+            self.assertEqual(obs[-1],obs_valid)
+            self.assertEqual(pred['valid'],reward_valid)
+            self.assertAlmostEqual(reward,1.99 if reward_valid else 2)
+            if not reward_valid:
+                self.assertEqual(pred['reference_invalid_reason'],'lookahead_past_route_end')
+                self.assertEqual(data['prediction_episode']['reason_seconds'],
+                                 {'reward_reference_invalid:lookahead_past_route_end':.1})
+            env.close()
+        for change,reason in (
+            (lambda raw:setattr(raw.vehicle.navigation,'checkpoints',('X','Y')),'navigation_route_changed'),
+            (lambda raw:setattr(raw.vehicle.navigation,'current_ref_lanes',[]),'start_lane_unavailable'),
+        ):
+            env=self.accelerated(MotionHost(velocities=((10.2,0),(10,0))))
+            env.reset(); change(env.env)
+            obs,reward,_,_,info=env.step(4)
+            self.assertEqual(obs[-1],0)
+            self.assertEqual(reward,2)
+            self.assertEqual(info['lookahead_learning']['prediction']['reference_invalid_reason'],reason)
+            env.close()
+
+    def test_current_low_speed_reverse_and_history_masks_keep_input_flag(self):
+        for raw, reason in ((MotionHost(speed=.1), 'low_speed'),
+                            (MotionHost(velocities=((-0.01,10),)), 'reverse_motion')):
+            env=self.accelerated(raw); env.reset()
+            obs,reward,_,_,info=env.step(4)
+            self.assertEqual(obs[-1],1); self.assertEqual(reward,2)
+            self.assertEqual(info['lookahead_learning']['prediction']['skip_reason'],reason)
+            env.close()
+        env=self.accelerated(); env.env.config['physics_world_step_size']=1e-7
+        env.reset(); result=env.step(4)
+        self.assertEqual(result[0][-1],1)
+        self.assertEqual(result[4]['lookahead_learning']['prediction']['skip_reason'],'insufficient_history_distance')
+        env.close()
+
+    def test_future_stop_scores_stop_position_at_original_target_time(self):
+        env=self.accelerated(MotionHost(offset=1,velocities=((10.2,0),(10,0)),length=50),lookahead_time_s=7)
+        env.reset(); obs,reward,_,_,info=env.step(4)
+        data=info['lookahead_learning']; pred=data['prediction']
+        self.assertTrue(pred['valid']); self.assertTrue(pred['stopped'])
+        self.assertAlmostEqual(pred['distance_m'],25)
+        self.assertAlmostEqual(pred['stop_time_s'],5)
+        self.assertEqual(pred['end_speed_mps'],0)
+        self.assertAlmostEqual(pred['target_time_s'],7.1)
+        self.assertAlmostEqual(pred['goal_xy'][0],36)
+        self.assertAlmostEqual(reward,1.99)
+        self.assertEqual(obs[-1],0)  # input point still at 70m, outside the route
+        env.close()
+
+    def test_shared_projection_no_extra_snapshot_or_host_reads_and_wrong_post_rejected(self):
+        from .geometry import project_to_path
+        from .prediction import MotionState
+        from dataclasses import replace
+        env=self.accelerated(MotionHost(velocities=((10.2,0),(10,0))))
+        provider=env._preview_provider
+        with patch.object(provider,'_read_preview',wraps=provider._read_preview) as preview_calls, \
+             patch('lookahead_learning.geometry.project_to_path',wraps=project_to_path) as projections:
+            env.reset(); env.step(4)
+            self.assertEqual(preview_calls.call_count,2)
+            self.assertEqual(projections.call_count,2)
+        snapshot=env.last_snapshot
+        post=MotionState.from_mapping(dict(snapshot.state))
+        with patch('lookahead_learning.adapter.read_vehicle_state',side_effect=AssertionError('extra host read')):
+            a=provider.reference_at_distance(post,distance_m=9)
+            b=provider.reference_at_distance(post,distance_m=9)
+        self.assertEqual(a,b); self.assertIs(snapshot,env.last_snapshot)
+        self.assertEqual(provider.lookahead_time_s,1)
+        with self.assertRaises(HostContractError):
+            provider.reference_at_distance(replace(post,position_xy=(0,0)),distance_m=9)
+        self.assertEqual((env.env.reset_calls,env.env.step_calls),(1,1))
+        env.close()
+
+    def test_old_provider_only_needs_new_api_when_acceleration_effective(self):
+        class OldProvider:
+            def __init__(self): self.provider=MetaDrivePreviewProvider(lookahead_time_s=1)
+            def reset(self,env): self.provider.reset(env)
+            def __call__(self,env): return self.provider(env)
+        for model,enabled,weight in (('constant_speed',True,.1),('constant_acceleration',False,.1),
+                                     ('constant_acceleration',True,0)):
+            raw=MotionHost()
+            env=LookaheadEnv(raw,mode='lookahead_obs',contract=_contract(raw),preview_provider=OldProvider(),
+                lookahead_time_s=1,prediction_motion_model=model,prediction_reward_enabled=enabled,
+                prediction_reward_weight=weight)
+            env.reset(); env.step(4); env.close()
+        raw=MotionHost()
+        with self.assertRaisesRegex(HostContractError,'reference_at_distance'):
+            LookaheadEnv(raw,mode='lookahead_obs',contract=_contract(raw),preview_provider=OldProvider(),
+                lookahead_time_s=1,prediction_motion_model='constant_acceleration',prediction_reward_enabled=True)
+        self.assertEqual((raw.reset_calls,raw.step_calls),(0,0))
+
+    def test_off_zero_and_zero_acceleration_equal_legacy_observations_rewards_rng(self):
+        cases=[{}, {'prediction_motion_model':'constant_speed'},
+               {'prediction_motion_model':'constant_acceleration'}]
+        for mode in ('active','off','zero','distance'):
+            configs=[]
+            for extra in cases:
+                config={'lookahead_time_s':1,'prediction_reward_enabled':True,**extra}
+                if mode=='off': config['prediction_reward_enabled']=False
+                if mode=='zero': config['prediction_reward_weight']=0
+                if mode=='distance': config.update(lookahead_time_s=None,prediction_reward_enabled=False)
+                configs.append(config)
+            envs=[wrap_lookahead_env(MotionHost(offset=1,headings=(0,.02,.04,.03)),**config) for config in configs]
+            for env in envs: env.reset(seed=321)
+            for action in (4,5,3):
+                results=[env.step(action) for env in envs]
+                for result in results:
+                    np.testing.assert_array_equal(result[0],results[0][0])
+                    self.assertEqual(result[1:4],results[0][1:4])
+                if mode=='active':
+                    p=results[0][4]['lookahead_learning']['prediction']
+                    a=results[2][4]['lookahead_learning']['prediction']
+                    for key in ('goal_xy','distance_m','predicted_xy','reward','kappa_hat_inv_m'):
+                        self.assertEqual(a[key],p[key])
+            rng=[env.env.np_random.random() for env in envs]
+            self.assertEqual(rng,[rng[0]]*len(rng))
+            for env in envs: env.close()
+        with patch('lookahead_learning.prediction.estimate_acceleration',side_effect=AssertionError('Off acceleration')), \
+             patch.object(MetaDrivePreviewProvider,'reference_at_distance',side_effect=AssertionError('Off reference')):
+            for enabled,weight in ((False,.1),(True,0)):
+                env=self.accelerated(prediction_reward_enabled=enabled,prediction_reward_weight=weight)
+                env.reset(); pred=env.step(4)[4]['lookahead_learning']['prediction']
+                self.assertIsNone(pred['acceleration_mps2']); self.assertIsNone(pred['goal_xy']); env.close()
+
+    def test_reset_terminal_masks_and_monitor_use_selected_reward(self):
+        for ending in ('terminal_after','truncated_after'):
+            env=self.accelerated(MotionHost(offset=1,velocities=((10.2,0),(10,0)),**{ending:2}))
+            env.reset(); self.assertAlmostEqual(env.step(4)[1],1.99)
+            pred=env.step(4)[4]['lookahead_learning']['prediction']
+            self.assertEqual(pred['skip_reason'],'episode_end'); self.assertIsNone(pred['acceleration_mps2'])
+            env.env.velocities=((5,0),(5,0))
+            reset=env.reset()[1]['lookahead_learning']
+            self.assertEqual(reset['episode_r_prediction'],0)
+            self.assertIsNone(reset['prediction']['acceleration_mps2'])
+            self.assertEqual(env.step(4)[4]['lookahead_learning']['prediction']['acceleration_mps2'],0)
+            env.close()
+        try:
+            from stable_baselines3.common.monitor import Monitor
+            from stable_baselines3.common.vec_env import DummyVecEnv
+        except ImportError:
+            self.skipTest('SB3 unavailable; pure/fake-host portability tests remain active')
+        envs=[self.accelerated(MotionHost(offset=i,velocities=((10.2,0),(10,0)),terminal_after=2)) for i in (1,2)]
+        vec=DummyVecEnv([lambda env=env:Monitor(env) for env in envs])
+        try:
+            vec.reset(); _,rewards,_,_=vec.step(np.array([4,4]))
+            np.testing.assert_allclose(rewards,(1.99,1.98))
+            _,_,dones,infos=vec.step(np.array([4,4]))
+            self.assertTrue(all(dones))
+            for i,info in enumerate(infos):
+                self.assertAlmostEqual(info['episode']['r'],4-.01*(i+1))
+                self.assertEqual(envs[i].last_snapshot.decision,0)
+        finally: vec.close()
+
+    def test_curved_centerline_matches_analytic_acceleration_prediction(self):
+        from .test_geometry import CircularLane
+        for sign in (-1,1):
+            for a in (-2,2):
+                radius=50.; vpre=10-a*.1; ds=.5*(vpre+10)*.1
+                lane=CircularLane((0,0),radius,0,1.5,direction=sign)
+                lane.index=('A','B',0)
+                headings=(lane.heading_theta_at(5),lane.heading_theta_at(5+ds))
+                velocities=tuple((v*math.cos(h),v*math.sin(h)) for v,h in zip((vpre,10),headings))
+                raw=MotionHost(headings=headings,velocities=velocities,
+                               positions=(lane.position(5,0),lane.position(5+ds,0)))
+                raw.vehicle.navigation=FakeNavigation(('A','B'),{'A':{'B':[lane]}})
+                env=self.accelerated(raw); env.reset()
+                p=env.step(4)[4]['lookahead_learning']['prediction']
+                self.assertTrue(p['valid']); self.assertAlmostEqual(p['error_m'],0,places=10)
+                self.assertAlmostEqual(p['kappa_hat_inv_m'],sign/radius)
+                self.assertAlmostEqual(p['alpha_rad'],sign*(10+.5*a)/radius)
+                env.close()
+
+    def test_pp_and_lateral_intervals_unchanged_under_deceleration(self):
+        from .lateral_acceleration import LateralReference
+        from .test_env import PPProbe
+        class Provider(MetaDrivePreviewProvider):
+            def __call__(self,host):
+                result=dict(super().__call__(host))
+                result['lateral_reference']=LateralReference(True,result['s_proj_m'],result['s_goal_m'],.02)
+                return result
+        results=[]
+        for model in ('constant_speed','constant_acceleration'):
+            raw=MotionHost(offset=1,headings=(0,.03),velocities=((10.2,0),(10*math.cos(.03),10*math.sin(.03))))
+            env=LookaheadEnv(raw,mode='lookahead_obs_pp_reward',contract=_contract(raw),
+                preview_provider=Provider(lookahead_time_s=1),pp_provider=PPProbe(),pp_weight=1,
+                lookahead_time_s=1,prediction_reward_enabled=True,prediction_motion_model=model,
+                lateral_accel_reward_enabled=True,max_lateral_accel=1.2,lateral_accel_weight=.07)
+            env.reset(seed=42); results.append(env.step(4)); env.close()
+        before,after=[r[4]['lookahead_learning'] for r in results]
+        for key in ('r_base','r_pp','r_lateral_accel','lateral_accel','q','S_proj','post_step'):
+            self.assertEqual(before[key],after[key])
+        self.assertLess(after['r_lateral_accel'],0)
+        self.assertNotEqual(before['r_prediction'],after['r_prediction'])
+        self.assertAlmostEqual(results[1][1]-results[0][1],after['r_prediction']-before['r_prediction'])
+        self.assertAlmostEqual(results[1][1],sum(after[k] for k in ('r_base','r_pp','r_lateral_accel','r_prediction')))
 
 
 if __name__ == '__main__':

@@ -67,12 +67,18 @@ class PackageCopyTests(unittest.TestCase):
         self.assertEqual(len(paths), len(set(paths)))
         with tempfile.TemporaryDirectory(prefix='lookahead-port-') as directory:
             copied = Path(directory) / 'lookahead_learning'
+            archive = create_archive(Path(directory) / 'delivery.zip')
+            with zipfile.ZipFile(archive) as bundle:
+                self.assertIsNone(bundle.testzip())
+                bundle.extractall(Path(directory) / 'incoming')
+            incoming = Path(directory) / 'incoming' / STAGING_DIRECTORY
             for name in paths:
                 relative = Path(name)
                 self.assertEqual(relative.parts[0], 'lookahead_learning')
                 self.assertNotIn('..', relative.parts)
                 self.assertIn(relative.suffix, ('.py', '.md', '.toml', '.txt'))
-                source = package.parent / relative
+                source = incoming.joinpath(*relative.parts[1:])
+                self.assertEqual(source.read_bytes(), (package.parent / relative).read_bytes())
                 destination = Path(directory) / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)

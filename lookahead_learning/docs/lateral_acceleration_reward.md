@@ -175,12 +175,13 @@ PP Off の場合は MetaDrivePPProvider や PP 用の車両・policy 契約を�
 未知キー、文字列の数値、数値としての bool、NaN/Inf を拒否します。
 正規化の唯一の入口は [resolve_lookahead_config](../checkpoint.py) です。
 
-時間指定・予測報酬の追加契約と旧schema1/2互換は [time_prediction.md](time_prediction.md) を参照してください。
-新モデルの ZIP 属性は lookahead_config と lookahead_schema_version=3 です。
+時間指定・予測報酬の追加契約と旧schema1/2/3互換は [time_prediction.md](time_prediction.md) を参照してください。
+新モデルの ZIP 属性は lookahead_config と lookahead_schema_version=4 です。
 version 1 の2キー旧モデルは時間指定なし・横加速度報酬Off・予測報酬Offとして読むため、
 同じモードでlookahead_m/pp_weightが同一なら評価を続けられます。Off 時の上限・重み差は互換性を妨げません。
 enabled=true/weight=0 も実効 Off として互換です。正の重みで On の場合は
 上限・重み・On/Off を含む実効設定の一致が必要で、旧モデルを On で学習済み扱いにはしません。
+旧schema3はconstant_speedとして読み取ります。実効Onの予測方式は一致が必要です。
 未知 schema、baseline/active の不一致は拒否します。
 検証はモデルを変更せず、旧 ZIP の上書き、sidecar、追加ハッシュ管理はしません。
 TOML root の既存 schema_version とモデルの lookahead_schema_version は別の契約です。

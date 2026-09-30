@@ -24,7 +24,7 @@ import numpy as np
 from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
 from .geometry import NORMALIZATION_DISTANCE_M, normalize_preview_value
 from .lateral_acceleration import LateralReference, finite_real, planar_speed_mps
-from .prediction import MotionState, time_lookahead_distance
+from .prediction import MotionState, PredictionReference, time_lookahead_distance
 
 if TYPE_CHECKING:
     from .env import LookaheadEnv
@@ -1244,6 +1244,8 @@ class MetaDrivePreviewProvider:
         self._episode_key: object = None
         self._target_ordinal: int | None = None
         self._target_ordinal_persistent = False
+        self._reference_preview: Mapping[str, object] | None = None
+        self._reference_projection = None
 
     def reset(self, env: object) -> None:
         """Rebuild route state exactly once after the raw environment reset."""
@@ -1253,6 +1255,8 @@ class MetaDrivePreviewProvider:
         self._episode_key = None
         self._target_ordinal = None
         self._target_ordinal_persistent = False
+        self._reference_preview = None
+        self._reference_projection = None
         vehicle = get_single_agent(env)
         target_ordinal, persistent = _target_ordinal_after_reset(env, vehicle)
         self._target_ordinal = target_ordinal
@@ -1290,7 +1294,50 @@ class MetaDrivePreviewProvider:
             ),
         }
 
+    def reference_at_distance(self, post: MotionState, *, distance_m: float) -> PredictionReference:
+        """Read a reward goal using the last ordinary preview's fixed route.
+
+        Called only for effective constant-acceleration prediction. No host API
+        reads, route search, provider setting changes or snapshot updates occur.
+        Common invalidity stays invalid; distance-dependent checks run anew.
+        """
+        from .geometry import compute_preview
+
+        distance = finite_real(distance_m, "reward reference distance")
+        if distance < 0:
+            raise ValueError("reward reference distance must be non-negative")
+        preview = self._reference_preview
+        if preview is None:
+            raise HostContractError("reference_at_distance requires an ordinary post preview first")
+        reason = preview.get("invalid_reason")
+        distance_reasons = {"lookahead_past_route_end", "lookahead_past_unvalidated_boundary",
+                            "goal_not_in_front", "goal_distance_too_small"}
+        if not preview["preview_valid"] and reason not in distance_reasons:
+            return PredictionReference(False, invalid_reason=reason)
+        details = preview["details"]
+        if (tuple(details["p_xy"]) != post.position_xy or details["psi_rad"] != post.heading_rad):
+            raise HostContractError("reward reference and cached preview must share the same post state")
+        if self._route is None or self._reference_projection is None:
+            raise HostContractError("reward reference requires the saved route and post projection")
+        result = compute_preview(
+            self._route.path, post.position_xy, post.heading_rad,
+            lookahead_m=distance, forward_speed_mps=post.forward_speed_mps,
+            projection=self._reference_projection,
+        )
+        if result.reason in {"nonfinite_vehicle_geometry", "nonfinite_projection_geometry",
+                             "projection_geometry_error", "goal_geometry_unavailable"}:
+            raise HostContractError(f"invalid reward reference geometry contract: {result.reason}")
+        return PredictionReference(bool(result.valid), result.q, result.s_proj,
+                                   result.s_goal, None if result.valid else result.reason)
+
     def __call__(self, env: object) -> Mapping[str, object]:
+        self._reference_preview = None
+        self._reference_projection = None
+        result = self._read_preview(env)
+        self._reference_preview = result
+        return result
+
+    def _read_preview(self, env: object) -> Mapping[str, object]:
         from .geometry import compute_preview
 
         state = read_vehicle_state(
@@ -1381,6 +1428,7 @@ class MetaDrivePreviewProvider:
             forward_speed_mps=speed,
             start_lane_valid=start_lane_valid,
         )
+        self._reference_projection = result.projection
         if self.lookahead_time_s is not None and result.reason in {
             "nonfinite_vehicle_geometry", "nonfinite_projection_geometry",
             "projection_geometry_error", "goal_geometry_unavailable",
@@ -1524,6 +1572,7 @@ def wrap_lookahead_env(
     prediction_reward_enabled: bool = LOOKAHEAD_DEFAULTS["prediction_reward_enabled"],
     prediction_reward_weight: float = LOOKAHEAD_DEFAULTS["prediction_reward_weight"],
     prediction_error_scale_m: float = LOOKAHEAD_DEFAULTS["prediction_error_scale_m"],
+    prediction_motion_model: str = LOOKAHEAD_DEFAULTS["prediction_motion_model"],
     lateral_accel_reward_enabled: bool = LOOKAHEAD_DEFAULTS["lateral_accel_reward_enabled"],
     max_lateral_accel: float = LOOKAHEAD_DEFAULTS["max_lateral_accel"],
     lateral_accel_weight: float = LOOKAHEAD_DEFAULTS["lateral_accel_weight"],
@@ -1545,6 +1594,7 @@ def wrap_lookahead_env(
         "prediction_reward_enabled": prediction_reward_enabled,
         "prediction_reward_weight": prediction_reward_weight,
         "prediction_error_scale_m": prediction_error_scale_m,
+        "prediction_motion_model": prediction_motion_model,
         "lateral_accel_reward_enabled": lateral_accel_reward_enabled,
         "max_lateral_accel": max_lateral_accel,
         "lateral_accel_weight": lateral_accel_weight,
@@ -1575,6 +1625,7 @@ def wrap_lookahead_env(
         prediction_reward_enabled=config["prediction_reward_enabled"],
         prediction_reward_weight=config["prediction_reward_weight"],
         prediction_error_scale_m=config["prediction_error_scale_m"],
+        prediction_motion_model=config["prediction_motion_model"],
         lateral_accel_reward_enabled=config["lateral_accel_reward_enabled"],
         max_lateral_accel=config["max_lateral_accel"],
         lateral_accel_weight=config["lateral_accel_weight"],

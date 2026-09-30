@@ -650,6 +650,8 @@ class LookaheadEnv(gym.Wrapper):
         prediction_reward_enabled: Opt in to post-origin position prediction.
         prediction_reward_weight: Non-negative coefficient; zero skips prediction.
         prediction_error_scale_m: Positive metre scale for the unnormalized error.
+        prediction_motion_model: constant_speed (default) or constant_acceleration.
+            The latter requires preview_provider.reference_at_distance(post, distance_m=...).
         lateral_accel_reward_enabled: Opt in to the route lateral-demand term.
         max_lateral_accel: Positive allowable reference demand in m/s².
         lateral_accel_weight: Non-negative coefficient; zero preserves the old
@@ -671,6 +673,7 @@ class LookaheadEnv(gym.Wrapper):
         prediction_reward_enabled: bool = LOOKAHEAD_DEFAULTS["prediction_reward_enabled"],
         prediction_reward_weight: float = LOOKAHEAD_DEFAULTS["prediction_reward_weight"],
         prediction_error_scale_m: float = LOOKAHEAD_DEFAULTS["prediction_error_scale_m"],
+        prediction_motion_model: str = LOOKAHEAD_DEFAULTS["prediction_motion_model"],
         lateral_accel_reward_enabled: bool = LOOKAHEAD_DEFAULTS["lateral_accel_reward_enabled"],
         max_lateral_accel: float = LOOKAHEAD_DEFAULTS["max_lateral_accel"],
         lateral_accel_weight: float = LOOKAHEAD_DEFAULTS["lateral_accel_weight"],
@@ -691,13 +694,20 @@ class LookaheadEnv(gym.Wrapper):
             "prediction_reward_enabled": prediction_reward_enabled,
             "prediction_reward_weight": prediction_reward_weight,
             "prediction_error_scale_m": prediction_error_scale_m,
+            "prediction_motion_model": prediction_motion_model,
         })
         assert prediction_config is not None
         self._lookahead_time_s = prediction_config["lookahead_time_s"]
         self._prediction_enabled = prediction_config["prediction_reward_enabled"]
         self._prediction_weight = prediction_config["prediction_reward_weight"]
         self._prediction_scale = prediction_config["prediction_error_scale_m"]
+        self._prediction_motion_model = prediction_config["prediction_motion_model"]
         self._prediction_effective = self._prediction_enabled and self._prediction_weight > 0
+        self._prediction_reference_reader = None
+        if self._prediction_effective and self._prediction_motion_model == "constant_acceleration":
+            self._prediction_reference_reader = getattr(preview_provider, "reference_at_distance", None)
+            if not callable(self._prediction_reference_reader):
+                raise HostContractError("constant_acceleration requires preview_provider.reference_at_distance(post, distance_m=...)")
         if mode == "baseline" and self._lookahead_time_s is not None:
             raise ValueError("time preview requires an active lookahead observation mode")
         lateral_config = resolve_lookahead_config({
@@ -959,9 +969,10 @@ class LookaheadEnv(gym.Wrapper):
         diagnostic: dict[str, object] = {
             "enabled": self._prediction_enabled,
             "effective_enabled": self._prediction_effective,
+            "motion_model": self._prediction_motion_model,
             "time_s": time,
             "origin_time_s": post.t_seconds,
-            "target_time_s": None if time is None else post.t_seconds + time,
+            "target_time_s": None if time is None else _finite(post.t_seconds + time, name="prediction target time"),
             "goal_xy": None if preview is None else preview.q_xy,
             "preview_invalid_reason": None if preview is None else preview.invalid_reason,
             "weight": self._prediction_weight,
@@ -979,17 +990,25 @@ class LookaheadEnv(gym.Wrapper):
         else:
             assert time is not None and self._dt_seconds is not None
             try:
+                post_motion = MotionState.from_mapping(dict(post.state))
                 result = prediction_penalty(
-                    MotionState.from_mapping(dict(pre.state)),
-                    MotionState.from_mapping(dict(post.state)),
+                    MotionState.from_mapping(dict(pre.state)), post_motion,
                     None if preview is None else preview.q_xy,
                     preview_valid=preview is not None and preview.preview_valid,
                     time_s=time, dt_seconds=self._dt_seconds,
                     weight=self._prediction_weight, error_scale_m=self._prediction_scale,
+                    motion_model=self._prediction_motion_model,
+                    reference_at_distance=(None if self._prediction_reference_reader is None else
+                        lambda distance: self._prediction_reference_reader(post_motion, distance_m=distance)),
                 )
             except ValueError as error:
                 raise HostContractError(str(error)) from error
         diagnostic.update(result.as_dict())
+        if self._prediction_motion_model == "constant_speed" and preview is not None:
+            # Keep the legacy diagnostic point even on reset/invalid transitions.
+            diagnostic.update(goal_xy=preview.q_xy, s_proj_m=preview.s_proj_m,
+                              s_goal_m=preview.s_goal_m, reference_valid=preview.preview_valid,
+                              reference_invalid_reason=preview.invalid_reason)
         return diagnostic
 
     def _observe_preview_saturation(self, snapshot: PreviewSnapshot) -> None:

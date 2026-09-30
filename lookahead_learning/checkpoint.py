@@ -23,6 +23,7 @@ class LookaheadConfig(TypedDict):
     lookahead_m: float
     lookahead_time_s: float | None
     prediction_reward_enabled: bool
+    prediction_motion_model: str
     prediction_reward_weight: float
     prediction_error_scale_m: float
     pp_weight: float
@@ -35,6 +36,7 @@ LOOKAHEAD_DEFAULTS: LookaheadConfig = {
     "lookahead_m": 6.0,
     "lookahead_time_s": None,
     "prediction_reward_enabled": False,
+    "prediction_motion_model": "constant_speed",
     "prediction_reward_weight": 0.1,
     "prediction_error_scale_m": 1.0,
     "pp_weight": 0.0,
@@ -44,7 +46,8 @@ LOOKAHEAD_DEFAULTS: LookaheadConfig = {
 }
 """Resolved defaults used whenever an explicit ``[lookahead]`` table exists."""
 
-LOOKAHEAD_MODEL_SCHEMA_VERSION = 3
+PREDICTION_MOTION_MODELS = ("constant_speed", "constant_acceleration")
+LOOKAHEAD_MODEL_SCHEMA_VERSION = 4
 LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE = "lookahead_config"
 LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE = "lookahead_schema_version"
 _LOOKAHEAD_KEYS = frozenset(LOOKAHEAD_DEFAULTS)
@@ -106,12 +109,16 @@ def resolve_lookahead_config(value: object) -> LookaheadConfig | None:
     prediction_enabled = value.get("prediction_reward_enabled", False)
     if type(prediction_enabled) is not bool:
         raise ValueError("lookahead.prediction_reward_enabled: boolで指定してください")
+    motion_model = value.get("prediction_motion_model", "constant_speed")
+    if not isinstance(motion_model, str) or motion_model not in PREDICTION_MOTION_MODELS:
+        raise ValueError("lookahead.prediction_motion_model: constant_speed / constant_accelerationで指定してください")
     time = value.get("lookahead_time_s")
     resolved: LookaheadConfig = {
         "lookahead_time_s": None if time is None else _lookahead_real(
             time, key="lookahead_time_s", minimum=0.0, minimum_inclusive=False,
         ),
         "prediction_reward_enabled": prediction_enabled,
+        "prediction_motion_model": motion_model,
         "prediction_reward_weight": _lookahead_real(
             value.get("prediction_reward_weight", LOOKAHEAD_DEFAULTS["prediction_reward_weight"]),
             key="prediction_reward_weight", minimum=0.0, minimum_inclusive=True,
@@ -172,7 +179,7 @@ def validate_lookahead_model_metadata(
     model: object,
     expected: Mapping[str, object] | None,
 ) -> None:
-    """Compare effective settings; v1/v2 mean distance and prediction Off.
+    """Compare effective settings; v1/v2 mean distance/Off, v3 constant speed.
 
     Validation never mutates a loaded model.  Off/zero-weight lateral settings
     ignore their inactive limit/weight, but active reward settings must match.
@@ -181,7 +188,7 @@ def validate_lookahead_model_metadata(
 
     actual = getattr(model, LOOKAHEAD_MODEL_CONFIG_ATTRIBUTE, _MISSING)
     schema = getattr(model, LOOKAHEAD_MODEL_SCHEMA_ATTRIBUTE, _MISSING)
-    if schema is not _MISSING and (type(schema) is not int or schema not in (1, 2, 3)):
+    if schema is not _MISSING and (type(schema) is not int or schema not in (1, 2, 3, 4)):
         raise CheckpointContractError(f"unsupported lookahead schema metadata: {schema!r}")
     if schema is not _MISSING and actual is _MISSING:
         raise CheckpointContractError("incomplete lookahead schema metadata: config is missing")
@@ -216,6 +223,8 @@ def validate_lookahead_model_metadata(
                           "max_lateral_accel", "lateral_accel_weight"}
     ):
         raise CheckpointContractError("schema v2 requires legacy distance/lateral settings")
+    if schema == 3 and "prediction_motion_model" in actual:
+        raise CheckpointContractError("schema v3 cannot contain prediction_motion_model; it means constant_speed")
     try:
         actual_config = resolve_lookahead_config(actual)
     except ValueError as error:
@@ -238,6 +247,7 @@ def _effective_settings(config: LookaheadConfig) -> tuple[object, ...]:
         config["max_lateral_accel"] if active else None,
         config["lateral_accel_weight"] if active else None,
         prediction,
+        config["prediction_motion_model"] if prediction else None,
         config["prediction_reward_weight"] if prediction else None,
         config["prediction_error_scale_m"] if prediction else None,
     )

@@ -1,25 +1,27 @@
 # 前方注視の学習拡張
 
 既存hostのraw観測Dに注視点3値を追加する `LookaheadEnv` です。
-今回、時間Tと平面速度で参照点を選ぶ機能1と、post状態からの等速・一定曲率予測位置の誤差を加える機能2を追加しました。
-従来の距離指定、PP、必要横加速度報酬の接続を維持しています。加速度推定・加速度付き予測は含みません。
+時間Tと平面速度で参照点を選ぶ機能1、等速・一定曲率の位置報酬（機能2）を維持し、今回1step差分の等加速度・一定曲率予測（機能3）を追加しました。
+従来の距離指定、PP、必要横加速度報酬の接続を維持しています。入力はD+3のまま、位置項は等速／等加速度の選択方式を1回だけ加算します。
 
 [設計仕様・数値例・ログの読み方](time_prediction.md) は実装に対応しています。
 別PCへ渡すときは配布フォルダ直下の [START_HERE.md](../START_HERE.md) をCopilotへ読ませて実施を依頼します。詳細な [移植指示](copilot_porting_prompt.md) と [接続手順](porting.md) も同梱しています。
 
 ## 通常train/evaluateで比較・併用する
 
-比較用の最初の3つのTOMLは `configs/official_start_lane_return_lookahead.toml` と同じ学習・環境条件を持つ独立した設定です。
+4比較条件のTOMLは `configs/official_start_lane_return_lookahead.toml` と同じ学習・環境条件を持つ独立した設定です。
 PP重み0、既存必要横加速度報酬Offでそろえ、元設定を上書きしていません。条件ごとに異なる実験名でモデル・出力を分けます。
-この3条件で横加速度報酬をOffにしているのは機能1・2を分けて比較するためで、移植先の既存報酬をOffにする指示ではありません。
+この4条件で横加速度報酬をOffにしているのは機能1・2・3を分けて比較するためで、移植先の既存報酬をOffにする指示ではありません。
 時間を使う設定例は同じT=1sです。weight=0.1、scale=1mとともに検証用初期値であり最適値ではありません。
 
 | 条件 | 設定ファイル（rootから） | 実験名 |
 |---|---|---|
-| 従来の距離指定6m | lookahead_learning/examples/distance.toml | lookahead_distance |
-| 機能1のみ | lookahead_learning/examples/time_only.toml | lookahead_time_only |
-| 機能1＋2 | lookahead_learning/examples/time_prediction.toml | lookahead_time_prediction |
+| 距離指定6m | lookahead_learning/examples/distance.toml | lookahead_distance |
+| 時間指定のみ（機能1） | lookahead_learning/examples/time_only.toml | lookahead_time_only |
+| 時間＋等速報酬（機能1＋2） | lookahead_learning/examples/time_prediction.toml | lookahead_time_prediction |
+| 時間＋等加速度報酬（機能1＋3） | lookahead_learning/examples/time_prediction_acceleration.toml | lookahead_time_prediction_acceleration |
 | 既存横加速度報酬＋機能1＋2 | lookahead_learning/examples/time_prediction_lateral.toml | lookahead_time_prediction_lateral |
+| 既存横加速度報酬＋機能1＋3 | lookahead_learning/examples/time_prediction_acceleration_lateral.toml | lookahead_time_prediction_acceleration_lateral |
 
 hostの既存Python環境で、同じ設定を学習と評価へ渡します。
 
@@ -30,6 +32,10 @@ python train.py --config lookahead_learning/examples/time_only.toml
 python evaluate.py --config lookahead_learning/examples/time_only.toml
 python train.py --config lookahead_learning/examples/time_prediction.toml
 python evaluate.py --config lookahead_learning/examples/time_prediction.toml
+python train.py --config lookahead_learning/examples/time_prediction_acceleration.toml
+python evaluate.py --config lookahead_learning/examples/time_prediction_acceleration.toml
+python train.py --config lookahead_learning/examples/time_prediction_acceleration_lateral.toml
+python evaluate.py --config lookahead_learning/examples/time_prediction_acceleration_lateral.toml
 python train.py --config lookahead_learning/examples/time_prediction_lateral.toml
 python evaluate.py --config lookahead_learning/examples/time_prediction_lateral.toml
 ```
@@ -51,6 +57,7 @@ lateral_accel_reward_enabled = true
 max_lateral_accel = 0.8
 lateral_accel_weight = 0.1
 prediction_reward_enabled = true
+prediction_motion_model = "constant_acceleration"  # 省略は等速版constant_speed
 prediction_reward_weight = 0.1
 prediction_error_scale_m = 1.0
 ```
@@ -61,7 +68,8 @@ Tがあれば **時間指定優先** でlookahead_mは未使用です。T省略�
 新項は `-weight * dt * 未クリップ位置誤差[m] / scale[m]`。
 詳細な型・マスク・近似の限界は仕様書にまとめています。
 
-モデルはZIP内schema3で実効設定を照合します。旧schema1/2は距離指定・予測Offとして読み取り互換を保ちます。
+モデルはZIP内schema4で実効設定を照合します。旧schema1/2は距離指定・予測Off、旧schema3はconstant_speedとして読み取り互換を保ちます。
+新キーは方式の1個だけです。Off時も型を検証し、実効Onでは方式が一致するモデルだけを許します。TOML rootのschema_version=2は変えません。
 同じ観測次元でもTや実効報酬設定が違うモデルは評価できません。時間指定中の未使用lookahead_mは照合対象外です。
 
 ## 既存の横加速度報酬へ予測項を追加する
@@ -73,23 +81,23 @@ Tがあれば **時間指定優先** でlookahead_mは未使用です。T省略�
 r_total = r_base + r_pp + r_lateral_accel + r_prediction
 ```
 
-併用例は既存 `official_start_lane_return_lookahead_lateral_accel.toml` の横加速度設定を保持して、新4キーを加えた独立TOMLです。
+併用例は既存の横加速度設定を保持した独立TOMLです。等加速度併用例はtime_prediction_lateral.tomlから方式・実験名だけを変えています。
 移植先では例の上限・重みを上書き適用せず、使用中の `lateral_accel_reward_enabled`、`max_lateral_accel`、`lateral_accel_weight`、PP設定を保ちます。
 横加速度項が独自hostのreward_functionに既に含まれる場合は、それをr_baseの一部として残し、wrapper側にも同じ項を追加しません。
 時間指定への切替えでは共有previewの参照距離がL=vTになるため、横加速度項の参照区間も変わります。式・上限・重み・pre区間/post速度の時刻契約は維持します。
 
 ## 配布するファイル
 
-[PORTABLE_FILES.txt](../PORTABLE_FILES.txt) に、移植元rootからの相対パスで27ファイルを列挙しています。
-実行コード7本、標準ライブラリだけの配布ツール、必要テスト、4設定例、最小文書です。
+[PORTABLE_FILES.txt](../PORTABLE_FILES.txt) に、移植元rootからの相対パスで29ファイルを列挙しています。
+実行コード7本、標準ライブラリだけの配布ツール、必要テスト、6設定例、最小文書です。
 モデル・動画・Excel・画像・assets・無関係なレポート・移植元rootの実装は含みません。
 既存横加速度の仕様も配布します。追加の既存解説（methods.md、route_definition.md、pp_derivation.md）は元repoに残し、今回の最小配布には含めません。
 
-配布済みZIPは移植元リポジトリ直下の `lookahead_learning_update.zip` です。そのZIPだけを別PCへ運べます。
+配布済みZIPは移植元リポジトリ直下の `lookahead_learning_update_acceleration.zip` です。そのZIPだけを別PCへ運べます。
 更新版を再生成する場合は次を使います（出力先は未作成のファイルを指定します）。
 
 ```bash
-python -B -m lookahead_learning.pack --output /tmp/lookahead_learning_update.zip
+python -B -m lookahead_learning.pack --output /tmp/lookahead_learning_update_acceleration.zip
 ```
 
 ZIPの最上位は **lookahead_learning_update/** だけです。展開先で既存のlookahead_learning/と並べて配置します。
@@ -113,13 +121,22 @@ manifestのlookahead_learning/は適用先の論理パスです。pack.pyはそ�
 テストで、ZIPの展開が既存adapter・報酬コード・未コミットファイルを変更しないことと、元root・MetaDrive/SB3なしの依存閉包を確認します。
 
 導入・更新時は、Copilotに **「lookahead_learning_update/START_HERE.md を読んで実施してください」** と伝えてください。
-長い依頼文のコピーは不要です。START_HERE.mdから詳細指示を読み、比較・バックアップ・不足差分の適用・軽量検証・報告まで進めます。
+そのまま貼れる詳細な導入・更新依頼文:
+
+```text
+lookahead_learning_update/START_HERE.md を読んで実施してください。まず実接続と差分から導入状況を判定し、変更前のファイルと未コミット差分をバックアップしてください。
+既存の機能1・2、独自adapter・観測・開始車線参照・基礎報酬・横加速度の式と設定、実運用設定・モデルを保持し、機能3の不足差分だけ適用してください。
+フォルダ全体を置換せず、通常のconfig/factory/worker/metadata/ログ接続を再利用してください。適用済みなら検証だけ行ってください。
+関連unittest、通常CLIの設定読込、可能なら既存assetsで数stepのsmokeを行い、契約未確認や競合の箇所だけ保留してください。変更・検証結果・バックアップ先・今回差分だけの復元方法を報告してください。
+```
+
+最短の1文だけでも実施できます。START_HERE.mdから詳細指示を読み、比較・バックアップ・不足差分の適用・軽量検証・報告まで進めます。
 
 今回差分の撤去・復元時に貼る文面:
 
 ```text
-今回の時間指定/予測報酬の導入差分だけを撤去してください。まずbranch・HEAD・git statusと適用前バックアップ・適用差分・現在の状態を比較してください。
-元からあったlookahead、独自adapter、既存host接続、既存設定・モデル、利用者の後続変更を残し、今回追加した行/ファイルのうち後続変更と競合しない部分だけ戻してください。
+今回の機能3（等加速度予測）追加差分だけを撤去してください。まずbranch・HEAD・git statusと適用前バックアップ・適用差分・現在の状態を比較してください。
+元からあった機能1・2、lookahead、独自adapter、既存host接続、既存設定・モデル、利用者の後続変更を残し、今回追加した行/ファイルのうち後続変更と競合しない部分だけ戻してください。
 稼働フォルダ全体の削除、reset --hard、バックアップの無条件復元はしないでください。競合箇所は保留して根拠を報告してください。
 対応する旧設定・旧モデルのmetadata互換とD+3、通常CLI、関連軽量テストを確認し、戻した差分と残った項目を報告してください。
 ```
@@ -137,6 +154,45 @@ python evaluate.py --help
 hostの通常入口への引数保持はrootの関連テストで別に確認しています。
 
 ## 検証記録
+
+機能3追加時（2026-09-30）、既存 `.venv` / Python 3.12.3で確認:
+
+- 変更前: 関連unittest **114件成功**。読取専用サンドボックスでの一時ファイル作成エラー5件は、権限付きの再実行で解消しました。
+- 変更後: パッケージunittest **130件成功**、rootの設定・通常train/evaluate・factory/worker・metadata・評価出力のpytest **132件成功、描画を伴う1件を選択除外**。
+- 変更前に保存した4条件（等速／時間Off／重み0／距離）の同一seed・action列と比較し、既存ログ項目・観測・報酬・終了フラグ・次の乱数が一致しました。
+- 加速度0の両方式一致、停止後25m固定、左右円弧、±π跨ぎ、独立valid、共通invalid、PP・非ゼロ横加速度との単一加算を確認しました。
+- 通常環境で実SB3のMonitor/DummyVecEnv/SubprocVecEnv、schema4の小さな未学習PPO保存・読込み、旧schema1/3実ZIPの非変更・互換確認を実行しました。純粋関数はNumPy/Gymnasium/MetaDrive/SB3を禁止しても実行でき、fake host隔離ではSB3関連だけskipします。
+- `train.py --help` / `evaluate.py --help`、6設定例の通常CLI読込み、比較ペアが方式・実験名以外で同じことを確認しました。
+- 配布テストはmanifestからZIPを作って空の場所へ展開し、その内容だけを別の模擬hostへ配置して依存閉包・純粋関数・fake hostを検証します。配布フォルダ自体はruntime import/PYTHONPATHへ追加しません。
+
+```bash
+python -B -m unittest discover -s lookahead_learning -t . -p 'test_*.py'
+python -B -m pytest -q -p no:cacheprovider tests/test_lookahead_integration.py tests/test_experiment_config.py tests/test_training_ppo_config.py tests/test_evaluation_visualization.py -k 'not one_step_connects_to_metadrive'
+python -B train.py --help
+python -B evaluate.py --help
+```
+
+実MetaDrive 0.4.3の既存assets版一致を確認し、download呼出しを禁止して、通常factoryから単一環境を順番に生成しました。
+描画なし、seed=5、action=7を8step、action=1を4step（加速後に制動）、各条件12stepです。
+全条件でraw幅259→262、dt=0.1sでした。
+
+| 条件 | step | 予測有効step | 位置報酬合計 | 未来停止を採点したstep |
+|---|---:|---:|---:|---:|
+| 距離指定 | 12 | 0（Off） | 0 | 0 |
+| 時間指定のみ | 12 | 0（Off） | 0 | 0 |
+| 時間＋等速 | 12 | 9 | −8.1905910e−8 | 0 |
+| 時間＋等加速度 | 12 | 9 | −4.0537024e−7 | 1 |
+| 時間＋等加速度・weight0 | 12 | 0（重み0） | 0 | 0 |
+| 時間＋等速＋横加速度 | 12 | 9 | −8.1905910e−8 | 0 |
+| 時間＋等加速度＋横加速度 | 12 | 9 | −4.0537024e−7 | 1 |
+
+等加速度推定の範囲は約−15.2162〜+2.9675m/s²で、クリップしていません。
+等速／等加速度のペアで入力・終了・r_base/r_pp/r_lateral_accel・snapshotが同一、返却報酬差が選択した位置項の差だけであること、
+各位置報酬をログ座標・dt・係数から再計算できることを確認しました。時間指定のみ／機能3重み0は報酬も同一です。
+この実環境の短い区間では横加速度項は0であり、非ゼロでの併用はfake hostで別に検証しています。
+長時間学習、学習改善、実描画/GIF、別PCでの実移植は未検証です。
+
+以下は機能1・2と旧配布物についての過去の記録です。
 
 別フォルダ配布・横加速度併用の追加確認（コミット3c34c1b、2026-09-29）:
 
