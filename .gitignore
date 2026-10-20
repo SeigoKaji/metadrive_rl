@@ -34,3 +34,6 @@ panda3d-log.txt
 /CODE_WALKTHROUGH.md
 /LEARNING_INVESTIGATION.md
 /REWARD_COST_SOURCE_TRACE.md
+
+# Claude Code local settings (personal, do not version)
+.claude/settings.local.json
