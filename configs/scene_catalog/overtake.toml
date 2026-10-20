@@ -1,0 +1,61 @@
+# 追い越しシーンの比較カタログ。
+#   .venv/bin/python tools/scene_catalog.py configs/scene_catalog/overtake.toml
+# 自車をMetaDrive付属のIDMPolicy（車線変更あり）で走らせ、GIFを出力する。
+# 「車線変更」は同じ道路区間内でレーン番号が変わった回数。区間境界での変更は含まない。
+# 0でも追い越しがなかったとは断定できない。直線は画像の横幅を抑えるためSSSにする。
+
+[settings]
+seeds = { start = 0, count = 8 }
+scaling = 5.0
+ego_policy = "idm"
+max_steps = 800
+render_every = 3
+trail_frames = 15                  # GIFが見づらくならないよう、軌跡は直近だけ残す
+gif = true
+
+[base]
+horizon = 1000
+random_spawn_lane_index = false
+random_traffic = false             # 交通配置もseedで固定する
+accident_prob = 0
+log_level = 50
+
+# 2車線の直線。交通車両は自車が近づいてから動き出す（MetaDrive既定のtrigger）。
+[[variants]]
+name = "lane2_trigger"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, traffic_density = 0.15, traffic_mode = "trigger" }
+
+# 3車線の直線。
+[[variants]]
+name = "lane3_trigger"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 3 }, traffic_density = 0.2, traffic_mode = "trigger" }
+
+# 3車線で交通が密。
+[[variants]]
+name = "lane3_dense"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 3 }, traffic_density = 0.35, traffic_mode = "trigger" }
+
+# 2車線で、交通車両が最初から走っている。
+[[variants]]
+name = "lane2_respawn"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, traffic_density = 0.2, traffic_mode = "respawn" }
+
+# 3車線で、交通車両が最初から走っている。
+[[variants]]
+name = "lane3_respawn"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 3 }, traffic_density = 0.2, traffic_mode = "respawn" }
+
+# 2車線で故障車・コーン・バリアなどを確率配置。配置先や種類はseedで変わる。
+[[variants]]
+name = "lane2_accident"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, traffic_density = 0.05, traffic_mode = "trigger", accident_prob = 0.8 }
+
+# 3車線で故障車・コーン・バリアなどを確率配置。配置先や種類はseedで変わる。
+[[variants]]
+name = "lane3_accident"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 3 }, traffic_density = 0.05, traffic_mode = "trigger", accident_prob = 0.8 }
+
+# カーブを含む2車線での追い越し。
+[[variants]]
+name = "curve_lane2"
+env = { map_config = { type = "block_sequence", config = "SCSC", lane_num = 2 }, traffic_density = 0.15, traffic_mode = "trigger" }

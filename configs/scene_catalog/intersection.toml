@@ -1,0 +1,52 @@
+# 交差点シーンの比較カタログ。
+#   .venv/bin/python tools/scene_catalog.py configs/scene_catalog/intersection.toml
+# 交差点のどの出口へ進むかもseedで決まる。index.html の「正味の旋回角」がその経路の旋回角で、
+# +90前後が左折、-90前後が右折（画像と照合済み）。複数交差点では左右の角度が相殺される。
+# 角度は区間ごとに-180〜180度へ正規化するため、ラウンドアバウトの総回転量とは異なりうる。
+# 自車はIDMPolicyで走らせ、最終フレームに走行軌跡を残す。
+
+[settings]
+seeds = { start = 0, count = 12 }
+scaling = 5.0
+ego_policy = "idm"
+max_steps = 800
+render_every = 5
+gif = false
+
+[base]
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0
+accident_prob = 0
+log_level = 50
+
+# 十字路。
+[[variants]]
+name = "cross"
+env = { map = "SXS" }
+
+# T字路。
+[[variants]]
+name = "t_junction"
+env = { map = "STS" }
+
+# ラウンドアバウト。
+[[variants]]
+name = "roundabout"
+env = { map = "SOS" }
+
+# 十字路が2つ続く。最後が交差点なので、ゴールの出口もseedで変わる。
+[[variants]]
+name = "cross_twice"
+env = { map = "SXSX" }
+
+# 2車線の十字路。
+[[variants]]
+name = "cross_lane2"
+env = { map_config = { type = "block_sequence", config = "SXS", lane_num = 2 } }
+
+# 交通車両ありの十字路。動きを見るためGIFも出す。
+[[variants]]
+name = "cross_traffic"
+env = { map = "SXS", traffic_density = 0.15, random_traffic = false }
+settings = { gif = true, render_every = 3, trail_frames = 15 }

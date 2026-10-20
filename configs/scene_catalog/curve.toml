@@ -1,0 +1,46 @@
+# カーブシーンの比較カタログ。
+#   .venv/bin/python tools/scene_catalog.py configs/scene_catalog/curve.toml
+# カーブの半径・角度・向きは map の文字列ではなく seed から抽選される。
+# 各variantを同じseed範囲で描画し、ブロック列と車線構成の違いを比較する。
+# 自車はMetaDrive付属のIDMPolicyで走らせ、最終フレームに走行軌跡を残す。
+
+[settings]
+seeds = { start = 0, count = 12 }  # 公式サンプルのseed 5を含む
+scaling = 5.0                      # 全画像で共通の縮尺 [px/m]
+ego_policy = "idm"                 # "idm" | "idle"（自車を停止させたまま）
+max_steps = 800
+render_every = 5
+gif = false
+
+# 全variant共通のMetaDrive設定。
+[base]
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0
+accident_prob = 0
+log_level = 50
+
+# 公式サンプルと同じ単一カーブ（seed 5が現在の学習シーン）。
+[[variants]]
+name = "C"
+env = { map = "C" }
+
+# 単一カーブで2車線。
+[[variants]]
+name = "C_lane2"
+env = { map_config = { type = "block_sequence", config = "C", lane_num = 2 } }
+
+# 連続カーブ（同じ向きならより大きな旋回、逆向きならS字）。
+[[variants]]
+name = "CC"
+env = { map = "CC" }
+
+# 直線を挟んだ2つのカーブ。
+[[variants]]
+name = "CSC"
+env = { map = "CSC" }
+
+# 3連続カーブ。
+[[variants]]
+name = "CCC"
+env = { map = "CCC" }

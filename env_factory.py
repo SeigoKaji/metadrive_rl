@@ -32,7 +32,11 @@ def make_env(
     # supplied ``off`` still needs this subclass so MetaDrive's closed config
     # schema recognizes the project-local key while retaining upstream runtime
     # reward/done behavior.
-    if "start_lane_objective" in config:
+    if "lead_vehicles" in config:
+        from lead_vehicle_env import LeadVehicleMetaDriveEnv
+
+        raw_env = LeadVehicleMetaDriveEnv(config)
+    elif "start_lane_objective" in config:
         # The custom task stays project-local so the installed/vendored
         # MetaDrive implementation remains byte-for-byte untouched.
         from start_lane_env import StartLaneMetaDriveEnv

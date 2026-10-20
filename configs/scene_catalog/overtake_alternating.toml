@@ -1,0 +1,40 @@
+# 2車線で0→1→0と戻り、別車線にいる前方2台を順に追い越す比較。
+#   bash run_scene_catalogs.sh alternating
+#   .venv/bin/python tools/scene_catalog.py configs/scene_catalog/overtake_alternating.toml
+# seed0では1台目がlane0の30m先、2台目がlane1の80m先または100m先に配置される。
+# lane="random"の抽選結果を選んだ例であり、他のseedでも同じ配置になる保証はない。
+# stoppedは故障車役の速度0の物理車両。故障フラグやバリア、コーンは付けない。
+
+[settings]
+seeds = { start = 0, count = 1 }
+scaling = 5.0
+ego_policy = "idm"
+max_steps = 800
+render_every = 3
+trail_frames = 15
+gif = true
+
+[base]
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0
+accident_prob = 0
+log_level = 50
+
+# 同じ速度で走る2台を、車線を変えて1台ずつ追い越す。
+[[variants]]
+name = "moving_d30_g50"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [2, 2], distance_m = [30, 30], gap_m = [50, 50], speed_kmh = [12, 12], lane = "random" } }
+
+[[variants]]
+name = "moving_d30_g70"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [2, 2], distance_m = [30, 30], gap_m = [70, 70], speed_kmh = [12, 12], lane = "random" } }
+
+# 停止車2台を同じ配置に置き、左右へ切り返して通過する。
+[[variants]]
+name = "stopped_d30_g50"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [2, 2], distance_m = [30, 30], gap_m = [50, 50], speed_kmh = [0, 0], lane = "random" } }
+
+[[variants]]
+name = "stopped_d30_g70"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [2, 2], distance_m = [30, 30], gap_m = [70, 70], speed_kmh = [0, 0], lane = "random" } }

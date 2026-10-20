@@ -1,0 +1,84 @@
+# 遅い先行車の追い越しシーンの比較カタログ。
+#   .venv/bin/python tools/scene_catalog.py configs/scene_catalog/overtake_slow_lead.toml
+# MetaDriveの通常の交通（traffic_density）は使わず、自車の前方に遅い車を1〜3台だけ置く。
+# 台数・距離・配置車線はseedで決まるため、seedごとに違うシーンになる。
+# 走行中の車間を保つため、比較用速度は12 km/h（very_slowは5 km/h）に固定する。
+# 自車はIDMPolicyで走らせ、遅い先行車に追いついたときに車線変更して抜けるかをGIFで確認する。
+#
+# lead_vehicles の書き方（すべて [最小, 最大] の範囲。両端を含む）:
+#   count      先行車の台数 [台]（整数）
+#   distance_m 自車から1台目までの距離 [m]（車線に沿った距離）
+#   gap_m      先行車どうしの間隔 [m]（2台目以降。1台なら使わない）
+#   speed_kmh  各先行車の速度 [km/h]（1台ずつ抽選）
+#   lane       "ego"（全台を自車と同じ車線に置く）| "random"（1台ずつ同方向の車線から抽選）
+
+[settings]
+seeds = { start = 0, count = 8 }
+scaling = 5.0
+ego_policy = "idm"
+max_steps = 800
+render_every = 3
+trail_frames = 15
+gif = true
+
+[base]
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0                # 通常の交通は使わない。先行車だけにする
+accident_prob = 0
+log_level = 50
+
+# 2車線、同じ車線に遅い車が1台。最も基本的な追い越し。
+[[variants]]
+name = "lane2_one"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [1, 1], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" } }
+
+# 2車線、同じ車線に遅い車が2台続く。
+[[variants]]
+name = "lane2_two"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [2, 2], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" } }
+
+# 2車線、1〜2台。台数もseedで変わる。
+[[variants]]
+name = "lane2_one_or_two"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [1, 2], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" } }
+
+# 2車線、先行車がかなり遅い（ほぼ停止に近い）。
+[[variants]]
+name = "lane2_very_slow"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [1, 2], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [5, 5], lane = "ego" } }
+
+# 2車線、2台の車線をseedで抽選。両車線がふさがり、抜けずに追従するシーンも出る。
+[[variants]]
+name = "lane2_random_lane"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [2, 2], distance_m = [30, 60], gap_m = [10, 40], speed_kmh = [12, 12], lane = "random" } }
+
+# 2車線、1台の車線をseedで抽選。
+[[variants]]
+name = "lane2_random_one"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [1, 1], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "random" } }
+
+# 2車線、1〜2台の台数と各車の車線をseedで抽選。
+[[variants]]
+name = "lane2_random_one_or_two"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }, lead_vehicles = { count = [1, 2], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "random" } }
+
+# 3車線、1〜2台。
+[[variants]]
+name = "lane3_one_or_two"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 3 }, lead_vehicles = { count = [1, 2], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" } }
+
+# 3車線、2台の車線を各車ごとにseedで抽選。
+[[variants]]
+name = "lane3_random_two"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 3 }, lead_vehicles = { count = [2, 2], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "random" } }
+
+# 3車線、3台の車線を各車ごとにseedで抽選。同じ車線に複数台が入ることもある。
+[[variants]]
+name = "lane3_random_three"
+env = { map_config = { type = "block_sequence", config = "SSS", lane_num = 3 }, lead_vehicles = { count = [3, 3], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "random" } }
+
+# 2車線、カーブを含む道での追い越し。
+[[variants]]
+name = "lane2_curve"
+env = { map_config = { type = "block_sequence", config = "SCS", lane_num = 2 }, lead_vehicles = { count = [1, 2], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" } }
