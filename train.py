@@ -294,6 +294,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     ppo_config = _resolved_ppo_config(args, training_config)
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
+    scenario_seeds = environment_config.get("scenario_seeds")
     training_output_dir = _training_output_directory(experiment.name)
     tensorboard_log_dir = TENSORBOARD_LOG_DIR / experiment.name
 
@@ -338,6 +339,8 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         # reject same-shaped checkpoints made with different lookahead values.
         set_lookahead_model_metadata(model, lookahead_config)
         actual_device = str(model.device)
+        if scenario_seeds is not None:
+            print(f"scenario_seeds={list(scenario_seeds)}")
         print(
             "training_start",
             {
@@ -442,10 +445,29 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "device": reload_device,
             },
         }
+        if scenario_seeds is not None:
+            worker_counts = train_env.get_attr("scenario_reset_counts")
+            metadata["training"].update({
+                "scenario_seeds": list(scenario_seeds),
+                "scenario_reset_counts": {
+                    str(seed): sum(counts[seed] for counts in worker_counts)
+                    for seed in scenario_seeds
+                },
+                "scenario_sampling_note": (
+                    "Each reset samples scenario_seeds with worker-local random.Random(rl_seed + rank); "
+                    "counts include automatic resets after terminal steps, not completed episode counts"
+                ),
+                "scenario_sampling_reproducible_from_rl_seed": True,
+            })
+            print("scenario_sampling", {
+                key: metadata["training"][key]
+                for key in ("scenario_seeds", "scenario_reset_counts")
+            })
         if experiment.name == "official":
             # Keep official baseline metadata available to existing consumers.
             metadata["official_environment_config"] = dict(environment_config)
-            metadata["training"]["scenario_seed"] = scenario_start
+            if scenario_seeds is None or len(scenario_seeds) == 1:
+                metadata["training"]["scenario_seed"] = scenario_start
         _write_json(metadata_path, metadata)
         print(f"model_saved={model_path} size_bytes={model_size} sha256={model_sha256}")
         print(f"model_reload_verified=True metadata={metadata_path}")

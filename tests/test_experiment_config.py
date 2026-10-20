@@ -77,6 +77,36 @@ def _write_config(tmp_path: Path, text: str = VALID_TOML) -> Path:
     return path
 
 
+@pytest.mark.parametrize("seeds", [[2, 5, 11], [5, 0, 3], [0]])
+def test_loader_derives_scenario_bounds_and_keeps_list_order(tmp_path, seeds):
+    text = VALID_TOML.replace("start_seed = 100\nnum_scenarios = 10", f"scenario_seeds = {seeds}")
+    text = text.replace("start_seed = 0\nnum_scenarios = 2", f"scenario_seeds = {seeds[::-1]}")
+    profile = load_experiment_config(_write_config(tmp_path, text)).profile
+    for environment, expected in [(profile.train_env_config, seeds),
+                                  (profile.evaluation_env_config, seeds[::-1])]:
+        assert environment["scenario_seeds"] == expected
+        assert environment["start_seed"] == min(seeds)
+        assert environment["num_scenarios"] == max(seeds) - min(seeds) + 1
+
+
+def test_scenario_lists_inherit_common_settings_and_override_by_stage(tmp_path):
+    text = VALID_TOML.replace('map = "C"', 'map = "C"\nscenario_seeds = [2, 5, 11]')
+    text = text.replace("start_seed = 100\nnum_scenarios = 10", "")
+    text = text.replace("start_seed = 0\nnum_scenarios = 2", "scenario_seeds = [11, 2]")
+    profile = load_experiment_config(_write_config(tmp_path, text)).profile
+    assert profile.train_env_config["scenario_seeds"] == [2, 5, 11]
+    assert profile.evaluation_env_config["scenario_seeds"] == [11, 2]
+    assert profile.train_env_config["num_scenarios"] == 10
+    assert profile.evaluation_env_config["num_scenarios"] == 10
+
+
+@pytest.mark.parametrize("value", ["[]", "[true, 2]", "[1.5, 2]", "[2, 2]", "[-1, 2]", "2", '"2,5"'])
+def test_loader_rejects_invalid_scenario_seed_lists(tmp_path, value):
+    text = VALID_TOML.replace("start_seed = 100\nnum_scenarios = 10", f"scenario_seeds = {value}")
+    with pytest.raises(ExperimentConfigError, match="scenario_seeds"):
+        load_experiment_config(_write_config(tmp_path, text))
+
+
 @pytest.mark.parametrize("profile_name", PROFILE_NAMES)
 def test_profile_aliases_resolve_to_canonical_toml_with_source_hash(
     profile_name: str,

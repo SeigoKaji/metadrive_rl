@@ -48,7 +48,7 @@ class _CheckEnvFixedScenarioAdapter(gym.Wrapper):
     MetaDrive 0.4.3は``reset(seed=...)``をGymnasiumの乱数seedではなく
     scenario indexとして扱う。一方、SB3 2.9の``check_env``は契約確認のため
     必ず``seed=0``を渡す。このwrapperはcheckerが渡すseedをspacesへ適用し、
-    underlying raw環境は選択stageの開始scenarioでresetする。stepやspaces、Reward、
+    underlying raw環境は検査対象のscenarioでresetする。stepやspaces、Reward、
     終了値には手を加えず、学習・評価にも使用しない。
     """
 
@@ -229,11 +229,57 @@ def _run_random_actions(env: MetaDriveEnv, max_steps: int = 50) -> None:
     print("random action run: PASS")
 
 
+def _plain_config_value(value: Any) -> Any:
+    """MetaDriveの入れ子Configを、値を変更せずJSON向けの容器へ戻す。"""
+
+    from metadrive.utils.config import Config
+
+    if isinstance(value, Config):
+        value = value.get_dict()
+    if isinstance(value, Mapping):
+        return {key: _plain_config_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_config_value(item) for item in value]
+    return value
+
+
+def _contains_config_values(actual: Any, requested: Any) -> bool:
+    """未指定のdefaultを許容し、指定された入れ子の値だけを照合する。"""
+
+    if isinstance(requested, Mapping):
+        return isinstance(actual, Mapping) and all(
+            key in actual and _contains_config_values(actual[key], value)
+            for key, value in requested.items()
+        )
+    if isinstance(requested, list):
+        return isinstance(actual, list) and len(actual) == len(requested) and all(
+            _contains_config_values(item, expected)
+            for item, expected in zip(actual, requested)
+        )
+    return actual == requested
+
+
+def _print_effective_environment_config(
+    actual: Any, environment_config: Mapping[str, object]
+) -> None:
+    """project専用キーを除き、raw環境の実効値を表示・検証する。"""
+
+    requested = {
+        key: value for key, value in environment_config.items() if key != "scenario_seeds"
+    }
+    actual_config = {key: _plain_config_value(actual[key]) for key in requested}
+    print("\n== Effective values in env.config ==")
+    print(json.dumps(actual_config, ensure_ascii=False, indent=2, default=str))
+    assert _contains_config_values(actual_config, requested)
+
+
 def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
     """選択されたstageの単一raw MetaDrive環境に対して全検査を実行する。"""
 
     environment_config = environment_config_for_stage(experiment, stage)
     scenario_start, scenario_stop = _scenario_seed_bounds(environment_config)
+    scenario_seeds = environment_config.get("scenario_seeds")
+    inspection_seed = scenario_start if scenario_seeds is None else scenario_seeds[0]
     _print_versions()
     print("\n== Selected experiment ==")
     print(
@@ -253,13 +299,13 @@ def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
     env = make_env(environment_config)
     checker_error: Exception | None = None
     try:
-        observation, reset_info = env.reset()
+        if scenario_seeds is None:
+            observation, reset_info = env.reset()
+        else:
+            observation, reset_info = env.reset(seed=inspection_seed)
         observation_array = _assert_valid_observation(env, observation)
 
-        actual_config = {key: env.config[key] for key in environment_config}
-        print("\n== Effective values in env.config ==")
-        print(json.dumps(actual_config, ensure_ascii=False, indent=2))
-        assert actual_config == environment_config
+        _print_effective_environment_config(env.config, environment_config)
 
         print("\n== Spaces and reset observation ==")
         print(f"observation_space: {env.observation_space}")
@@ -286,13 +332,20 @@ def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
         print(f"terminated: {terminated}")
         print(f"truncated: {truncated}")
 
-        print("\n== Stable-Baselines3 check_env: raw environment ==")
+        checker_target = env
+        checker_label = "raw check_env"
+        checker_description = "raw environment"
+        if scenario_seeds is not None:
+            checker_target = _CheckEnvFixedScenarioAdapter(env, scenario_seed=inspection_seed)
+            checker_label = "selected-list adapted check_env"
+            checker_description = f"selected-list inspection adapter (scenario={inspection_seed})"
+        print(f"\n== Stable-Baselines3 check_env: {checker_description} ==")
         try:
-            check_env(env, warn=True)
+            check_env(checker_target, warn=True)
         except Exception as error:
-            print(f"raw check_env fatal error: {type(error).__name__}: {error}")
+            print(f"{checker_label} fatal error: {type(error).__name__}: {error}")
             traceback.print_exc()
-            if _is_known_check_env_seed_conflict(error, environment_config):
+            if scenario_seeds is None and _is_known_check_env_seed_conflict(error, environment_config):
                 print(
                     "raw check_env compatibility finding: SB3 seed=0 conflicts "
                     "with MetaDrive's configured scenario range "
@@ -302,7 +355,7 @@ def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
                 print("\n== Stable-Baselines3 check_env: seed-only inspection adapter ==")
                 checker_env = _CheckEnvFixedScenarioAdapter(
                     env,
-                    scenario_seed=scenario_start,
+                    scenario_seed=inspection_seed,
                 )
                 try:
                     check_env(checker_env, warn=True)
@@ -322,10 +375,10 @@ def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
             else:
                 checker_error = error
         else:
-            print("raw check_env: PASS (warnings, if any, are shown above)")
+            print(f"{checker_label}: PASS (warnings, if any, are shown above)")
 
         # check_envは内部でreset/stepするため、random走行の開始状態を明示的に戻す。
-        _run_random_actions(env, max_steps=50)
+        _run_random_actions(checker_target, max_steps=50)
     finally:
         env.close()
         print("environment closed: PASS")

@@ -324,17 +324,35 @@ def _deep_merge(
     return merged
 
 
+def validate_scenario_seeds(
+    value: object, location: str = "scenario_seeds"
+) -> list[int]:
+    """Validate a nonempty, ordered selection of distinct MetaDrive scenarios."""
+
+    if not isinstance(value, list) or not value:
+        raise _error(location, "空でない整数の配列で指定してください")
+    seeds = [_require_int(seed, location) for seed in value]
+    if any(seed < 0 for seed in seeds):
+        raise _error(location, "0以上の整数で指定してください")
+    if len(set(seeds)) != len(seeds):
+        raise _error(location, "scenario seedを重複させないでください")
+    return seeds
+
+
 def _validate_environment(
     value: Mapping[str, PlainData],
     location: str,
 ) -> dict[str, object]:
-    start_seed = _require_int(value.get("start_seed"), f"{location}.start_seed")
-    num_scenarios = _require_int(
-        value.get("num_scenarios"),
-        f"{location}.num_scenarios",
-        positive=True,
-    )
     validated = {key: _clone_plain(item) for key, item in value.items()}
+    if "scenario_seeds" in value:
+        seeds = validate_scenario_seeds(value["scenario_seeds"], f"{location}.scenario_seeds")
+        validated["scenario_seeds"] = seeds
+        start_seed, num_scenarios = min(seeds), max(seeds) - min(seeds) + 1
+    else:
+        start_seed = _require_int(value.get("start_seed"), f"{location}.start_seed")
+        num_scenarios = _require_int(
+            value.get("num_scenarios"), f"{location}.num_scenarios", positive=True
+        )
     # The values above are intentionally assigned back as ordinary ``int`` for
     # callers that inspect only the required scenario controls.
     validated["start_seed"] = start_seed

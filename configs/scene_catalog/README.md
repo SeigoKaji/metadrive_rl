@@ -261,7 +261,19 @@ MetaDrive では、交通車両を走らせるのにも同じ `IDMPolicy` が使
 .venv/bin/python evaluate.py --config configs/<新しい学習用TOML>.toml
 ```
 
-いまの学習設定は `start_seed` と `num_scenarios` で連続したseedの範囲しか指定できないため、飛び飛びのseedを複数まとめて使うことはできません。
+飛び飛びのseedを選ぶ場合は、完全な実験TOMLの学習・評価tableへ `scenario_seeds` を指定します。カタログの `[settings].seeds` とは別の設定です。
+
+```toml
+[environment.train]
+scenario_seeds = [2, 5, 11]
+
+[environment.evaluation]
+scenario_seeds = [2, 5, 11]
+```
+
+`scenario_seeds` は非空の整数配列で、負数・bool・重複は指定できません。入力順を保持します。指定時は `start_seed` / `num_scenarios` を省略でき、既存の値があっても一覧を優先します。MetaDriveの有効なseed範囲は、最小から最大までを含む `start_seed = 2, num_scenarios = 10`（2以上12未満）へ導出しますが、実際に選ぶ候補は `[2, 5, 11]` だけです。`scenario_seeds` 自体はMetaDriveへ渡しません。
+
+学習はworkerごとの `random.Random(RL seed + rank)` で候補から復元抽出するため、同じseedを続けて使うことがあります。この乱数器はPython・NumPy・MetaDriveの既存乱数列から独立しています。評価は指定した一覧順に各seedを1回ずつ使います。`scenario_seeds` を指定しない場合は、従来どおり `start_seed` / `num_scenarios` の連続範囲を使います。
 
 ## パターンを追加・変更する
 

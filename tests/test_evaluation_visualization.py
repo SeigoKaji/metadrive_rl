@@ -635,9 +635,11 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
     assert result["episodes"][0]["termination_reason"] == "success"
 
 
+@pytest.mark.parametrize("scenario_seeds", [None, [5, 0, 3], [5]])
 def test_evaluate_traverses_custom_scenario_range_once_in_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scenario_seeds: list[int] | None,
 ) -> None:
     """評価回数ではなく選択profileのscenario範囲が評価対象を決める。"""
 
@@ -653,6 +655,11 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
         "horizon": 1,
         "vehicle_config": {"enable_reverse": False},
     }
+    if scenario_seeds is not None:
+        custom_environment_config.update(
+            scenario_seeds=scenario_seeds, start_seed=min(scenario_seeds),
+            num_scenarios=max(scenario_seeds) - min(scenario_seeds) + 1
+        )
 
     class FakeEnv:
         def __init__(self) -> None:
@@ -766,10 +773,20 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
     evaluated_seeds = [episode["scenario_seed"] for episode in result["episodes"]]
 
     assert fake_env.closed is True
-    assert fake_env.reset_seeds == [41, 42]
-    assert evaluated_seeds == [41, 42]
-    assert len(set(evaluated_seeds)) == 2
-    assert result["episode_count"] == 2
+    expected_seeds = [41, 42] if scenario_seeds is None else scenario_seeds
+    assert fake_env.reset_seeds == expected_seeds
+    assert evaluated_seeds == expected_seeds
+    assert len(set(evaluated_seeds)) == len(expected_seeds)
+    assert result["episode_count"] == len(expected_seeds)
+    if scenario_seeds is not None:
+        assert result["scenario_seeds"] == scenario_seeds
+        assert result["scenario_seed_range"] == {
+            "start": min(scenario_seeds), "stop_exclusive": max(scenario_seeds) + 1
+        }
+        if len(scenario_seeds) == 1:
+            assert result["scenario_seed"] == scenario_seeds[0]
+        else:
+            assert "scenario_seed" not in result
 
 
 def test_evaluate_finalizes_png_gif_mp4_with_simulation_timing(

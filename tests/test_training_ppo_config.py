@@ -4,23 +4,31 @@ from __future__ import annotations
 
 from contextlib import closing
 from pathlib import Path
+import pickle
+import random
 
+import gymnasium as gym
+import numpy as np
 import pytest
+import torch
 from stable_baselines3.common.logger import Logger
 from stable_baselines3.common.save_util import save_to_zip_file
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 import train as train_module
+import env_factory
 from configs.experiment_config import PPO_COMMON_SCALAR_KEYS, canonical_config_path
 from lookahead_learning.checkpoint import resolve_lookahead_config
 from evaluate import parse_args as parse_evaluation_args
 
 
 @pytest.mark.parametrize("experiment_name", ["official", "custom_run", "custom.v2", "custom.zip"])
+@pytest.mark.parametrize("scenario_seeds", [None, [5, 0, 3], [11]])
 def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     experiment_name: str,
+    scenario_seeds: list[int] | None,
 ) -> None:
     """SB3をmockし、10 scalarがconstructorとmetadataの双方へ届くことを確認する。"""
 
@@ -34,6 +42,13 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
 
         def close(self) -> None:
             self.closed = True
+
+        def get_attr(self, name):
+            assert scenario_seeds is not None
+            assert name == "scenario_reset_counts"
+            if len(scenario_seeds) == 1:
+                return [{scenario_seeds[0]: 1}, {scenario_seeds[0]: 2}]
+            return [{5: 1, 0: 2, 3: 3}, {5: 2, 0: 0, 3: 1}]
 
     class FakePPO:
         def __init__(self, _policy: str, _env: object, **kwargs: object) -> None:
@@ -69,12 +84,12 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     )
 
     config_path = tmp_path / "experiment.toml"
-    config_path.write_text(
-        canonical_config_path("official").read_text(encoding="utf-8").replace(
-            'name = "official"', f'name = "{experiment_name}"'
-        ),
-        encoding="utf-8",
+    text = canonical_config_path("official").read_text(encoding="utf-8").replace(
+        'name = "official"', f'name = "{experiment_name}"'
     )
+    if scenario_seeds is not None:
+        text = text.replace("start_seed = 5\nnum_scenarios = 1", f"scenario_seeds = {scenario_seeds}")
+    config_path.write_text(text, encoding="utf-8")
     args = train_module.parse_args(["--config", str(config_path)])
     model_path = train_module._run_training(args, tmp_path / "train.log")
 
@@ -118,6 +133,69 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     assert resolved["n_steps"] == args.n_steps
     assert resolved["tensorboard_log"] == str(tensorboard_log_dir)
     assert training_metadata["ppo_seed_argument"] is None
+    if scenario_seeds is not None:
+        assert training_metadata["scenario_seeds"] == scenario_seeds
+        expected_counts = {"11": 3} if len(scenario_seeds) == 1 else {"5": 3, "0": 2, "3": 4}
+        assert training_metadata["scenario_reset_counts"] == expected_counts
+        assert training_metadata["scenario_sampling_reproducible_from_rl_seed"] is True
+        assert training_metadata["scenario_seed_range"] == {
+            "start": min(scenario_seeds), "stop_exclusive": max(scenario_seeds) + 1
+        }
+        if experiment_name == "official" and len(scenario_seeds) == 1:
+            assert training_metadata["scenario_seed"] == scenario_seeds[0]
+        else:
+            assert "scenario_seed" not in training_metadata
+    else:
+        assert "scenario_seeds" not in training_metadata
+        assert "scenario_reset_counts" not in training_metadata
+
+
+def test_factory_consumes_scenario_list_before_metadrive_construction(monkeypatch):
+    from types import SimpleNamespace
+    import metadrive.envs
+
+    monkeypatch.setattr(metadrive.envs, "MetaDriveEnv", lambda config: SimpleNamespace(config=config))
+    config = {"scenario_seeds": [5, 0, 3], "start_seed": 100, "num_scenarios": 1}
+    env = env_factory.make_env(config)
+    assert env.config == {"start_seed": 0, "num_scenarios": 6}
+    assert config == {"scenario_seeds": [5, 0, 3], "start_seed": 100, "num_scenarios": 1}
+
+
+def test_training_sampler_is_repeatable_local_and_counts_actual_resets(monkeypatch):
+    class FakeEnv(gym.Env):
+        def __init__(self):
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Box(0, 20, shape=(1,))
+            self.current_seed = -1
+
+        def reset(self, *, seed=None):
+            self.current_seed = seed
+            return np.asarray([seed], dtype=np.float32), {"scenario_seed": seed}
+
+    monkeypatch.setattr(env_factory, "make_env", lambda *_args, **_kwargs: FakeEnv())
+    before = pickle.dumps((random.getstate(), np.random.get_state(), torch.get_rng_state().numpy().tobytes()))
+    envs = [env_factory.make_training_env(rank, 11, {"scenario_seeds": [2, 5, 11]})
+            for rank in [0, 0, 1]]
+    try:
+        samples = [[env.reset()[1]["scenario_seed"] for _ in range(30)] for env in envs]
+        assert samples[0] == samples[1]
+        assert samples[0] != samples[2]
+        assert all(set(sample) <= {2, 5, 11} for sample in samples)
+        assert envs[0].reset(seed=5)[1]["scenario_seed"] == 5
+        assert envs[0].get_wrapper_attr("scenario_reset_counts") == {
+            seed: samples[0].count(seed) + int(seed == 5) for seed in [2, 5, 11]
+        }
+        with pytest.raises(ValueError):
+            envs[0].reset(seed=3)
+        counts = envs[0].get_wrapper_attr("scenario_reset_counts").copy()
+        monkeypatch.setattr(envs[0].unwrapped, "reset", lambda **_kwargs: (np.zeros(1), {}))
+        with pytest.raises(RuntimeError, match="requested scenario seed"):
+            envs[0].reset(seed=11)
+        assert envs[0].get_wrapper_attr("scenario_reset_counts") == counts
+        assert pickle.dumps((random.getstate(), np.random.get_state(), torch.get_rng_state().numpy().tobytes())) == before
+    finally:
+        for env in envs:
+            env.close()
 
 
 def test_training_logger_replaces_only_the_selected_experiments_events(

@@ -3,13 +3,38 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import random
 from typing import TYPE_CHECKING
 
 import gymnasium as gym
 from stable_baselines3.common.monitor import Monitor
 
+from configs.experiment_config import validate_scenario_seeds
+
 if TYPE_CHECKING:
     from metadrive.envs import MetaDriveEnv
+
+
+class _ScenarioSeedSampler(gym.Wrapper):
+    """Sample explicit scenarios with a worker-local RNG and count actual resets."""
+
+    def __init__(self, env: gym.Env, scenario_seeds: list[int], worker_seed: int) -> None:
+        super().__init__(env)
+        self.scenario_seeds = tuple(scenario_seeds)
+        self.scenario_reset_counts = dict.fromkeys(self.scenario_seeds, 0)
+        self._scenario_rng = random.Random(worker_seed)
+
+    def reset(self, *, seed: int | None = None, **kwargs):
+        if seed is None:
+            seed = self._scenario_rng.choice(self.scenario_seeds)
+        if isinstance(seed, bool) or seed not in self.scenario_reset_counts:
+            raise ValueError(f"scenario seed must be one of {self.scenario_seeds}: {seed}")
+        result = self.env.reset(seed=seed, **kwargs)
+        actual_seed = int(self.unwrapped.current_seed)
+        if actual_seed != seed:
+            raise RuntimeError(f"requested scenario seed {seed}, got {actual_seed}")
+        self.scenario_reset_counts[actual_seed] += 1
+        return result
 
 
 def make_env(
@@ -28,6 +53,9 @@ def make_env(
     # MetaDriveは受け取った設定を内部でmergeする。呼出元のconstantの
     # 偶発的な変更を防ぐため、環境ごとに浅いcopyを渡す。
     config = dict(env_config)
+    if "scenario_seeds" in config:
+        seeds = validate_scenario_seeds(config.pop("scenario_seeds"))
+        config.update(start_seed=min(seeds), num_scenarios=max(seeds) - min(seeds) + 1)
     # A missing key means the canonical upstream environment.  An explicitly
     # supplied ``off`` still needs this subclass so MetaDrive's closed config
     # schema recognizes the project-local key while retaining upstream runtime
@@ -84,6 +112,7 @@ def make_training_env(
     Notes:
         MetaDrive 0.4.3の ``reset(seed=...)`` はscenario indexを意味する。
         RL seedとの混同を避けるため、ここではspaceだけをseedする。
+        scenario_seeds指定時だけ、worker固有の乱数で一覧からscenarioを選ぶ。
     """
 
     if rank < 0:
@@ -94,6 +123,8 @@ def make_training_env(
         worker_seed = seed + rank
         env.action_space.seed(worker_seed)
         env.observation_space.seed(worker_seed)
+        if "scenario_seeds" in env_config:
+            env = _ScenarioSeedSampler(env, env_config["scenario_seeds"], worker_seed)
         # Keep episode statistics for SB3/TensorBoard without writing CSV files.
         return Monitor(env)
     except Exception:

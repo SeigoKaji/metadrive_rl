@@ -1,8 +1,10 @@
-# このMDを読んで、シーンカタログと遅い先行車の機能を移植してください
+# このMDを読んで、シーンカタログと任意scenario seedの学習・評価対応を移植してください
 
 この文書が移植先の実装担当への依頼です。追加のチャット指示や移植元PCを参照せず、同梱ソースと移植先の既存コードを比較し、バックアップ、不足差分の適用、検証、結果報告まで進めてください。対象は、このプロジェクトから派生した既存のMetaDrive RL環境です。
 
-完成条件は、既存の学習・評価・報酬・観測・lookahead接続を保持したまま、シーンカタログ、seedで再現する遅い先行車・停止車、2車線での連続追い越し、全カタログの統合HTML、比較再生成シェルを使えることです。本手順には移植先でのslow 22シーンsmoke、slow 88シーンの再生成、別途alternating 4例と統合表示の確認を含みます。長時間学習は実行しません。
+完成条件は、既存の学習・評価・報酬・観測・lookahead接続とカタログ機能を保持したまま、nested configを含む `inspect_env.py` の表示、任意の `scenario_seeds` による通常の学習・評価、その短い実動作確認まで行うことです。カタログ未導入の環境では、同梱のシーンカタログ、遅い先行車・停止車、2車線での連続追い越し、統合HTML、比較再生成シェルも不足差分から導入してください。
+
+**カタログを移植済みのPCでは、今回の差分適用、3a節のinspect・短い学習評価・metadata確認を中心に進めます。** 既存カタログのコード・設定・出力が変わらなければ、4〜7節のslow 22シーンsmoke、slow 88シーン、alternating 4例の再生成は不要です。これらはカタログ初回導入、関連処理の変更、既存結果の不一致がある場合の確認手順として残しています。長時間学習や全256シーンの自動再生成は行いません。
 
 シーンを見るときに最初に開く入口は **`outputs/scene_catalog/index.html`** です。生成済みの正式カタログを1つにまとめ、ブラウザでfilter・検索・ページ送り・GIF自動再生・原寸表示を使います。既存の生成済みシーンから統合HTMLだけを更新でき、表示のためにシミュレーションをやり直す必要はありません。
 
@@ -12,14 +14,18 @@
 
 このMDだけがあるフォルダから開始した場合は、親ディレクトリの `scene_catalog_update.zip` を探し、新しい外部作業ディレクトリへ展開して同梱ソースを取得してください。ZIPもソースもない場合は、不足する配布物を報告します。元GitHub、過去チャット、別の移植プロンプトからコードを推測して作りません。
 
-配布フォルダの内容は次の15ファイルです。コード・設定・テスト・説明の13ファイル、本MD、`SHA256SUMS`です。
+配布フォルダの内容は次の23ファイルです。コード・設定・テスト・説明の21ファイル、本MD、`SHA256SUMS`です。
 
 | 移植先rootからの相対パス | 適用内容 |
 |---|---|
 | `tools/scene_catalog.py` | TOMLのパターン×seedを走行し、HTML・PNG・GIF・環境TOMLを生成 |
 | `tools/scene_catalog_gallery.py` | 既存の正式5カタログの表示行を読み、統合HTMLを構築。標準ライブラリのみ、CSS/JSを内包 |
 | `lead_vehicle_env.py` | private RNGによる先行車抽選、経路に沿う一定速の先行車managerと環境subclass |
-| `env_factory.py` | `lead_vehicles`がある場合の環境選択を追加。既存ファイル全体は接続例 |
+| `env_factory.py` | 先行車環境選択、MetaDriveへ渡すseed包含範囲、学習workerの候補抽出wrapper。独自factoryへ必要差分をmerge |
+| `configs/experiment_config.py` | `scenario_seeds` の検証・順序保持と包含範囲の導出。既存の完全実験TOML loaderを維持 |
+| `inspect_env.py` | nested configの表示・指定値照合、候補指定時の先頭seed固定検査 |
+| `train.py` | 通常PPO学習と候補一覧・実reset回数のmetadata保存 |
+| `evaluate.py` | 候補一覧順の評価と実episode seedの記録 |
 | `run_scene_catalogs.sh` | 比較カタログの再生成。実行権限を保持 |
 | `configs/scene_catalog/README.md` | カタログの操作、設定、出力の説明 |
 | `configs/scene_catalog/curve.toml` | カーブ5パターン×12seed |
@@ -29,8 +35,12 @@
 | `configs/scene_catalog/overtake_alternating.toml` | 移動車・停止車を0→1→0で順に抜く4パターン×seed 0 |
 | `tests/test_lead_vehicles.py` | RNG分離、配置・運動・衝突・cleanup、既存lookaheadとの接続テスト |
 | `tests/test_scene_catalog_gallery.py` | シミュレーションを起動せず、統合HTMLと既存カタログの取込契約を検証 |
+| `tests/test_experiment_config.py` | 完全TOMLと任意seed一覧の検証・継承・stage上書き |
+| `tests/test_configuration_refactor.py` | inspectのnested表示・指定値照合・seed固定と既存入口の検証 |
+| `tests/test_training_ppo_config.py` | factoryの候補抽出、RNG分離、通常学習とmetadataの検証 |
+| `tests/test_evaluation_visualization.py` | 一覧順の評価とepisode/既存出力の互換検証 |
 
-展開先で `sha256sum -c SHA256SUMS`、またはPython標準ライブラリのSHA-256で、13ファイルと本MDの計14ファイルを照合してください。manifest自身は照合対象に含めません。欠落・不一致・symlink・想定外ファイルがあれば適用前に報告します。
+展開先で `sha256sum -c SHA256SUMS`、またはPython標準ライブラリのSHA-256で、21ファイルと本MDの計22ファイルを照合してください。manifest自身は照合対象に含めません。欠落・不一致・symlink・想定外ファイルがあれば適用前に報告します。
 
 配布フォルダは比較専用です。PYTHONPATHに追加せず、そこから `tools/scene_catalog.py` やシェルを実行しません。適用後は**移植先rootの通常モジュール**を使います。配布用 `tests/` をリポジトリ内へ残すとpytestが二重収集することがあるため、展開先はリポジトリ外に保ちます。pytest設定の変更で回避しません。
 
@@ -40,17 +50,19 @@
 
 最初は読み取り専用で調べます。branch、HEAD、`git status --short --untracked-files=all`、staged/unstagedの差分を保存し、同名ファイルが「未導入／旧版／部分適用／独自変更あり／適用済み」のどれかをシンボルと呼出し元から判定してください。`git diff`だけでは未追跡ファイルを含まないため、ファイルの実在と内容も確認します。
 
-今回の13ファイルだけでは独立したシミュレーション環境になりません。移植先に次の既存接続があるか、ファイル名だけでなくシンボルと契約を確認してください。統合HTMLだけを構築する `tools/scene_catalog_gallery.py` は標準ライブラリのみで動き、MetaDriveを起動しません。
+今回の21ファイルだけでは独立したシミュレーション環境になりません。移植先に次の既存接続があるか、ファイル名だけでなくシンボルと契約を確認してください。統合HTMLだけを構築する `tools/scene_catalog_gallery.py` は標準ライブラリのみで動き、MetaDriveを起動しません。
 
 | 既存ファイル・依存 | 確認する接続 |
 |---|---|
 | `start_lane_env.py` | `StartLaneMetaDriveEnv`。先行車環境はこのクラスを継承し、既存開始車線タスク・reward/doneを保持する。先行車だけの設定でもimportが必要 |
-| `env_factory.py` | `make_env`、`make_training_env`、`make_evaluation_env`。既存独自環境の分岐、cleanup、lookahead、Monitorの接続 |
+| `env_factory.py` | `make_env`、`make_training_env`、`make_evaluation_env`。既存独自環境の分岐、cleanup、lookahead、Monitorの接続。今回同梱版との比較でもこれらを保持する |
 | `evaluation_visualization.py` | `derive_timing(config)`の戻り値に `gif_frame_duration_ms` があり、実効 `physics_world_step_size × decision_repeat` に対応する |
+| `evaluation_results.py` | `evaluate.py` がimportする `_prepare_evaluation_output_directory`、`_write_json`、録画・telemetryの既存helper。既存の評価出力契約を保持する |
 | `project_paths.py` | `PROJECT_ROOT`と`OUTPUT_DIR`が移植先を指す。配布フォルダや移植元PCを指さない |
-| `configs/experiment_config.py` | `load_experiment_config(path).profile`、train/evaluationの環境mappingと `lookahead_config`を保持する |
+| `configs/experiment_config.py` | 同梱のloader修正を既存へmergeする。`load_experiment_config(path).profile`、train/evaluationの環境mappingと `lookahead_config`を保持する |
 | `configs/official_start_lane_return_lookahead.toml` | 組合せテストが読む既存の完全な実験TOML。既存内容を保護する |
 | `lookahead_learning/adapter.py`など既存lookahead | `wrap_lookahead_env`、既存設定・観測・報酬・checkpoint互換を維持する |
+| `lookahead_learning/checkpoint.py` | `set_lookahead_model_metadata`、`validate_lookahead_model_metadata`。通常train/evaluateのimportとモデル再読込に必要 |
 | 使用中のPython環境 | `tomllib`、NumPy、Pillow、Gymnasium、Stable-Baselines3、PyTorch、pytest、MetaDriveを利用できる。カタログでもfactoryのtop-level importにSB3が必要 |
 | 使用中のMetaDrive | `TrafficDefaultVehicle`、`BaseManager`、single-agent manager、経路・lane API、`set_static`、`set_velocity`、top-down renderの互換性 |
 
@@ -84,6 +96,8 @@
 
 factoryの接続例は `lead_vehicles` のキーがある場合に `LeadVehicleMetaDriveEnv(config)` を選び、その後は既存lookahead接続へ進むものです。同梱版ではこの分岐を `start_lane_objective` の分岐より先に置きます。キーのない設定の既存経路、移植先独自のraw Env、reward/done、観測、開始車線タスク、lookahead mapping、Monitor/VecEnvの順序、例外時closeを保持してください。独自base classがある場合は、その契約を確認して最小の接続を行い、独自処理を脱落させません。
 
+今回の追加対応は、同梱の `configs/experiment_config.py`、`env_factory.py`、`train.py`、`evaluate.py`、`inspect_env.py` の差分を既存ファイルへmergeします。別の学習runnerや補助runtime moduleを新設せず、既存の入口・出力契約を使います。`scenario_seeds` はloaderで検証・保持し、MetaDriveへ渡す直前に取り除きます。学習時の候補抽出wrapperは既存lookaheadとMonitorの順序を保つ位置に入れ、指定がなければ従来経路を保持してください。inspectは表示用にnestedなMappingや配列をJSON化できる形へ変換し、環境config本体の値を表示目的で書き換えません。
+
 `lead_vehicles`は次の5キーを持ちます。台数は整数の包含範囲、距離・間隔は車両中心間の経路距離[m]、速度はkm/hです。
 
 ```toml
@@ -113,11 +127,11 @@ HTMLのGIF自動再生、画像クリックによる原寸表示、列のソー�
 
 `tools/scene_catalog.py` の `main` で個別カタログHTMLを保存した後に、`tools.scene_catalog_gallery.build_gallery(output_dir=OUTPUT_DIR / "scene_catalog")` を呼ぶ同梱の接続もmergeしてください。これにより通常のシーン生成後に統合入口も更新されます。`build_gallery(root=None, *, output_dir=None)` はMetaDriveを起動せず、既存の正式indexの表示行を取り込みます。CSS/JS用の追加ファイルや依存パッケージは不要です。
 
-既存の実験TOML・モデル・ログ・認証・共有設定・AGENTS・pytest設定は変更しません。検証用の設定は別名で作り、シェルの実行権限を保持します。commit/pushは移植先利用者から別途指示がある場合だけ行います。
+既存の実験TOML・モデル・ログ・認証・共有設定・AGENTS・pytest設定は変更しません。検証用の完全TOMLとログは `outputs/` 配下の新しい一意な検証用ディレクトリを使います。実験名も一意にし、標準CLIが使う `models/<実験名>.zip`、`logs/tensorboard/<実験名>/`、`outputs/<実験名>/` で既存成果物を上書きしないこと。シェルの実行権限を保持します。この依頼ではcommit/pushを行いません。
 
 ## 3. 小さい検証から、対象テスト・既存テストへ進む
 
-まず変更した6つのPythonを `compile(source, filename, "exec")` で構文確認し、5つのカタログTOMLを `tomllib` でparseしてください。`compileall`や`py_compile`でcacheを作る必要はありません。TOMLのvariant名、seed範囲、速度、描画設定が同梱版と対応することを確認します。
+まず今回適用したPythonを `compile(source, filename, "exec")` で構文確認し、5つのカタログTOMLと検証用完全TOMLを `tomllib` でparseしてください。`compileall`や`py_compile`でcacheを作る必要はありません。TOMLのvariant名、seed範囲、速度、描画設定が同梱版と対応することを確認します。
 
 ```bash
 bash -n run_scene_catalogs.sh
@@ -126,6 +140,8 @@ bash run_scene_catalogs.sh --help
 "$PYTHON_BIN" -B tools/scene_catalog_gallery.py --help
 "$PYTHON_BIN" -B train.py --help
 "$PYTHON_BIN" -B evaluate.py --help
+"$PYTHON_BIN" -B inspect_env.py --help
+"$PYTHON_BIN" -B -m pytest -q -p no:cacheprovider tests/test_experiment_config.py tests/test_configuration_refactor.py tests/test_training_ppo_config.py tests/test_evaluation_visualization.py
 "$PYTHON_BIN" -B -m pytest -q -p no:cacheprovider tests/test_scene_catalog_gallery.py
 "$PYTHON_BIN" -B -m pytest -q -p no:cacheprovider tests/test_lead_vehicles.py -k 'sampling or invalid_lead'
 "$PYTHON_BIN" -B -m pytest -q -p no:cacheprovider tests/test_lead_vehicles.py
@@ -136,7 +152,41 @@ galleryテストは標準ライブラリとpytestだけで取込を検証し、M
 
 先行車導入時の移植元rootテストは変更前 **212件成功**、変更後 **222件成功**でした。この記録はgallery追加前のもので、移植先の合格件数を固定する値ではありません。移植先ではgalleryテストも含めて実行したコマンド・対象コード状態・結果を記録し、未実行、失敗、skipを明記してください。同じコード状態で成功した検証は、新しい変更や懸念がなければ繰り返しません。
 
+今回のinspect・任意seed対応時の移植元テストは、変更前 **437件＋249 subtests成功**、変更後 **467件＋249 subtests成功**でした。これも移植先の固定合格件数ではなく、今回の変更に対する移植元の実測記録です。
+
+## 3a. inspectと任意scenario seedを、短い実学習・評価で確認する
+
+完全な実験TOMLの `[environment.train]` と `[environment.evaluation]` に、たとえば `scenario_seeds = [2, 5, 11]` を指定できるようにします。配列は非空・非負の整数・重複なしで、boolは受け付けません。順序を保持し、`start_seed` / `num_scenarios` は省略可能です。併記されていても一覧を優先し、最小から最大を含む範囲へ導出します。この例では `start_seed = 2, num_scenarios = 10`（2以上12未満）ですが、実際の候補は2・5・11だけです。MetaDriveへ `scenario_seeds` キーを渡しません。
+
+学習はworkerごとの `random.Random(RL seed + rank)` で候補から復元抽出し、同じ候補の反復を許します。Python・NumPy・MetaDriveの既存乱数列を消費しません。評価は一覧の入力順に各候補を1回ずつ実行します。一覧なしの場合の従来の連続範囲・学習・評価・metadataの互換性も保ってください。乱数器の再現性を、異なる環境や学習条件で報酬・軌跡まで完全一致する保証と混同しません。
+
+短い実動作確認は、次の条件で新しい完全実験TOMLを `outputs/` 内へ作ります。既存 `configs/official.toml` などの学習・評価tableをコピーし、`name` を未使用の実験名へ変更してください。同梱の完全runnerを使い、新しい検証runnerは作りません。
+
+- 環境は同梱 `overtake_slow_lead.toml` の `[base]` に `lane2_two` の `env` を重ねたもの。生成済み `lane2_two/seed_0000.toml` があれば同じ環境部分を利用できますが、そのファイルを得るためのカタログ再生成は不要です。
+- 自車はPPOです。カタログ表示用の `IDMPolicy` を学習設定へ追加せず、元の `discrete_action = true`、`discrete_throttle_dim = 3`、`discrete_steering_dim = 3` を残します。`map_config` と競合する `map`、各stageの古い環境overrideを確認します。元ファイルは変更しません。
+- 2車線SSS・先行車2台・速度12 km/h・`horizon = 1000` を保持し、両stageに `scenario_seeds = [0, 3, 5]` を指定します。これは短い実測比較用の候補です。前述の `[2, 5, 11]` も設定検証・対象テストで受理されることを確認します。
+- CPU、RL seed 0、2環境、rollout長256、要求学習step数3072を使います。元のPPO scalar設定とaction次元を保持し、既存モデルを更新しません。
+
+`VERIFY_CONFIG` はその完全TOMLの実パス、`VERIFY_NAME` はその `name` に担当者が設定してください。`VERIFY_DIR` は新しい検証用ディレクトリです。次の処理は共有MetaDrive engineと学習資源を使うため直列で実行し、exit codeとログを保存します。
+
+```bash
+"$PYTHON_BIN" -B inspect_env.py --config "$VERIFY_CONFIG" --stage train
+"$PYTHON_BIN" -B inspect_env.py --config "$VERIFY_CONFIG" --stage evaluation
+"$PYTHON_BIN" -B train.py --config "$VERIFY_CONFIG" --device cpu --seed 0 --num-envs 2 --n-steps 256 --timesteps 3072 --log-file "$VERIFY_DIR/train.log"
+"$PYTHON_BIN" -B evaluate.py --config "$VERIFY_CONFIG" --model "models/$VERIFY_NAME.zip" --device cpu --seed 0 --no-record-gif --output-prefix "$VERIFY_NAME" --log-file "$VERIFY_DIR/evaluate.log"
+```
+
+inspectではnestedな `map_config`・`lead_vehicles` を含む実効configの表示、要求した値の照合、reset/step、`check_env`、random action検査、closeまで到達することを確認します。MetaDriveが補った未指定defaultは許容し、指定したnested値が保たれていることを検査します。`scenario_seeds` 指定時は最初のresetからchecker・random走行までを一覧の先頭seedへ固定し、checkerも検査専用adapterを通します。候補全件の走査はevaluateの役割です。未指定時は従来どおりraw checkerを使い、SB3の `seed=0` と対象範囲の既知衝突がある場合だけadapterへfallbackします。adapter使用をraw検査成功と混同せず記録します。
+
+`outputs/<実験名>/training/training_metadata.json` で `training.scenario_seeds` と `training.scenario_reset_counts` を確認します。後者は各workerが実際にresetした候補別回数の合計で、JSONのキーはseedの文字列です。終了直後の自動resetも含み、完了episode数とは異なります。候補外seedを使っていないこと、短い今回の実行でも0・3・5すべての回数が正であること、実学習step数・CPU・RL seed・解決済みPPO設定・モデル保存と再読込成功を記録してください。
+
+`outputs/<実験名>/evaluation/` の結果JSONでは、`scenario_seeds` が `[0, 3, 5]`、`episode_count` が3、各episodeの実seedが順に0→3→5であることを確認します。包含rangeの6シーンを評価していないこと、学習時と同じ完全TOMLのhash・モデルhashが記録されていること、録画なしで評価が完了したことも確認します。短い実学習・評価が通ることと、十分な学習による追い越し・到着性能を区別して報告してください。
+
+今回の移植元実測では、上記条件で通常CLIの学習・評価がともにexit 0となりました。学習は実3072 step・約7.49秒、実reset回数の合計は `{"0": 4, "3": 4, "5": 1}`、モデル546,242 bytesを保存し再読込に成功しました。評価は約2.77秒、0→3→5の3 episodeが各19 step、計57行のstep記録で、同じモデルhashを確認しました。結果は全3件 `out_of_road`・到着0/3です。これは短い学習とseed選択・接続の確認成功であり、運転性能の改善を示す結果ではありません。inspectは両stageと順序を変えた `[5, 0, 3]` の検査も終了し、nested表示・checker・random 50 step・closeを確認しました。移植先でも実行結果を測定し、元PCの実測をそのまま成功記録に転記しないでください。
+
 ## 4. 先に11パターン×seed 0・1の22シーンを確認する
+
+この節から7節までは、カタログ初回導入や関連する配置・走行処理の変更時に行う確認です。カタログ移植済みで今回の差分だけを適用した場合は、既存成果物を保ち、再実行を省略します。
 
 `configs/scene_catalog/overtake_slow_lead.toml` を読み、**seedだけを0・1の2個**へ絞った一時TOMLを `PORT_WORK` へ作ります。全11パターン、max_steps、速度、距離、間隔、描画間隔、GIF、trail設定は保持してください。元TOMLを書き換えません。
 
@@ -160,7 +210,7 @@ galleryテストは標準ライブラリとpytestだけで取込を検証し、M
 
 通常の `configs.experiment_config.load_experiment_config` でこの完全TOMLを読み、train/evaluationの両方に地図・seed・`lead_vehicles`が届くことを確認してください。同じfactoryから順番に環境を作り、resetと数stepまで確認します。長時間学習や保存済みモデルの更新は不要です。
 
-既存 `inspect_env.py` が使える場合は結果を記録します。ただし移植元では、261行目相当の実効configを `json.dumps` で表示する箇所で、nestedなMetaDrive `Config` がJSON化できない既存の失敗を確認しています。この表示失敗を環境検査全体の成功とも、先行車実装の失敗とも即断しません。実際のtracebackを確認し、今回のためにinspect側を無関係に修正せず、**同じ完全TOMLの通常loader→factory→reset/step**を別に実行して結果を分けて報告します。
+今回同梱の `inspect_env.py` は、nestedなMetaDrive `Config` のJSON表示に対応します。旧版の表示失敗を未修正の既知制約として残さず、3a節のtrain/evaluation両stageで実効configの表示、reset、step、検査終了まで確認してください。tracebackがあれば原因を区別して報告し、表示だけの成功や、別のfactory検証だけでinspect全体を成功扱いにしません。
 
 同seed・同実効設定・同action列で2回実行し、先行車の抽選records、地図・初期配置、位置・heading・速度の軌跡、step数・終了理由・追い越した台数を比較します。数値比較の許容差と差異を記録してください。カタログ走行は `IDMPolicy` をruntimeで設定しており、生成TOMLにはpolicy classを出力しません。カタログとの走行比較では同じpolicyを検証用の環境mappingだけへ設定し、学習用の実験設定や通常policyを変更しません。
 
@@ -227,6 +277,8 @@ PYTHON_BIN="$PYTHON_BIN" bash run_scene_catalogs.sh alternating
 
 ## 8. 統合HTMLを更新し、最初の入口として確認する
 
+カタログ移植済みで表示処理・出力に差分がなければ、既存入口の場所を記録すれば十分です。この節のgallery再構築やブラウザ操作の再検証は、初回導入、表示関連の差分適用、出力更新が必要な場合に行います。
+
 適用後、移植先に個別カタログの生成済みindexと画像があれば、次のコマンドで**統合HTMLだけ**を作成・更新してください。環境生成やシーンの再実行は行いません。
 
 ```bash
@@ -247,7 +299,7 @@ PYTHON_BIN="$PYTHON_BIN" bash run_scene_catalogs.sh gallery
 
 ## 9. その他のシェルtargetsは案内だけにする
 
-この依頼で実行するtargetは `slow`、`alternating`、統合HTMLだけを更新する `gallery` です。以下のその他のtargetは利用者が追加比較を希望したときのもので、移植確認のために全件を自動実行する必要はありません。
+カタログ移植済みで今回その処理を変えない場合は、統合HTMLだけを更新する `gallery` で十分です。`slow`、`alternating` は4〜7節の初回導入・関連変更の検証が必要な場合に使います。以下のその他のtargetは利用者が追加比較を希望したときのもので、移植確認のために全件を自動実行する必要はありません。
 
 | target | 件数・呼出し先 |
 |---|---|
@@ -275,10 +327,10 @@ PYTHON_BIN="$PYTHON_BIN" bash run_scene_catalogs.sh all
 
 1. 移植先の既存状態の判定根拠、Python・MetaDrive・assets・描画環境、配布hashの照合結果。
 2. 適用・merge・適用不要だったファイルと接続、保持した独自変更、旧root版の退避先と新パスへの切替状況、バックアップ先、適用後diffとhash。旧パスの呼出しが残っていないかの検索結果も記録。
-3. 実行コマンド、作業場所、対象コード状態、基線と変更後のテスト結果、slow 22シーン・88シーンとalternating 4例の結果、車線random40シーンの内訳、統合入口と個別HTMLの場所。
-4. 統合HTMLの取込件数・未生成カタログ・filter/検索/ページ送り・GIF/原寸リンク・自動更新の確認結果、生成TOMLの通常loader/factory再現、2回の配置・軌跡比較、alternating全4例の0→1→0と両台通過の順序・step、開始車線/lookahead組合せの結果。inspectの既存表示失敗、ブラウザ未検証、skip、契約不明も明示。
+3. 実行コマンド、作業場所、対象コード状態、基線と変更後のテスト結果、inspect両stage、短い実学習の実step数・モデル再読込、候補seedごとの実reset回数の合計、評価の一覧順seed・episode数、設定hash・metadataの場所。カタログ再生成を省略した場合は導入済みと判断した根拠を示す。
+4. 統合HTMLと個別HTMLの場所、必要に応じて行った取込件数・GIF/原寸リンク・自動更新、slow 22/88・alternating 4例・車線random40の確認結果、通常loader/factory再現・配置/軌跡比較・開始車線/lookahead組合せ。inspectの失敗、ブラウザ未検証、skip、契約不明も明示し、今回の必須確認と省略した任意確認を区別する。
 5. 今回の変更だけを撤去する手順。適用前原本・適用後差分・現在を比較し、後続変更を保持して今回の行だけを戻す。追加ファイルも後続利用を確認し、無条件削除、フォルダ置換、`reset --hard`は行わない。
 
 必要作業が未実行なら、その理由・不足根拠・残作業を示し、移植完了と記載しません。元PCの検証記録や構文確認だけを、移植先の実動作成功・学習改善と扱わないでください。
 
-最後に、作業のためだけに作った一時TOML・補助スクリプト・不要な展開コピーなどを確認して削除します。バックアップ、適用diff/hash、検証ログ、最終成果物は記録した場所に残し、その保存先を報告してください。後続利用のあるものや元から存在したものを一時物として削除しません。
+最後に、作業のためだけに作った一時TOML・補助スクリプト・不要な展開コピーなどを確認して削除します。バックアップ、適用diff/hash、短い学習・評価に用いた完全TOML、metadata・モデル・検証ログ、最終成果物は記録した場所に残し、その保存先を報告してください。後続利用のあるものや元から存在したものを一時物として削除しません。

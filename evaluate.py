@@ -383,6 +383,9 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     deterministic = bool(getattr(args, "deterministic", True))
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
+    scenario_seeds = environment_config.get(
+        "scenario_seeds", range(scenario_start, scenario_start + scenario_count)
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -459,11 +462,10 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                 f"mp4_fps={simulation_timing.control_hz:.3f}"
             )
 
-            for episode_number in range(1, scenario_count + 1):
+            for episode_number, scenario_seed in enumerate(scenario_seeds, start=1):
                 episode_start_time = time.perf_counter()
                 # MetaDriveのseedはRL乱数ではなくscenario indexである。設定された
-                # scenario範囲を先頭から一度ずつ走査し、ランダム抽選による重複を避ける。
-                scenario_seed = scenario_start + episode_number - 1
+                # 指定一覧またはscenario範囲を、順番に一度ずつ走査する。
                 obs, reset_info = env.reset(seed=scenario_seed)
                 actual_scenario_seed = int(host_env.current_seed)
                 if actual_scenario_seed != scenario_seed:
@@ -696,7 +698,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "rl_seed": args.seed,
         "deterministic": deterministic,
         "simulation_timing": simulation_timing.to_dict(),
-        "episode_count": scenario_count,
+        "episode_count": len(scenario_seeds),
         "episodes": episodes,
         "aggregate": {
             "mean_reward": statistics.fmean(rewards),
@@ -724,9 +726,11 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "step_telemetry": step_trace_result,
         "console_log_path": str(log_path.resolve()),
     }
-    if scenario_count == 1:
+    if "scenario_seeds" in environment_config:
+        result["scenario_seeds"] = list(scenario_seeds)
+    if len(scenario_seeds) == 1:
         # Preserve the scalar scenario_seed alongside scenario_seed_range.
-        result["scenario_seed"] = scenario_start
+        result["scenario_seed"] = scenario_seeds[0]
     _write_json(result_path, result)
     print(f"evaluation_saved={result_path.resolve()}")
     return result_path
