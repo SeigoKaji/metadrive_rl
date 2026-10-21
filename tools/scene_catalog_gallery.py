@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from html.parser import HTMLParser
 import json
 from pathlib import Path, PurePosixPath
+import sys
+import tomllib
 from urllib.parse import quote, unquote, urlsplit
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from configs.experiment_config import SCENE_GROUP_SWITCH_KEYS
 
 
 # 一時的なprobe/smokeの設定や出力は統合しない。
@@ -30,6 +38,135 @@ FIELDS = {
     "車線変更": "lane_changes",
     "終了理由": "outcome",
 }
+
+
+def _toml_value(value: object) -> str:
+    """書き出す値はPythonで引用し、JSには完成したTOML片だけ渡す。"""
+
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{_toml_value(k)} = {_toml_value(v)}" for k, v in value.items()) + " }"
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+    raise ValueError(f"書き出せないTOML値です: {type(value).__name__}")
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _selection_data(scene: dict, directory: Path) -> None:
+    """壊れた設定でも閲覧は維持し、選択時に理由を表示する。"""
+
+    identity = "missing"
+    scene.update(selection_error=None, random_traffic=False)
+    try:
+        source = (directory / unquote(scene["toml"])).read_text(encoding="utf-8")
+        identity = source
+        config = tomllib.loads(source)
+        identity = _canonical(config)
+        common = config.get("environment", {}).get("common")
+        if not isinstance(common, dict):
+            raise ValueError("[environment.common] がありません")
+        switches = {key: common[key] for key in sorted(SCENE_GROUP_SWITCH_KEYS) if key in common}
+        if ("map" in switches) == ("map_config" in switches):
+            raise ValueError("map / map_config はどちらか一方だけ必要です")
+        seed = int(scene["seed"])
+        if seed < 0:
+            raise ValueError("seed は0以上の整数が必要です")
+        random_traffic = common.get("random_traffic", False)
+        if not isinstance(random_traffic, bool):
+            raise ValueError("random_traffic はboolが必要です")
+        if "/" in scene["variant"] or "\\" in scene["variant"]:
+            raise ValueError("パターン名をグループのbasenameに使えません")
+        scene.update(
+            switch_settings=switches, random_traffic=random_traffic, seed_literal=str(seed),
+            group_key=_canonical([scene["catalog"], scene["variant"], switches]),
+            common_toml="\n".join(f"{_toml_value(k)} = {_toml_value(v)}" for k, v in switches.items()),
+        )
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError) as exc:
+        scene["selection_error"] = f"設定TOMLを選択に使えません: {exc}"
+    scene["selection_key"] = hashlib.sha256(
+        _canonical([scene["catalog"], scene["variant"], scene["seed"], identity]).encode("utf-8")
+    ).hexdigest()
+
+
+def _selection_names(scenes: list[dict]) -> None:
+    # 素のパターン名の末尾が _2 等でも、別設定への連番と衝突させない。
+    reserved = {f"{s['catalog']}__{s['variant']}" for s in scenes}
+    names, used = {}, set()
+    for scene in scenes:
+        if scene["selection_error"]:
+            continue
+        key, base = scene["group_key"], f"{scene['catalog']}__{scene['variant']}"
+        if key not in names:
+            name, suffix = base, 2
+            while name in used or (name != base and name in reserved):
+                name, suffix = f"{base}_{suffix}", suffix + 1
+            names[key] = _toml_value(name)
+            used.add(name)
+        scene["group_name_literal"] = names[key]
+
+
+SELECTION_INSTRUCTIONS = """# scene_selection.toml（シーンカタログの選択）
+# 【GitHub Copilot への指示】このファイルとベースの学習用configから、新しいconfigを作る。
+# 1. ベースを configs/<新しい名前>.toml にコピーし、name を新しい名前にする
+#    （指定がなければ selection.suggested_name）。[training]・[evaluation]・[lookahead] と
+#    独自tableを含む environment 以外の設定は、name を除いてすべてそのまま残す。
+# 2. environment.common / environment.train / environment.evaluation のすべてから
+#    次の切り替えキーを削除する（グループ内の設定だけを使い、map と map_config の競合を防ぐ）:
+#    __SWITCH_KEYS__
+#    start_seed・num_scenarios・scenario_seeds も上記3tableすべてから削除する。
+#    random_traffic は common に false を設定し、stage側にあれば false に揃える。
+#    行動形式・報酬・終了条件など残りの設定は維持し、空になったstage tableは削除してよい。
+# 3. ベースの既存 environment.scene_groups は残さず、このファイルの全グループで置換する。
+#    [[environment.scene_groups]] と [environment.scene_groups.common] だけをすべて末尾へ貼る。
+#    [selection] はメタ情報なので完成した実験configへコピーしない。
+#    評価未選択のグループは、明記された学習と同じseedで評価する。
+# 4. 作ったconfigで次の両方を実行し、PASSを確認して結果を報告する:
+#    .venv/bin/python inspect_env.py --config <新しいconfig>
+#    .venv/bin/python inspect_env.py --config <新しいconfig> --stage evaluation
+""".replace("__SWITCH_KEYS__", ", ".join(sorted(SCENE_GROUP_SWITCH_KEYS)))
+
+
+EXPORT_SCRIPT = r"""
+function buildSelectionExport(selectedScenes, metadata) {
+  const selected = selectedScenes.filter((s) => s.train || s.evaluation);
+  if (!selected.length) throw new Error("学習または評価のシーンを選択してください。");
+  const groups = new Map();
+  selected.forEach((s) => {
+    const label = `${s.catalog} / ${s.variant} / seed ${s.seed}`;
+    if (s.selection_error) throw new Error(`${label}: ${s.selection_error}`);
+    if (s.random_traffic) throw new Error(`${label}: random_traffic = true は書き出せません。選択を解除してください。`);
+    if (!groups.has(s.group_key)) groups.set(s.group_key, {scene: s, train: [], evaluation: []});
+    const group = groups.get(s.group_key);
+    ["train", "evaluation"].forEach((stage) => {
+      if (s[stage] && !group[stage].includes(s.seed_literal)) group[stage].push(s.seed_literal);
+    });
+  });
+  groups.forEach((group) => {
+    if (!group.train.length) throw new Error(`${group.scene.catalog} / ${group.scene.variant}: 評価だけのグループがあります。学習にもチェックしてください。`);
+  });
+  if (!/^[A-Za-z0-9_-]+$/.test(metadata.suggested_name) || !/^[0-9TZ:.+-]+$/.test(metadata.created_at)) {
+    throw new Error("書き出し名または生成日時が不正です。");
+  }
+  const parts = [metadata.instructions, `[selection]\nschema = "scene_selection/1"\nsuggested_name = "${metadata.suggested_name}"\ncreated_at = "${metadata.created_at}"\n`];
+  groups.forEach((group) => {
+    const evaluation = group.evaluation.length ? group.evaluation : group.train;
+    parts.push("[[environment.scene_groups]]\nname = " + group.scene.group_name_literal
+      + "\ntrain_seeds = [" + group.train.join(", ") + "]\n"
+      + (group.evaluation.length ? "" : "# 評価未選択のため、学習と同じseedで評価する。\n")
+      + "evaluation_seeds = [" + evaluation.join(", ") + "]\n[environment.scene_groups.common]\n"
+      + group.scene.common_toml + "\n");
+  });
+  return parts.join("\n");
+}
+"""
 
 
 class _SceneTableParser(HTMLParser):
@@ -138,6 +275,7 @@ def _read_scenes(path: Path, catalog: str) -> list[dict]:
             key: columns[title]["text"] if title in columns else None
             for title, key in FIELDS.items()
         })
+        _selection_data(scene, path.parent.parent)
         scenes.append(scene)
     return scenes
 
@@ -174,6 +312,12 @@ button:disabled { opacity: .45; cursor: default; }
 label { display: flex; flex-direction: column; gap: 5px; font-size: .85rem; font-weight: 600; min-width: 0; }
 select, input { width: 100%; min-width: 0; }
 .options { display: grid; gap: 10px; margin-top: 12px; }
+.selection-actions { display: grid; gap: 8px; margin: 12px 0; padding: 12px; border: 1px solid #b8c8d7; border-radius: 9px; background: white; }
+.selection-counts, .scene-selection { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.scene-selection { margin-top: 8px; }
+.scene-selection label { display: inline-flex; flex-direction: row; align-items: center; gap: 5px; }
+.scene-selection input { width: auto; min-width: auto; }
+#selectionWarning { margin: 0; color: #8c2923; font-size: .85rem; overflow-wrap: anywhere; }
 .status-row, .pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
 #status { margin: 0; font-weight: 600; }
 .gallery-scroll { min-width: 0; min-height: 0; height: 100%; overflow-y: auto; container: gallery / inline-size; border-radius: 9px; border: 1px solid #ced9e3; background: #e8eef3; }
@@ -237,6 +381,13 @@ pre { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size
 <div id="sidebarContent">
 <h1>シーンカタログ</h1>
 <p class="intro">カーブ・交差点・追い越しの例を、同じ画面で絞り込んで比較できます。</p>
+<section class="selection-actions" aria-label="学習・評価のシーン選択">
+<div class="selection-counts"><span>学習 <strong id="selectionTrainCount">0</strong>件</span><span>評価 <strong id="selectionEvaluationCount">0</strong>件</span></div>
+<button id="exportSelectionButton" type="button">選択を書き出す</button>
+<button id="clearSelectionButton" type="button">選択をすべて解除</button>
+<p class="hint">件数は全ページの選択。評価未選択のグループは学習と同じseedで評価します。</p>
+<p id="selectionWarning" role="alert" hidden></p>
+</section>
 <details id="sidebarControls" class="sidebar-controls" open><summary>絞り込み・表示設定</summary>
 <section class="toolbar" aria-label="カタログの絞り込み">
 <div class="filters">
@@ -267,8 +418,59 @@ pre { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size
 <script id="gallery-data" type="application/json">__GALLERY_DATA__</script>
 <script>
 "use strict";
+__EXPORT_SCRIPT__
 const data = JSON.parse(document.getElementById("gallery-data").textContent);
 const el = (id) => document.getElementById(id);
+const selectionStorageKey = "scene_catalog_selection/1", selections = new Map();
+let storageWarning = "";
+try {
+  const saved = JSON.parse(localStorage.getItem(selectionStorageKey) || "{}");
+  data.scenes.forEach((s) => {
+    const state = saved[s.selection_key];
+    if (state && (state.train === true || state.evaluation === true)) {
+      selections.set(s.selection_key, {train: state.train === true, evaluation: state.evaluation === true});
+    }
+  });
+} catch (_) { storageWarning = "このブラウザでは選択の保存を利用できません。ページを閉じると選択は消えます。"; }
+function exportMetadata() {
+  const now = new Date().toISOString();
+  const stamp = now.slice(0, 10).replace(/-/g, "") + "_" + now.slice(11, 16).replace(":", "");
+  return {created_at: now, suggested_name: "scene_mix_" + stamp, instructions: data.selection_instructions};
+}
+function selectedScenes() {
+  return data.scenes.filter((s) => selections.has(s.selection_key)).map((s) => ({...s, ...selections.get(s.selection_key)}));
+}
+function updateSelection() {
+  const selected = selectedScenes();
+  el("selectionTrainCount").textContent = selected.filter((s) => s.train).length;
+  el("selectionEvaluationCount").textContent = selected.filter((s) => s.evaluation).length;
+  el("exportSelectionButton").disabled = selected.length === 0;
+  let warning = storageWarning;
+  if (selected.length) {
+    try { buildSelectionExport(selected, exportMetadata()); }
+    catch (error) { warning = [warning, error.message].filter(Boolean).join("\n"); }
+  }
+  el("selectionWarning").textContent = warning; el("selectionWarning").hidden = !warning;
+}
+function saveSelection() {
+  try { localStorage.setItem(selectionStorageKey, JSON.stringify(Object.fromEntries(selections))); }
+  catch (_) { storageWarning = "選択を保存できません。ページを閉じると選択は消えます。"; }
+  updateSelection();
+}
+el("clearSelectionButton").addEventListener("click", () => {
+  selections.clear();
+  document.querySelectorAll("input[data-selection-key]").forEach((input) => { input.checked = false; });
+  saveSelection();
+});
+el("exportSelectionButton").addEventListener("click", () => {
+  try {
+    const text = buildSelectionExport(selectedScenes(), exportMetadata());
+    const url = URL.createObjectURL(new Blob([text], {type: "application/toml;charset=utf-8"}));
+    const link = document.createElement("a"); link.href = url; link.download = "scene_selection.toml";
+    document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { el("selectionWarning").textContent = error.message; el("selectionWarning").hidden = false; }
+});
 const sidebarControls = el("sidebarControls");
 const sidebarToggle = el("sidebarToggle"), sidebarContent = el("sidebarContent"), layout = el("galleryLayout");
 const compactLayout = window.matchMedia("(max-width: 850px)");
@@ -332,6 +534,20 @@ function card(s, index) {
   const article = node("article", null, "scene-card");
   const header = node("header", null, "scene-summary");
   const identity = node("div"); identity.append(node("span", s.catalog_label, "catalog-label"), node("strong", s.variant, "variant"));
+  const choices = node("div", null, "scene-selection");
+  [["train", "学習"], ["evaluation", "評価"]].forEach(([stage, title]) => {
+    const label = node("label"), input = node("input"); input.type = "checkbox";
+    input.dataset.stage = stage; input.dataset.selectionKey = s.selection_key;
+    input.checked = !!selections.get(s.selection_key)?.[stage];
+    input.setAttribute("aria-label", `${s.catalog_label} ${s.variant} seed ${s.seed} を${title}に使う`);
+    input.addEventListener("change", () => {
+      const state = {...selections.get(s.selection_key), [stage]: input.checked};
+      if (state.train || state.evaluation) selections.set(s.selection_key, state); else selections.delete(s.selection_key);
+      saveSelection();
+    });
+    label.append(input, node("span", title)); choices.append(label);
+  });
+  identity.append(choices);
   const result = node("div", null, "result");
   const state = ["arrive_dest", "timeout"].includes(s.outcome) ? s.outcome : "problem";
   result.append(node("span", outcomeLabels[s.outcome] || s.outcome, `outcome ${state}`));
@@ -365,7 +581,7 @@ function filteredScenes() {
   const rows = data.scenes.filter((s) => {
     if (catalog.value && s.catalog !== catalog.value || pattern.value && s.variant !== pattern.value || outcome.value && s.outcome !== outcome.value) return false;
     if (seedQuery && Number(s.seed) !== Number(seedQuery[1])) return false;
-    const text = `${Object.values(s).join(" ")} seed ${s.seed} ${outcomeLabels[s.outcome] || ""}`.toLocaleLowerCase();
+    const text = `${data.search_fields.map((key) => s[key]).join(" ")} seed ${s.seed} ${outcomeLabels[s.outcome] || ""}`.toLocaleLowerCase();
     return words.every((word) => text.includes(word));
   });
   if (sort.value !== "default") {
@@ -402,7 +618,7 @@ el("resetButton").addEventListener("click", () => {
   catalog.value = ""; outcome.value = ""; search.value = ""; sort.value = "default"; size.value = "12";
   updatePatterns(); pattern.value = ""; page = 1; render();
 });
-updatePatterns(); render();
+updatePatterns(); render(); updateSelection();
 </script></main></body></html>
 """
 
@@ -425,12 +641,16 @@ def build_gallery(root: Path | None = None, *, output_dir: Path | None = None) -
         rows = _read_scenes(index, name)
         catalogs.append({"id": name, "label": label, "count": len(rows)})
         scenes.extend(rows)
-    data = json.dumps({"catalogs": catalogs, "scenes": scenes}, ensure_ascii=False)
+    _selection_names(scenes)
+    data = json.dumps({"catalogs": catalogs, "scenes": scenes,
+                       "search_fields": ["catalog", "catalog_label", "image", "link", "toml", "width", *FIELDS.values()],
+                       "switch_keys": sorted(SCENE_GROUP_SWITCH_KEYS),
+                       "selection_instructions": SELECTION_INSTRUCTIONS}, ensure_ascii=False)
     # application/json内でもHTMLのscript終了タグとして解釈させない。
     data = data.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "index.html"
-    path.write_text(PAGE.replace("__GALLERY_DATA__", data), encoding="utf-8")
+    path.write_text(PAGE.replace("__EXPORT_SCRIPT__", EXPORT_SCRIPT).replace("__GALLERY_DATA__", data), encoding="utf-8")
     return path
 
 

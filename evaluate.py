@@ -10,6 +10,7 @@ import statistics
 import sys
 import time
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping, TextIO
@@ -262,6 +263,30 @@ def _aggregate_target_lane_metrics(
     }
 
 
+def _aggregate_episode_metrics(episodes: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Use the same reward, termination and lane metrics for any episode subset."""
+
+    rewards = [float(episode["total_reward"]) for episode in episodes]
+    lengths = [int(episode["episode_length"]) for episode in episodes]
+    reasons = Counter(episode["termination_reason"] for episode in episodes)
+    return {
+        "mean_reward": statistics.fmean(rewards),
+        "min_reward": min(rewards),
+        "max_reward": max(rewards),
+        "mean_episode_length": statistics.fmean(lengths),
+        "success_count": reasons["success"],
+        "success_rate": reasons["success"] / len(episodes),
+        "out_of_road_count": reasons["out_of_road"],
+        "out_of_road_rate": reasons["out_of_road"] / len(episodes),
+        "wrong_lane_arrival_count": reasons["wrong_lane_arrival"],
+        "wrong_lane_arrival_rate": reasons["wrong_lane_arrival"] / len(episodes),
+        "start_lane_departure_count": reasons["start_lane_departure"],
+        "start_lane_departure_rate": reasons["start_lane_departure"] / len(episodes),
+        "target_lane": _aggregate_target_lane_metrics(episodes),
+        "termination_reason_counts": dict(reasons),
+    }
+
+
 def _evaluation_output_directory(profile_name: str) -> Path:
     """Return the experiment's evaluation artifact directory."""
 
@@ -386,6 +411,11 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
     scenario_seeds = environment_config.get(
         "scenario_seeds", range(scenario_start, scenario_start + scenario_count)
     )
+    scene_groups = environment_config.get("scene_groups")
+    scenes = (
+        [(group["name"], seed) for group in scene_groups for seed in group["seeds"]]
+        if scene_groups is not None else [(None, seed) for seed in scenario_seeds]
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -419,6 +449,8 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "row_count": 0,
         "fields": list(STEP_TELEMETRY_FIELDS),
     }
+    if scene_groups is not None:
+        step_trace_result["fields"].append("scene_group")
 
     env = None
     active_recorder: _EpisodeVisualizationRecorder | None = None
@@ -450,9 +482,6 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                 1,
                 math.ceil(ACTION_HISTORY_SECONDS * simulation_timing.control_hz),
             )
-            horizon_value = host_env.config.get("horizon")
-            horizon = None if horizon_value is None else int(horizon_value)
-
             print(
                 "simulation_timing="
                 f"physics_hz={simulation_timing.physics_hz:.3f} "
@@ -462,17 +491,22 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                 f"mp4_fps={simulation_timing.control_hz:.3f}"
             )
 
-            for episode_number, scenario_seed in enumerate(scenario_seeds, start=1):
+            for episode_number, (scene_group, scenario_seed) in enumerate(scenes, start=1):
                 episode_start_time = time.perf_counter()
                 # MetaDriveのseedはRL乱数ではなくscenario indexである。設定された
                 # 指定一覧またはscenario範囲を、順番に一度ずつ走査する。
-                obs, reset_info = env.reset(seed=scenario_seed)
+                reset_options = {} if scene_group is None else {"options": {"scene_group": scene_group}}
+                obs, reset_info = env.reset(seed=scenario_seed, **reset_options)
                 actual_scenario_seed = int(host_env.current_seed)
                 if actual_scenario_seed != scenario_seed:
                     raise RuntimeError(
                         "要求したscenarioと実際のscenarioが一致しません: "
                         f"requested={scenario_seed}, actual={actual_scenario_seed}"
                     )
+                if scene_group is not None and env.current_scene_group != scene_group:
+                    raise RuntimeError(f"要求したscene_groupと実際のscene_groupが一致しません: {scene_group}")
+                horizon_value = host_env.config.get("horizon")
+                horizon = None if horizon_value is None else int(horizon_value)
                 total_reward = 0.0
                 episode_length = 0
                 terminated_flag = False
@@ -487,6 +521,7 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     run_dir=run_dir,
                     episode_number=episode_number,
                     scenario_seed=actual_scenario_seed,
+                    scene_group=scene_group,
                     write_gif_trace=_write_gif_trace,
                 )
                 active_recorder.prepare()
@@ -527,6 +562,8 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                         action_switch_count=switch_count,
                         action_switches_per_second=switches_per_second,
                     )
+                    if scene_group is not None:
+                        telemetry["scene_group"] = scene_group
                     _write_jsonl_record(step_trace_file, telemetry)
                     step_trace_row_count += 1
                     speed_samples_m_s.append(float(telemetry["speed_m_s"]))
@@ -589,6 +626,8 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     ),
                     "execution_seconds": time.perf_counter() - episode_start_time,
                 }
+                if scene_group is not None:
+                    episode_result["scene_group"] = scene_group
                 target_lane_metrics = _final_target_lane_metrics(final_info)
                 lookahead_info = final_info.get("lookahead_learning")
                 if isinstance(lookahead_info, Mapping):
@@ -611,8 +650,10 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                 active_recorder.cleanup()
                 active_recorder = None
                 episodes.append(episode_result)
+                group_log = "" if scene_group is None else f"scene_group={scene_group} "
                 print(
                     f"episode={episode_number} scenario_seed={actual_scenario_seed} "
+                    f"{group_log}"
                     f"reward={total_reward:.6f} "
                     f"length={episode_length} terminated={terminated_flag} "
                     f"truncated={truncated_flag} "
@@ -649,23 +690,6 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         f"rows={step_trace_row_count}"
     )
 
-    rewards = [float(episode["total_reward"]) for episode in episodes]
-    lengths = [int(episode["episode_length"]) for episode in episodes]
-    success_count = sum(
-        episode["termination_reason"] == "success" for episode in episodes
-    )
-    out_of_road_count = sum(
-        episode["termination_reason"] == "out_of_road" for episode in episodes
-    )
-    wrong_lane_arrival_count = sum(
-        episode["termination_reason"] == "wrong_lane_arrival"
-        for episode in episodes
-    )
-    start_lane_departure_count = sum(
-        episode["termination_reason"] == "start_lane_departure"
-        for episode in episodes
-    )
-    target_lane_aggregate = _aggregate_target_lane_metrics(episodes)
     if simulation_timing is None:
         raise AssertionError("successful evaluation has no simulation timing")
     visualizations = [episode["visualization"] for episode in episodes]
@@ -698,24 +722,9 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "rl_seed": args.seed,
         "deterministic": deterministic,
         "simulation_timing": simulation_timing.to_dict(),
-        "episode_count": len(scenario_seeds),
+        "episode_count": len(scenes),
         "episodes": episodes,
-        "aggregate": {
-            "mean_reward": statistics.fmean(rewards),
-            "min_reward": min(rewards),
-            "max_reward": max(rewards),
-            "mean_episode_length": statistics.fmean(lengths),
-            "success_count": success_count,
-            "success_rate": success_count / len(episodes),
-            "out_of_road_count": out_of_road_count,
-            "out_of_road_rate": out_of_road_count / len(episodes),
-            "wrong_lane_arrival_count": wrong_lane_arrival_count,
-            "wrong_lane_arrival_rate": wrong_lane_arrival_count / len(episodes),
-            "start_lane_departure_count": start_lane_departure_count,
-            "start_lane_departure_rate": start_lane_departure_count
-            / len(episodes),
-            "target_lane": target_lane_aggregate,
-        },
+        "aggregate": _aggregate_episode_metrics(episodes),
         # Recording failures are deliberately independent of successful policy
         # evaluation and of each other where they do not share rendering.
         "visualizations": visualizations,
@@ -726,9 +735,17 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
         "step_telemetry": step_trace_result,
         "console_log_path": str(log_path.resolve()),
     }
-    if "scenario_seeds" in environment_config:
+    if scene_groups is not None:
+        result["scene_groups"] = list(scene_groups)
+        result["group_aggregates"] = {}
+        for group in scene_groups:
+            selected = [episode for episode in episodes if episode["scene_group"] == group["name"]]
+            result["group_aggregates"][group["name"]] = {
+                "episode_count": len(selected), "aggregate": _aggregate_episode_metrics(selected)
+            }
+    elif "scenario_seeds" in environment_config:
         result["scenario_seeds"] = list(scenario_seeds)
-    if len(scenario_seeds) == 1:
+    if scene_groups is None and len(scenario_seeds) == 1:
         # Preserve the scalar scenario_seed alongside scenario_seed_range.
         result["scenario_seed"] = scenario_seeds[0]
     _write_json(result_path, result)

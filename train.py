@@ -295,6 +295,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
     scenario_start = int(environment_config["start_seed"])
     scenario_count = int(environment_config["num_scenarios"])
     scenario_seeds = environment_config.get("scenario_seeds")
+    scene_groups = environment_config.get("scene_groups")
     training_output_dir = _training_output_directory(experiment.name)
     tensorboard_log_dir = TENSORBOARD_LOG_DIR / experiment.name
 
@@ -339,7 +340,9 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         # reject same-shaped checkpoints made with different lookahead values.
         set_lookahead_model_metadata(model, lookahead_config)
         actual_device = str(model.device)
-        if scenario_seeds is not None:
+        if scene_groups is not None:
+            print(f"scene_groups={[group['name'] for group in scene_groups]}")
+        elif scenario_seeds is not None:
             print(f"scenario_seeds={list(scenario_seeds)}")
         print(
             "training_start",
@@ -445,7 +448,26 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
                 "device": reload_device,
             },
         }
-        if scenario_seeds is not None:
+        if scene_groups is not None:
+            worker_counts = train_env.get_attr("scene_group_reset_counts")
+            metadata["training"].update({
+                "scene_groups": list(scene_groups),
+                "scene_group_reset_counts": {
+                    group["name"]: {
+                        str(seed): sum(counts[group["name"]][seed] for counts in worker_counts)
+                        for seed in group["seeds"]
+                    }
+                    for group in scene_groups
+                },
+                "scenario_sampling_note": (
+                    "Each reset samples uniformly from all (scene_group, seed) pairs with "
+                    "worker-local random.Random(rl_seed + rank); counts include automatic "
+                    "resets after terminal steps, not completed episode counts"
+                ),
+                "scenario_sampling_reproducible_from_rl_seed": True,
+            })
+            print("scene_group_sampling", metadata["training"]["scene_group_reset_counts"])
+        elif scenario_seeds is not None:
             worker_counts = train_env.get_attr("scenario_reset_counts")
             metadata["training"].update({
                 "scenario_seeds": list(scenario_seeds),
@@ -466,7 +488,7 @@ def _run_training(args: argparse.Namespace, log_path: Path) -> Path:
         if experiment.name == "official":
             # Keep official baseline metadata available to existing consumers.
             metadata["official_environment_config"] = dict(environment_config)
-            if scenario_seeds is None or len(scenario_seeds) == 1:
+            if scene_groups is None and (scenario_seeds is None or len(scenario_seeds) == 1):
                 metadata["training"]["scenario_seed"] = scenario_start
         _write_json(metadata_path, metadata)
         print(f"model_saved={model_path} size_bytes={model_size} sha256={model_sha256}")

@@ -115,9 +115,13 @@ def test_inspect_still_rejects_different_nested_effective_values(requested: dict
         inspect_env._print_effective_environment_config(actual, requested)
 
 
-@pytest.mark.parametrize("scenario_seeds", [None, [9, 5], [9, 0]])
+@pytest.mark.parametrize(("scenario_seeds", "stage"), [
+    (None, "train"), ([9, 5], "train"), ([9, 0], "train"),
+    ("groups", "train"), ("groups", "evaluation"),
+])
 def test_inspect_initial_reset_and_checker_use_selected_scenarios(
-    scenario_seeds: list[int] | None,
+    scenario_seeds: list[int] | str | None,
+    stage: str,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -125,13 +129,22 @@ def test_inspect_initial_reset_and_checker_use_selected_scenarios(
 
     from metadrive.utils.config import Config
 
-    start = 5 if scenario_seeds is None else min(scenario_seeds)
-    stop = 6 if scenario_seeds is None else max(scenario_seeds) + 1
+    group_mode = scenario_seeds == "groups"
+    start = 0 if group_mode else (5 if scenario_seeds is None else min(scenario_seeds))
+    stop = 10 if group_mode else (6 if scenario_seeds is None else max(scenario_seeds) + 1)
     requested = {
         "start_seed": start, "num_scenarios": stop - start,
         "map_config": {"config": "SSS"},
     }
-    if scenario_seeds is not None:
+    if group_mode:
+        requested.pop("map_config")
+        requested["scene_groups"] = [
+            {"name": "curve__C", "seeds": [9, 5] if stage == "train" else [5, 9],
+             "env_config": {"map_config": {"config": "C"}}},
+            {"name": "curve__SSS", "seeds": [9, 0] if stage == "train" else [0, 9],
+             "env_config": {"map_config": {"config": "SSS"}}},
+        ]
+    elif scenario_seeds is not None:
         requested["scenario_seeds"] = scenario_seeds
 
     class InspectionEnv(gym.Env):
@@ -144,7 +157,9 @@ def test_inspect_initial_reset_and_checker_use_selected_scenarios(
             })
             self.reset_calls = []
             self.current_seed = None
+            self.current_scene_group = None
             self.closed = False
+            self.close_count = 0
 
         def reset(self, **kwargs):
             self.reset_calls.append(kwargs)
@@ -153,6 +168,10 @@ def test_inspect_initial_reset_and_checker_use_selected_scenarios(
                 f"scenario_index (seed) should be in [{start}:{stop})"
             )
             self.current_seed = seed
+            if "options" in kwargs:
+                self.current_scene_group = kwargs["options"]["scene_group"]
+                group = next(g for g in requested["scene_groups"] if g["name"] == self.current_scene_group)
+                self.config.update(group["env_config"])
             return np.array([0.5], dtype=np.float32), {}
 
         def step(self, action):
@@ -160,10 +179,16 @@ def test_inspect_initial_reset_and_checker_use_selected_scenarios(
 
         def close(self):
             self.closed = True
+            self.close_count += 1
 
     env = InspectionEnv()
     checker_calls = []
     random_targets = []
+    created = []
+
+    def make_fake_env(config):
+        created.append(config)
+        return env
 
     def fake_check_env(checked_env, *, warn):
         assert warn is True
@@ -179,18 +204,31 @@ def test_inspect_initial_reset_and_checker_use_selected_scenarios(
         checked_env.reset()
 
     monkeypatch.setattr(inspect_env, "environment_config_for_stage", lambda *_: requested)
-    monkeypatch.setattr(inspect_env, "make_env", lambda config: env)
+    monkeypatch.setattr(inspect_env, "make_env", make_fake_env)
     monkeypatch.setattr(inspect_env, "_print_versions", lambda: None)
     monkeypatch.setattr(inspect_env, "_print_action_conversion", lambda env: None)
     monkeypatch.setattr(inspect_env, "_run_random_actions", fake_random_actions)
     monkeypatch.setattr(inspect_env, "check_env", fake_check_env)
 
-    inspect_env._run_inspection(parse_inspection_args([]).experiment, "train")
+    inspect_env._run_inspection(parse_inspection_args([]).experiment, stage)
     output = capsys.readouterr().out
-    inspection_seed = start if scenario_seeds is None else scenario_seeds[0]
+    inspection_seed = start if scenario_seeds is None or group_mode else scenario_seeds[0]
 
-    assert env.reset_calls[0] == ({} if scenario_seeds is None else {"seed": inspection_seed})
-    if scenario_seeds is None:
+    assert len(created) == 1
+    if group_mode:
+        expected = [
+            {"seed": group["seeds"][0], "options": {"scene_group": group["name"]}}
+            for group in requested["scene_groups"] for _ in range(5)
+        ]
+        assert env.reset_calls == expected
+        assert len(checker_calls) == 2
+        assert random_targets == checker_calls
+        assert all(isinstance(checked, inspect_env._CheckEnvFixedScenarioAdapter) for checked in checker_calls)
+        assert output.count("== Scene group:") == 2
+        assert output.count("scene-group inspection adapter") == 2
+        assert f'"stage": "{stage}"' in output
+    elif scenario_seeds is None:
+        assert env.reset_calls[0] == {}
         assert env.reset_calls[1] == {"seed": 0}
         assert checker_calls[0] is env
         assert len(checker_calls) == 2
@@ -202,6 +240,7 @@ def test_inspect_initial_reset_and_checker_use_selected_scenarios(
         assert random_targets == [env]
         assert env.reset_calls[-2:] == [{}, {}]
     else:
+        assert env.reset_calls[0] == {"seed": inspection_seed}
         assert len(checker_calls) == 1
         assert isinstance(checker_calls[0], inspect_env._CheckEnvFixedScenarioAdapter)
         assert random_targets == checker_calls
@@ -210,9 +249,11 @@ def test_inspect_initial_reset_and_checker_use_selected_scenarios(
         assert "selected-list adapted check_env: PASS" in output
         assert "compatibility finding" not in output
     assert env.closed
+    assert env.close_count == 1
     assert "scenario_seeds" not in env.config
-    assert requested["map_config"] == {"config": "SSS"}
-    if scenario_seeds is not None:
+    if not group_mode:
+        assert requested["map_config"] == {"config": "SSS"}
+    if scenario_seeds is not None and not group_mode:
         assert requested["scenario_seeds"] == scenario_seeds
 
 

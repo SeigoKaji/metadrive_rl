@@ -275,6 +275,75 @@ scenario_seeds = [2, 5, 11]
 
 学習はworkerごとの `random.Random(RL seed + rank)` で候補から復元抽出するため、同じseedを続けて使うことがあります。この乱数器はPython・NumPy・MetaDriveの既存乱数列から独立しています。評価は指定した一覧順に各seedを1回ずつ使います。`scenario_seeds` を指定しない場合は、従来どおり `start_seed` / `num_scenarios` の連続範囲を使います。
 
+### 設定の違うシーンを混ぜる（scene_groups）
+
+カーブと遅い先行車など、設定自体が違うシーンを1つのモデルで学習する場合は `[[environment.scene_groups]]` を使います。完全な設定例は [example_scene_groups.toml](../example_scene_groups.toml) です。Cの3seed、遅い先行車の3seed、respawn交通の2seed、交差点交通の2seedを含む、4グループ・10シーンの短い学習用設定です。
+
+```toml
+[environment.common]
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+random_traffic = false
+store_map = true
+
+[[environment.scene_groups]]
+name = "curve__C"
+train_seeds = [0, 3, 5]
+evaluation_seeds = [0, 3, 5]  # 省略時はtrain_seedsと同じ
+[environment.scene_groups.common]
+map = "C"
+horizon = 1000
+traffic_density = 0
+
+[[environment.scene_groups]]
+name = "overtake_slow_lead__lane2_one"
+train_seeds = [0, 3, 5]
+[environment.scene_groups.common]
+map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }
+horizon = 1000
+traffic_density = 0
+lead_vehicles = { count = [1, 1], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" }
+```
+
+これは環境部分の例です。実行時は、同梱の完全設定例か、既存の `[training]` / `[evaluation]` を保持した完全な実験TOMLへ反映してください。元の設定を保護するため別名へコピーし、`name` も未使用の値に変えます。統合ページからの選択書き出しは次の節を参照してください。
+
+カタログの `seed_XXXX.toml` から選ぶ場合は、その環境設定のうち次の8キーをグループの `common` へ、行動形式や `log_level` など固定するキーを全体の `common` へ分け、使いたいseedをグループの一覧へ写します。
+
+- グループの `common` で切り替えられるキーは、`map`、`map_config`、`traffic_density`、`traffic_mode`、`accident_prob`、`lead_vehicles`、`horizon`、`random_spawn_lane_index` の8個です。行動形式・報酬・観測・`store_map` など固定する設定は `[environment.common]` に置きます。
+- この8キーは `[environment.common]` とstageの `[environment.train]` / `[environment.evaluation]` に置けません。各グループの `common` へ移します。各グループには `map` または `map_config` のどちらか1つが必要です。
+- `random_traffic` は全体で `false` 固定です。グループ内には置かず、全体の `common` に指定します。`true` は使えません。
+- `scene_groups` 使用時は、全体の `common` とstageに `start_seed`、`num_scenarios`、`scenario_seeds` を置けません。stageのtable自体は省略できます。
+- グループ名は出力フォルダ名として使える一意な名前、seed配列は非空・非負の整数・bool不可・グループ内の重複なしです。別グループで同じseedを使えます。`evaluation_seeds` は省略すると `train_seeds` と同じになります。
+
+学習は各episodeの開始時に、全学習シーンの「グループ×seed」の組から均等に1つを復元抽出します。上の完全設定例では10組が各1/10の確率です。workerごとの `random.Random(RL seed + rank)` を使い、環境はworkerにつき1つのまま切り替えます。`store_map = true` の地図cacheもグループ別に分け、同じseedの異なる地図を区別します。先行車なしのグループへ切り替えたときは、前の先行車を残しません。
+
+評価はグループの記載順、そのグループの `evaluation_seeds` の順に各組を1回ずつ実行します。episodeの結果・出力フォルダ・GIFにはグループ名が入り、全体とグループ別の集計を保存します。学習metadataのグループ×seed使用回数は、終了直後の自動resetも含む実reset回数で、完了episode数とは異なります。`inspect_env.py --config <完全TOML> --stage train` / `--stage evaluation` は各グループを検査します。`scene_groups` を省略した場合は、既存の連続seed範囲と `scenario_seeds` の使い方を維持します。
+
+### 統合ページで選択して書き出す
+
+`outputs/scene_catalog/index.html` の各カードのタイトル下にある「学習」「評価」のチェックで、カタログ・パターンをまたいで使いたいシーンを選びます。左の設定バー上部（狭い画面ではページ上部）にそれぞれの件数が表示され、「選択を書き出す」で `scene_selection.toml` を保存できます。「選択をすべて解除」で両方の選択を消せます。filterの解除とシーン選択の解除は独立しています。
+
+チェック状態はブラウザのlocalStorageへ保存し、同じページを開き直したときに復元します。設定TOMLの内容も照合するため、再生成で設定が変わったシーンへ古い選択を誤って戻しません。ブラウザが保存を許可しない場合は画面に警告し、そのページを閉じると選択は消えます。
+
+- 同じカタログ・パターン・切替設定が完全に一致するシーンを1グループへまとめます。同じパターン名でも設定が違えば別グループになり、名前が重なる場合は連番で区別します。
+- あるグループで評価を1つも選ばなければ、そのグループの学習seedと同じ一覧を `evaluation_seeds` に明示して書き出します。評価seedを学習seedとは別に選ぶこともできます。
+- 学習が0件で評価だけ選ばれたグループ、`random_traffic = true`、読めない・壊れた設定TOMLの選択がある場合は、画面で警告して選択全体の書き出しを中止します。選択や設定を修正してから再実行してください。
+
+`file://` で開いたまま使えます。サーバーへ送らず、ブラウザのダウンロードとして保存するため、保存先はブラウザ側で確認してください。選択ファイルは正しいTOMLですが、完全な学習設定ではなく、単独で `train.py --config` へ渡すものではありません。冒頭にGitHub Copilot向けの変換手順、`[selection]` に形式・推奨名・日時、続いて貼り付け用の `[[environment.scene_groups]]` が入ります。
+
+保存したファイルと、使いたい完全な学習設定のベースをCopilotへ渡します。次の例の `configs/official.toml` は、開始車線タスクやlookaheadを含む手元のベースへ置き換えられます。
+
+```text
+#file:scene_selection.toml と #file:configs/official.toml を使い、
+scene_selection.toml の冒頭の指示どおりに、別名の完全な学習用configを作ってください。
+元ファイルは変更せず、nameを一意にし、training・evaluation・lookaheadと
+行動形式・報酬・観測などの独自設定を保持してください。
+最後にinspect_env.pyをtrain/evaluationの両stageで実行し、結果を教えてください。
+```
+
+作成する完全TOMLには `[selection]` を貼りません。ベースにある切替8キーと旧seed指定を全体・stageから整理し、固定する設定は保持します。既存の `scene_groups` があれば今回の選択へ置き換え、重複して追記しないでください。古い統合ページにチェックがない場合は、`PYTHON_BIN=.venv/bin/python bash run_scene_catalogs.sh gallery` で統合HTMLだけを再生成して開き直します。シミュレーションの再実行は不要です。
+
 ## パターンを追加・変更する
 
 TOMLは次の3つの部分からなります。
@@ -299,7 +368,7 @@ env = { map_config = { type = "block_sequence", config = "C", lane_num = 2 } }  
 settings = { gif = true }          # 省略可。[settings] に上書きする値
 ```
 
-`env` に書けるのは、学習用TOMLの `[environment.common]` に書けるMetaDriveの設定と同じです。
+`env` に書けるのは、単一設定で学習するTOMLの `[environment.common]` に書けるMetaDriveの設定と同じです。
 主なものは次のとおりです。
 
 | キー | 意味 |

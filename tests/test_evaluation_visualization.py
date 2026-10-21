@@ -635,11 +635,11 @@ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
     assert result["episodes"][0]["termination_reason"] == "success"
 
 
-@pytest.mark.parametrize("scenario_seeds", [None, [5, 0, 3], [5]])
+@pytest.mark.parametrize("scenario_seeds", [None, [5, 0, 3], [5], "groups"])
 def test_evaluate_traverses_custom_scenario_range_once_in_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    scenario_seeds: list[int] | None,
+    scenario_seeds: list[int] | str | None,
 ) -> None:
     """評価回数ではなく選択profileのscenario範囲が評価対象を決める。"""
 
@@ -655,7 +655,12 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
         "horizon": 1,
         "vehicle_config": {"enable_reverse": False},
     }
-    if scenario_seeds is not None:
+    if scenario_seeds == "groups":
+        custom_environment_config.update(start_seed=0, num_scenarios=6, scene_groups=[
+            {"name": "curve__C", "seeds": [5, 0], "env_config": {"map": "C", "horizon": 1}},
+            {"name": "lead__one", "seeds": [5], "env_config": {"map": "SSS", "horizon": 2}},
+        ])
+    elif scenario_seeds is not None:
         custom_environment_config.update(
             scenario_seeds=scenario_seeds, start_seed=min(scenario_seeds),
             num_scenarios=max(scenario_seeds) - min(scenario_seeds) + 1
@@ -668,6 +673,9 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
             self.action_space = object()
             self.current_seed = -1
             self.reset_seeds: list[int] = []
+            self.reset_groups = []
+            self.current_scene_group = None
+            self.step_number = 0
             self.closed = False
             self.agent = SimpleNamespace(
                 navigation=None,
@@ -678,29 +686,37 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
                 engine=None,
             )
 
-        def reset(self, *, seed: int) -> tuple[np.ndarray, dict[str, object]]:
+        def reset(self, *, seed: int, options=None) -> tuple[np.ndarray, dict[str, object]]:
             self.current_seed = seed
             self.reset_seeds.append(seed)
+            self.step_number = 0
+            if options is not None:
+                self.current_scene_group = options["scene_group"]
+                self.reset_groups.append(self.current_scene_group)
+                group = next(g for g in self.config["scene_groups"] if g["name"] == self.current_scene_group)
+                self.config.update(group["env_config"])
             return np.zeros(1, dtype=np.float32), {}
 
         def step(
             self,
             _action: object,
         ) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
+            self.step_number += 1
+            crashed = self.current_scene_group == "lead__one"
             return (
                 np.zeros(1, dtype=np.float32),
                 1.0,
-                True,
+                self.step_number >= self.config["horizon"],
                 False,
                 {
                     "velocity": 1.0,
                     "steering": 0.0,
                     "acceleration": 1.0,
                     "route_completion": 1.0,
-                    "arrive_dest": True,
+                    "arrive_dest": not crashed,
                     "out_of_road": False,
-                    "crash": False,
-                    "crash_vehicle": False,
+                    "crash": crashed,
+                    "crash_vehicle": crashed,
                     "crash_object": False,
                     "max_step": False,
                 },
@@ -741,6 +757,11 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
     model_path.write_bytes(b"fake-model")
     fake_env = FakeEnv()
     fake_model = FakeModel()
+    created = []
+
+    def make_fake_env(**kwargs):
+        created.append(kwargs)
+        return fake_env
 
     monkeypatch.setattr(evaluate_module, "OUTPUT_DIR", output_dir)
     monkeypatch.setattr(evaluate_module, "LOG_DIR", log_dir)
@@ -752,7 +773,7 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
     monkeypatch.setattr(
         evaluate_module,
         "make_evaluation_env",
-        lambda **_kwargs: fake_env,
+        make_fake_env,
     )
     monkeypatch.setattr(
         evaluate_module,
@@ -773,12 +794,38 @@ def test_evaluate_traverses_custom_scenario_range_once_in_order(
     evaluated_seeds = [episode["scenario_seed"] for episode in result["episodes"]]
 
     assert fake_env.closed is True
-    expected_seeds = [41, 42] if scenario_seeds is None else scenario_seeds
+    expected_seeds = [5, 0, 5] if scenario_seeds == "groups" else (
+        [41, 42] if scenario_seeds is None else scenario_seeds
+    )
+    assert len(created) == 1
     assert fake_env.reset_seeds == expected_seeds
     assert evaluated_seeds == expected_seeds
-    assert len(set(evaluated_seeds)) == len(expected_seeds)
     assert result["episode_count"] == len(expected_seeds)
-    if scenario_seeds is not None:
+    if scenario_seeds == "groups":
+        assert fake_env.reset_groups == ["curve__C", "curve__C", "lead__one"]
+        assert [episode["scene_group"] for episode in result["episodes"]] == fake_env.reset_groups
+        assert [episode["visualization"]["scene_group"] for episode in result["episodes"]] == fake_env.reset_groups
+        assert [episode["episode_length"] for episode in result["episodes"]] == [1, 1, 2]
+        assert result["aggregate"]["termination_reason_counts"] == {"success": 2, "crash_vehicle": 1}
+        assert result["aggregate"]["mean_reward"] == pytest.approx(4 / 3)
+        groups = result["group_aggregates"]
+        assert list(groups) == ["curve__C", "lead__one"]
+        assert groups["curve__C"]["episode_count"] == 2
+        assert groups["curve__C"]["aggregate"]["success_rate"] == 1
+        assert groups["lead__one"]["aggregate"]["mean_reward"] == 2
+        assert groups["lead__one"]["aggregate"]["termination_reason_counts"] == {"crash_vehicle": 1}
+        assert all(set(group["aggregate"]) == set(result["aggregate"]) for group in groups.values())
+        rows = [json.loads(line) for line in Path(result["step_telemetry"]["path"]).read_text().splitlines()]
+        assert [row["horizon"] for row in rows] == [1, 1, 2, 2]
+        assert [row["scene_group"] for row in rows] == ["curve__C", "curve__C", "lead__one", "lead__one"]
+        paths = [evaluate_module._episode_visualization_paths(
+            tmp_path, episode_number=1, scenario_seed=5, scene_group=name
+        ) for name in groups]
+        assert paths[0]["gif"] != paths[1]["gif"]
+        assert all(name in path["directory"].name for name, path in zip(groups, paths))
+        assert "scenario_seed" not in result
+    elif scenario_seeds is not None:
+        assert len(set(evaluated_seeds)) == len(expected_seeds)
         assert result["scenario_seeds"] == scenario_seeds
         assert result["scenario_seed_range"] == {
             "start": min(scenario_seeds), "stop_exclusive": max(scenario_seeds) + 1

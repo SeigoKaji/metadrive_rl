@@ -71,10 +71,165 @@ num_scenarios = 2
 """
 
 
+GROUPS_TOML = VALID_TOML.split("[environment.common]")[0] + """
+[environment.common]
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+store_map = true
+
+[[environment.scene_groups]]
+name = "curve"
+train_seeds = [5, 0]
+evaluation_seeds = [11, 2]
+[environment.scene_groups.common]
+map = "C"
+traffic_density = 0
+horizon = 75
+random_spawn_lane_index = true
+
+[[environment.scene_groups]]
+name = "lead"
+train_seeds = [0, 3, 5]
+[environment.scene_groups.common]
+map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }
+lead_vehicles = { count = [1, 1], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" }
+traffic_density = 0.1
+traffic_mode = "respawn"
+accident_prob = 0.5
+"""
+
+
 def _write_config(tmp_path: Path, text: str = VALID_TOML) -> Path:
     path = tmp_path / "experiment.toml"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def test_scene_groups_preserve_order_and_share_the_all_stage_seed_bounds(tmp_path):
+    profile = load_experiment_config(_write_config(tmp_path, GROUPS_TOML)).profile
+    train, evaluation = profile.train_env_config, profile.evaluation_env_config
+    assert [group["name"] for group in train["scene_groups"]] == ["curve", "lead"]
+    assert [group["seeds"] for group in train["scene_groups"]] == [[5, 0], [0, 3, 5]]
+    assert [group["seeds"] for group in evaluation["scene_groups"]] == [[11, 2], [0, 3, 5]]
+    assert train["scene_groups"][1]["env_config"]["map_config"]["lane_num"] == 2
+    for config in (train, evaluation):
+        assert (config["start_seed"], config["num_scenarios"]) == (0, 12)
+        assert config["random_traffic"] is False
+        assert "scenario_seeds" not in config
+
+
+@pytest.mark.parametrize(("before", "after", "match"), [
+    ('name = "lead"', 'name = "curve"', "name"),
+    ('name = "curve"', 'name = "../curve"', "name"),
+    ('name = "curve"', 'name = ""', "name"),
+    ("train_seeds = [5, 0]", "train_seeds = []", "train_seeds"),
+    ("train_seeds = [5, 0]", "train_seeds = [true, 0]", "train_seeds"),
+    ("train_seeds = [5, 0]", "train_seeds = [5, 5]", "train_seeds"),
+    ("evaluation_seeds = [11, 2]", "evaluation_seeds = [-1]", "evaluation_seeds"),
+    ('map = "C"', 'map = "C"\nmap_config = { lane_num = 2 }', "map_config"),
+    ('map = "C"', "", "map_config"),
+    ('map = "C"', 'map = "C"\ndiscrete_action = true', "environment.common"),
+    ("store_map = true", "store_map = true\nmap = 3", "environment.common"),
+    ("store_map = true", "store_map = true\nrandom_traffic = true", "random_traffic"),
+    ('name = "curve"', 'name = "curve"\nunknown = 1', "unknown"),
+])
+def test_scene_group_rules_fail_during_config_loading(tmp_path, before, after, match):
+    with pytest.raises(ExperimentConfigError, match=match):
+        load_experiment_config(_write_config(tmp_path, GROUPS_TOML.replace(before, after, 1)))
+
+
+@pytest.mark.parametrize("stage", ["common", "train", "evaluation"])
+@pytest.mark.parametrize("entry", ["horizon = 100", "start_seed = 0", "num_scenarios = 1", "scenario_seeds = [0]"])
+def test_scene_groups_reject_stage_switches_and_scenario_controls(tmp_path, stage, entry):
+    if stage == "common":
+        text = GROUPS_TOML.replace("store_map = true", f"store_map = true\n{entry}")
+    else:
+        text = GROUPS_TOML.replace("[[environment.scene_groups]]", f"[environment.{stage}]\n{entry}\n\n[[environment.scene_groups]]", 1)
+    with pytest.raises(ExperimentConfigError, match=f"environment.{stage}"):
+        load_experiment_config(_write_config(tmp_path, text))
+
+
+def test_scene_group_example_has_four_groups_and_ten_scenes():
+    profile = load_experiment_config(PROJECT_ROOT / "configs/example_scene_groups.toml").profile
+    for config in (profile.train_env_config, profile.evaluation_env_config):
+        assert len(config["scene_groups"]) == 4
+        assert sum(len(group["seeds"]) for group in config["scene_groups"]) == 10
+
+
+def test_scene_groups_require_a_nonempty_array(tmp_path):
+    text = GROUPS_TOML.split("[[environment.scene_groups]]")[0] + "\n[environment]\nscene_groups = []\n"
+    with pytest.raises(ExperimentConfigError, match="scene_groups"):
+        load_experiment_config(_write_config(tmp_path, text))
+
+
+def test_scene_group_sampler_uses_flat_worker_local_choices_and_counts(monkeypatch):
+    from collections import Counter
+    import pickle
+    import random
+    import gymnasium as gym
+    import numpy as np
+    import torch
+    from metadrive.envs import MetaDriveEnv
+    import env_factory
+
+    groups = [{"name": "one", "seeds": [0], "env_config": {"map": "C"}},
+              {"name": "two", "seeds": [0, 3, 5], "env_config": {"map": "SSS", "accident_prob": 0.01}}]
+
+    class FakeEnv(gym.Env):
+        def __init__(self):
+            self.default_config_copy = MetaDriveEnv.default_config()
+            self.config = self.default_config_copy.copy()
+            self.engine = SimpleNamespace(
+                traffic_manager=SimpleNamespace(),
+                map_manager=SimpleNamespace(maps={}, current_map=None))
+            self.action_space = gym.spaces.Discrete(2)
+            self.observation_space = gym.spaces.Discrete(1)
+
+        def lazy_init(self):
+            pass
+
+        def reset(self, *, seed=None):
+            self.current_seed = seed
+            self.reset_accident_prob = self.config["accident_prob"]
+            return 0, {}
+
+    monkeypatch.setattr(env_factory, "make_env", lambda *_args, **_kwargs: env_factory._SceneGroupEnv(FakeEnv(), groups))
+    def global_state():
+        return pickle.dumps((random.getstate(), np.random.get_state(), torch.get_rng_state().numpy().tobytes()))
+    before = global_state()
+    envs = [env_factory.make_training_env(rank, 11, {"scene_groups": groups}) for rank in [0, 0, 1]]
+    try:
+        samples = []
+        for env in envs:
+            chosen = []
+            for _ in range(200):
+                env.reset()
+                chosen.append((env.get_wrapper_attr("current_scene_group"), env.unwrapped.current_seed))
+            samples.append(chosen)
+        assert samples[0] == samples[1]
+        assert samples[0] != samples[2]
+        counts = Counter(samples[0])
+        assert set(counts) == {("one", 0), ("two", 0), ("two", 3), ("two", 5)}
+        assert all(30 <= count <= 70 for count in counts.values())
+        assert envs[0].get_wrapper_attr("scene_group_reset_counts") == {
+            group["name"]: {seed: counts[(group["name"], seed)] for seed in group["seeds"]} for group in groups
+        }
+        envs[0].reset(seed=3, options={"scene_group": "two"})
+        assert envs[0].unwrapped.reset_accident_prob == 0
+        assert envs[0].unwrapped.config["accident_prob"] == 0.01
+        with pytest.raises(ValueError):
+            envs[0].reset(seed=3, options={"scene_group": "one"})
+        def fail_reset(**_kwargs):
+            raise RuntimeError("reset failure")
+        monkeypatch.setattr(envs[0].unwrapped, "reset", fail_reset)
+        with pytest.raises(RuntimeError, match="reset failure"):
+            envs[0].reset(seed=3, options={"scene_group": "two"})
+        assert envs[0].unwrapped.config["accident_prob"] == 0.01
+        assert global_state() == before
+    finally:
+        for env in envs:
+            env.close()
 
 
 @pytest.mark.parametrize("seeds", [[2, 5, 11], [5, 0, 3], [0]])

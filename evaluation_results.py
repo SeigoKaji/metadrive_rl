@@ -272,11 +272,13 @@ def _episode_visualization_paths(
     *,
     episode_number: int,
     scenario_seed: int,
+    scene_group: str | None = None,
 ) -> dict[str, Path]:
     """Return collision-free artifact paths for one evaluated episode."""
 
+    group_suffix = "" if scene_group is None else f"_{scene_group}"
     episode_dir = run_dir / "episodes" / (
-        f"episode_{episode_number:04d}_scenario_{scenario_seed:06d}"
+        f"episode_{episode_number:04d}{group_suffix}_scenario_{scenario_seed:06d}"
     )
     frame_dir = episode_dir / "frames"
     return {
@@ -314,16 +316,19 @@ class _EpisodeVisualizationRecorder:
         run_dir: Path,
         episode_number: int,
         scenario_seed: int,
+        scene_group: str | None = None,
         write_gif_trace: Callable[[Path, str, list[str]], None] | None = None,
     ) -> None:
         self.requested = bool(requested)
         self.episode_number = int(episode_number)
         self.scenario_seed = int(scenario_seed)
+        self.scene_group = scene_group
         self._write_gif_trace = write_gif_trace or _write_gif_trace
         self.paths = _episode_visualization_paths(
             run_dir,
             episode_number=self.episode_number,
             scenario_seed=self.scenario_seed,
+            scene_group=scene_group,
         )
 
         self.gif_result: dict[str, Any] = {
@@ -841,6 +846,7 @@ class _EpisodeVisualizationRecorder:
         return {
             "episode": self.episode_number,
             "scenario_seed": self.scenario_seed,
+            **({"scene_group": self.scene_group} if self.scene_group is not None else {}),
             "requested": self.requested,
             "artifact_directory": (
                 str(self.paths["directory"].resolve()) if self.requested else None

@@ -1,0 +1,87 @@
+# 設定が異なる4グループ・10シーンを、1つのPPOモデルで学習・評価する例。
+# CPU・4環境・4096 stepの短い接続確認用で、運転性能を保証する設定ではない。
+# 実行前に別名へコピーし、nameも未使用の値に変えて既存成果物を保護する。
+schema_version = 2
+name = "example_scene_groups"
+algorithm = "ppo"
+
+[training]
+policy = "MlpPolicy"
+seed = 0
+num_envs = 4
+n_steps = 256
+total_timesteps = 4096
+log_interval = 1
+device = "cpu"
+learning_rate = 0.0003
+batch_size = 64
+n_epochs = 10
+gamma = 0.99
+gae_lambda = 0.95
+clip_range = 0.2
+normalize_advantage = true
+ent_coef = 0.0
+vf_coef = 0.5
+max_grad_norm = 0.5
+
+[evaluation]
+record_gif = true
+seed = 0
+device = "cpu"
+deterministic = true
+
+# 全グループで固定する設定だけを置く。map、horizonなどの切替キーは各グループへ。
+[environment.common]
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+log_level = 50
+random_traffic = false
+store_map = true
+
+[[environment.scene_groups]]
+name = "curve__C"
+train_seeds = [0, 3, 5]
+evaluation_seeds = [0, 3, 5]
+[environment.scene_groups.common]
+map = "C"
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0
+traffic_mode = "trigger"
+accident_prob = 0
+
+[[environment.scene_groups]]
+name = "overtake_slow_lead__lane2_one"
+train_seeds = [0, 3, 5]
+# evaluation_seedsを省略したグループではtrain_seedsと同じ一覧を使う。
+[environment.scene_groups.common]
+map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0
+traffic_mode = "trigger"
+accident_prob = 0
+lead_vehicles = { count = [1, 1], distance_m = [30, 60], gap_m = [20, 40], speed_kmh = [12, 12], lane = "ego" }
+
+[[environment.scene_groups]]
+name = "overtake__lane2_respawn"
+train_seeds = [0, 3]
+[environment.scene_groups.common]
+map_config = { type = "block_sequence", config = "SSS", lane_num = 2 }
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0.2
+traffic_mode = "respawn"
+accident_prob = 0
+
+[[environment.scene_groups]]
+name = "intersection__cross_traffic"
+train_seeds = [0, 3]
+[environment.scene_groups.common]
+map = "SXS"
+horizon = 1000
+random_spawn_lane_index = false
+traffic_density = 0.15
+traffic_mode = "trigger"
+accident_prob = 0

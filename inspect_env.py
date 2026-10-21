@@ -52,9 +52,10 @@ class _CheckEnvFixedScenarioAdapter(gym.Wrapper):
     終了値には手を加えず、学習・評価にも使用しない。
     """
 
-    def __init__(self, env: gym.Env, *, scenario_seed: int) -> None:
+    def __init__(self, env: gym.Env, *, scenario_seed: int, scene_group: str | None = None) -> None:
         super().__init__(env)
         self._scenario_seed = scenario_seed
+        self._scene_group = scene_group
 
     def reset(
         self,
@@ -72,8 +73,11 @@ class _CheckEnvFixedScenarioAdapter(gym.Wrapper):
             self.action_space.seed(seed)
             self.observation_space.seed(seed)
 
-        reset_result = self.env.reset(seed=self._scenario_seed)
-        assert getattr(self.env, "current_seed", None) == self._scenario_seed
+        reset_options = {} if self._scene_group is None else {"options": {"scene_group": self._scene_group}}
+        reset_result = self.env.reset(seed=self._scenario_seed, **reset_options)
+        assert getattr(self.env.unwrapped, "current_seed", None) == self._scenario_seed
+        if self._scene_group is not None:
+            assert self.env.current_scene_group == self._scene_group
         return reset_result
 
 
@@ -265,7 +269,8 @@ def _print_effective_environment_config(
     """project専用キーを除き、raw環境の実効値を表示・検証する。"""
 
     requested = {
-        key: value for key, value in environment_config.items() if key != "scenario_seeds"
+        key: value for key, value in environment_config.items()
+        if key not in {"scenario_seeds", "scene_groups"}
     }
     actual_config = {key: _plain_config_value(actual[key]) for key in requested}
     print("\n== Effective values in env.config ==")
@@ -278,8 +283,6 @@ def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
 
     environment_config = environment_config_for_stage(experiment, stage)
     scenario_start, scenario_stop = _scenario_seed_bounds(environment_config)
-    scenario_seeds = environment_config.get("scenario_seeds")
-    inspection_seed = scenario_start if scenario_seeds is None else scenario_seeds[0]
     _print_versions()
     print("\n== Selected experiment ==")
     print(
@@ -297,91 +300,110 @@ def _run_inspection(experiment: ExperimentSelection, stage: str) -> None:
     print(json.dumps(environment_config, ensure_ascii=False, indent=2))
 
     env = make_env(environment_config)
-    checker_error: Exception | None = None
     try:
-        if scenario_seeds is None:
-            observation, reset_info = env.reset()
-        else:
-            observation, reset_info = env.reset(seed=inspection_seed)
-        observation_array = _assert_valid_observation(env, observation)
-
-        _print_effective_environment_config(env.config, environment_config)
-
-        print("\n== Spaces and reset observation ==")
-        print(f"observation_space: {env.observation_space}")
-        print(f"action_space: {env.action_space}")
-        print(f"observation_shape: {observation_array.shape}")
-        print(f"observation_dtype: {observation_array.dtype}")
-        print(f"observation_min: {float(observation_array.min())}")
-        print(f"observation_max: {float(observation_array.max())}")
-        print(f"observation_has_nan: {bool(np.isnan(observation_array).any())}")
-        print(f"observation_has_inf: {bool(np.isinf(observation_array).any())}")
-        print(f"reset_info_keys: {sorted(map(str, reset_info.keys()))}")
-
-        _print_action_conversion(env)
-
-        probe_result = env.step(env.action_space.sample())
-        assert isinstance(probe_result, tuple) and len(probe_result) == 5
-        probe_observation, probe_reward, terminated, truncated, step_info = probe_result
-        _assert_valid_observation(env, probe_observation)
-        assert isinstance(probe_reward, Real) and not isinstance(probe_reward, bool)
-        assert isinstance(terminated, bool)
-        assert isinstance(truncated, bool)
-        print("\n== One-step return ==")
-        print(f"step_info_keys: {sorted(map(str, step_info.keys()))}")
-        print(f"terminated: {terminated}")
-        print(f"truncated: {truncated}")
-
-        checker_target = env
-        checker_label = "raw check_env"
-        checker_description = "raw environment"
-        if scenario_seeds is not None:
-            checker_target = _CheckEnvFixedScenarioAdapter(env, scenario_seed=inspection_seed)
-            checker_label = "selected-list adapted check_env"
-            checker_description = f"selected-list inspection adapter (scenario={inspection_seed})"
-        print(f"\n== Stable-Baselines3 check_env: {checker_description} ==")
-        try:
-            check_env(checker_target, warn=True)
-        except Exception as error:
-            print(f"{checker_label} fatal error: {type(error).__name__}: {error}")
-            traceback.print_exc()
-            if scenario_seeds is None and _is_known_check_env_seed_conflict(error, environment_config):
-                print(
-                    "raw check_env compatibility finding: SB3 seed=0 conflicts "
-                    "with MetaDrive's configured scenario range "
-                    f"[{scenario_start}:{scenario_stop}); the adapter does not "
-                    "modify the task configuration"
-                )
-                print("\n== Stable-Baselines3 check_env: seed-only inspection adapter ==")
-                checker_env = _CheckEnvFixedScenarioAdapter(
-                    env,
-                    scenario_seed=inspection_seed,
-                )
-                try:
-                    check_env(checker_env, warn=True)
-                except Exception as adapter_error:
-                    checker_error = adapter_error
-                    print(
-                        "adapted check_env fatal error: "
-                        f"{type(adapter_error).__name__}: {adapter_error}"
-                    )
-                    traceback.print_exc()
-                else:
-                    print(
-                        "adapted check_env: PASS "
-                        f"(stage start scenario={scenario_start}; warnings, if any, "
-                        "are shown above)"
-                    )
-            else:
-                checker_error = error
-        else:
-            print(f"{checker_label}: PASS (warnings, if any, are shown above)")
-
-        # check_envは内部でreset/stepするため、random走行の開始状態を明示的に戻す。
-        _run_random_actions(checker_target, max_steps=50)
+        for group in environment_config.get("scene_groups", [None]):
+            requested = dict(environment_config)
+            name = None
+            if group is not None:
+                name = group["name"]
+                requested.update(group["env_config"], scenario_seeds=group["seeds"])
+                print(f"\n== Scene group: {name} ==")
+            _inspect_environment(env, requested, name)
     finally:
         env.close()
         print("environment closed: PASS")
+
+
+def _inspect_environment(
+    env: gym.Env, environment_config: Mapping[str, object], scene_group: str | None = None
+) -> None:
+    """Run the existing checks on one selected scene without creating another engine."""
+
+    scenario_start, scenario_stop = _scenario_seed_bounds(environment_config)
+    scenario_seeds = environment_config.get("scenario_seeds")
+    inspection_seed = scenario_start if scenario_seeds is None else scenario_seeds[0]
+    host_env = getattr(env, "unwrapped", env)
+    checker_error: Exception | None = None
+    checker_target = env if scenario_seeds is None else _CheckEnvFixedScenarioAdapter(
+        env, scenario_seed=inspection_seed, scene_group=scene_group
+    )
+    observation, reset_info = checker_target.reset()
+    observation_array = _assert_valid_observation(env, observation)
+
+    _print_effective_environment_config(host_env.config, environment_config)
+
+    print("\n== Spaces and reset observation ==")
+    print(f"observation_space: {env.observation_space}")
+    print(f"action_space: {env.action_space}")
+    print(f"observation_shape: {observation_array.shape}")
+    print(f"observation_dtype: {observation_array.dtype}")
+    print(f"observation_min: {float(observation_array.min())}")
+    print(f"observation_max: {float(observation_array.max())}")
+    print(f"observation_has_nan: {bool(np.isnan(observation_array).any())}")
+    print(f"observation_has_inf: {bool(np.isinf(observation_array).any())}")
+    print(f"reset_info_keys: {sorted(map(str, reset_info.keys()))}")
+
+    _print_action_conversion(host_env)
+
+    probe_result = env.step(env.action_space.sample())
+    assert isinstance(probe_result, tuple) and len(probe_result) == 5
+    probe_observation, probe_reward, terminated, truncated, step_info = probe_result
+    _assert_valid_observation(env, probe_observation)
+    assert isinstance(probe_reward, Real) and not isinstance(probe_reward, bool)
+    assert isinstance(terminated, bool)
+    assert isinstance(truncated, bool)
+    print("\n== One-step return ==")
+    print(f"step_info_keys: {sorted(map(str, step_info.keys()))}")
+    print(f"terminated: {terminated}")
+    print(f"truncated: {truncated}")
+
+    checker_label = "raw check_env"
+    checker_description = "raw environment"
+    if scenario_seeds is not None:
+        checker_label = "selected-list adapted check_env"
+        checker_description = f"selected-list inspection adapter (scenario={inspection_seed})"
+        if scene_group is not None:
+            checker_description = f"scene-group inspection adapter ({scene_group}, scenario={inspection_seed})"
+    print(f"\n== Stable-Baselines3 check_env: {checker_description} ==")
+    try:
+        check_env(checker_target, warn=True)
+    except Exception as error:
+        print(f"{checker_label} fatal error: {type(error).__name__}: {error}")
+        traceback.print_exc()
+        if scenario_seeds is None and _is_known_check_env_seed_conflict(error, environment_config):
+            print(
+                "raw check_env compatibility finding: SB3 seed=0 conflicts "
+                "with MetaDrive's configured scenario range "
+                f"[{scenario_start}:{scenario_stop}); the adapter does not "
+                "modify the task configuration"
+            )
+            print("\n== Stable-Baselines3 check_env: seed-only inspection adapter ==")
+            checker_env = _CheckEnvFixedScenarioAdapter(
+                env,
+                scenario_seed=inspection_seed,
+            )
+            try:
+                check_env(checker_env, warn=True)
+            except Exception as adapter_error:
+                checker_error = adapter_error
+                print(
+                    "adapted check_env fatal error: "
+                    f"{type(adapter_error).__name__}: {adapter_error}"
+                )
+                traceback.print_exc()
+            else:
+                print(
+                    "adapted check_env: PASS "
+                    f"(stage start scenario={scenario_start}; warnings, if any, "
+                    "are shown above)"
+                )
+        else:
+            checker_error = error
+    else:
+        print(f"{checker_label}: PASS (warnings, if any, are shown above)")
+
+    # check_envは内部でreset/stepするため、random走行の開始状態を明示的に戻す。
+    _run_random_actions(checker_target, max_steps=50)
 
     if checker_error is not None:
         raise RuntimeError("check_env reported a fatal error; see the inspection log") from checker_error

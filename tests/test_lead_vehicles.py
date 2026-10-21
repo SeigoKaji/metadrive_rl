@@ -189,3 +189,141 @@ def test_config_loader_start_lane_and_lookahead_share_one_real_step(tmp_path):
     finally:
         env.close()
     assert not engine_initialized()
+
+
+def _scene_group_snapshot(env):
+    raw = env.unwrapped
+    graph = raw.current_map.road_network.graph
+    lanes = [(a, b, lane) for a in sorted(graph) for b in sorted(graph[a])
+             for lane in graph[a][b]]
+
+    def objects(manager):
+        rows = sorted((type(v).__name__, str(getattr(v, "lane_index", None)),
+                       *map(float, v.position), float(v.heading_theta))
+                      for v in manager.spawned_objects.values()) if manager else []
+        return ([row[:2] for row in rows],
+                np.asarray([row[2:] for row in rows]).reshape(len(rows), 3))
+
+    managers = raw.engine.managers
+    lead = managers.get("lead_vehicle_manager")
+    return {
+        "blocks": [block.ID for block in raw.current_map.blocks],
+        "lanes": [(a, b, lane.index[2]) for a, b, lane in lanes],
+        "geometry": np.asarray([(lane.length, lane.width) for _, _, lane in lanes]),
+        "bounds": raw.current_map.road_network.get_bounding_box(),
+        "ego_lane": raw.agent.lane_index,
+        "ego_position": tuple(raw.agent.position),
+        "settings": (raw.config["horizon"], raw.config["random_spawn_lane_index"],
+                     raw.config["traffic_density"], raw.engine.traffic_manager.mode,
+                     raw.config["accident_prob"]),
+        "lead_records": deepcopy(lead.records) if lead else [],
+        "lead": objects(lead),
+        # Include waiting trigger vehicles as well as active traffic vehicles.
+        "traffic": objects(raw.engine.traffic_manager),
+        "accident": objects(managers.get("object_manager")),
+    }
+
+
+def _assert_same_scene(actual, expected):
+    for key in ("blocks", "lanes", "ego_lane", "settings", "lead_records"):
+        assert actual[key] == expected[key], key
+    for key in ("geometry", "bounds", "ego_position"):
+        np.testing.assert_allclose(actual[key], expected[key], rtol=0, atol=1e-4, err_msg=key)
+    for key in ("lead", "traffic", "accident"):
+        assert actual[key][0] == expected[key][0], key
+        np.testing.assert_allclose(actual[key][1], expected[key][1], rtol=0, atol=1e-4, err_msg=key)
+
+
+@pytest.mark.parametrize("store_map", [True, False])
+def test_scene_groups_match_fresh_scenes_and_destroy_every_map(store_map):
+    import gc
+
+    common = {
+        "discrete_action": True, "discrete_throttle_dim": 3,
+        "discrete_steering_dim": 3, "random_traffic": False, "log_level": 50,
+        "start_seed": 0, "num_scenarios": 4, "store_map": store_map,
+        "crash_vehicle_done": False, "crash_object_done": False, "out_of_road_done": False,
+    }
+    groups = [
+        {"name": "curve", "seeds": [0, 3], "env_config": {
+            "map": "C", "traffic_density": 0, "accident_prob": 0.01,
+            "horizon": 75, "random_spawn_lane_index": True}},
+        {"name": "lead", "seeds": [0], "env_config": {
+            "map_config": {"type": "block_sequence", "config": "SSS", "lane_num": 2},
+            "traffic_density": 0, "lead_vehicles": LEAD,
+            "horizon": 90, "random_spawn_lane_index": False}},
+        {"name": "trigger", "seeds": [0], "env_config": {
+            "map": "SXS", "traffic_density": 0.15, "traffic_mode": "trigger",
+            "horizon": 75, "random_spawn_lane_index": True}},
+        {"name": "respawn", "seeds": [0], "env_config": {
+            "map_config": {"type": "block_sequence", "config": "SSS", "lane_num": 3},
+            "traffic_density": 0.2, "traffic_mode": "respawn",
+            "horizon": 90, "random_spawn_lane_index": False}},
+        {"name": "accident", "seeds": [0], "env_config": {
+            "map_config": {"type": "block_sequence", "config": "SSS", "lane_num": 2},
+            "traffic_density": 0.05, "traffic_mode": "trigger", "accident_prob": 1,
+            "horizon": 75, "random_spawn_lane_index": True}},
+    ]
+
+    def run_episode(env, reset_kwargs, maps):
+        env.reset(**reset_kwargs)
+        raw = env.unwrapped
+        maps.append(raw.current_map)
+        initial = _scene_group_snapshot(env)
+        horizon = raw.config["horizon"]
+        at_60 = None
+        for step in range(1, horizon + 1):
+            _, _, terminated, truncated, info = env.step(4)
+            assert not terminated
+            assert info["max_step"] == truncated == (step == horizon)
+            if step == 60:
+                at_60 = _scene_group_snapshot(env)
+        return initial, at_60
+
+    expected = {}
+    for group in groups:
+        for seed in group["seeds"]:
+            maps = []
+            env = make_env(deepcopy({**common, **group["env_config"]}))
+            try:
+                expected[group["name"], seed] = run_episode(env, {"seed": seed}, maps)
+            finally:
+                if not store_map and maps:
+                    # Upstream raw close only destroys cached maps; this fixture
+                    # must also unload its uncached map. Group close is tested unaided.
+                    env.unwrapped.engine.map_manager.unload_map(maps[-1])
+                env.close()
+            assert all(m.road_network is None and not m.blocks for m in maps)
+            assert not engine_initialized()
+    assert len(expected["accident", 0][0]["accident"][0]) > 0
+    assert len(expected["trigger", 0][0]["traffic"][0]) > 0
+    assert len(expected["respawn", 0][0]["traffic"][0]) > 0
+    assert expected["curve", 3][0]["ego_lane"][2] != 0
+    assert expected["lead", 0][0]["ego_lane"][2] == 0
+
+    maps = []
+    seen = {}
+    env = make_env(deepcopy({**common, "scene_groups": groups}))
+    try:
+        visits = [(g["name"], 0) for g in groups] + [
+            ("curve", 3), ("lead", 0), ("respawn", 0), ("curve", 0), ("accident", 0)]
+        for name, seed in visits:
+            actual = run_episode(env, {"seed": seed, "options": {"scene_group": name}}, maps)
+            if store_map and (name, seed) in seen:
+                assert maps[-1] is seen[name, seed]
+            elif not store_map:
+                assert all(maps[-1] is not old for old in maps[:-1])
+            seen[name, seed] = maps[-1]
+            for step, (observed, reference) in enumerate(zip(actual, expected[name, seed])):
+                try:
+                    _assert_same_scene(observed, reference)
+                except AssertionError as error:
+                    raise AssertionError(f"group={name}, seed={seed}, step={step * 60}: {error}") from error
+            if not store_map:
+                assert all(m is None for cache in env._group_maps.values() for m in cache.values())
+    finally:
+        env.close()
+    assert all(m.road_network is None and not m.blocks for m in maps)
+    assert not env._group_maps and not engine_initialized()
+    del maps, seen, env
+    gc.collect()

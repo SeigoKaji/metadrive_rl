@@ -23,12 +23,12 @@ from evaluate import parse_args as parse_evaluation_args
 
 
 @pytest.mark.parametrize("experiment_name", ["official", "custom_run", "custom.v2", "custom.zip"])
-@pytest.mark.parametrize("scenario_seeds", [None, [5, 0, 3], [11]])
+@pytest.mark.parametrize("scenario_seeds", [None, [5, 0, 3], [11], "groups"])
 def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     experiment_name: str,
-    scenario_seeds: list[int] | None,
+    scenario_seeds: list[int] | str | None,
 ) -> None:
     """SB3をmockし、10 scalarがconstructorとmetadataの双方へ届くことを確認する。"""
 
@@ -44,6 +44,12 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
             self.closed = True
 
         def get_attr(self, name):
+            if scenario_seeds == "groups":
+                assert name == "scene_group_reset_counts"
+                return [
+                    {"curve__C": {5: 1, 1: 2}, "traffic__SSS": {5: 3}},
+                    {"curve__C": {5: 4, 1: 1}, "traffic__SSS": {5: 0}},
+                ]
             assert scenario_seeds is not None
             assert name == "scenario_reset_counts"
             if len(scenario_seeds) == 1:
@@ -87,7 +93,29 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     text = canonical_config_path("official").read_text(encoding="utf-8").replace(
         'name = "official"', f'name = "{experiment_name}"'
     )
-    if scenario_seeds is not None:
+    if scenario_seeds == "groups":
+        text = text.split("[environment.common]", 1)[0] + '''[environment.common]
+discrete_action = true
+discrete_throttle_dim = 3
+discrete_steering_dim = 3
+log_level = 50
+[[environment.scene_groups]]
+name = "curve__C"
+train_seeds = [5, 1]
+evaluation_seeds = [1]
+[environment.scene_groups.common]
+map = "C"
+horizon = 500
+[[environment.scene_groups]]
+name = "traffic__SSS"
+train_seeds = [5]
+[environment.scene_groups.common]
+map = "SSS"
+traffic_density = 0.1
+[environment.train]
+[environment.evaluation]
+'''
+    elif scenario_seeds is not None:
         text = text.replace("start_seed = 5\nnum_scenarios = 1", f"scenario_seeds = {scenario_seeds}")
     config_path.write_text(text, encoding="utf-8")
     args = train_module.parse_args(["--config", str(config_path)])
@@ -133,7 +161,17 @@ def test_training_forwards_all_resolved_ppo_scalars_and_records_metadata(
     assert resolved["n_steps"] == args.n_steps
     assert resolved["tensorboard_log"] == str(tensorboard_log_dir)
     assert training_metadata["ppo_seed_argument"] is None
-    if scenario_seeds is not None:
+    if scenario_seeds == "groups":
+        assert training_metadata["scene_groups"] == args.experiment.profile.train_env_config["scene_groups"]
+        assert training_metadata["scene_group_reset_counts"] == {
+            "curve__C": {"5": 5, "1": 3}, "traffic__SSS": {"5": 3}
+        }
+        assert training_metadata["scenario_sampling_reproducible_from_rl_seed"] is True
+        assert "uniformly from all (scene_group, seed) pairs" in training_metadata["scenario_sampling_note"]
+        assert "scenario_seed" not in training_metadata
+        assert "scenario_seeds" not in training_metadata
+        assert "scenario_reset_counts" not in training_metadata
+    elif scenario_seeds is not None:
         assert training_metadata["scenario_seeds"] == scenario_seeds
         expected_counts = {"11": 3} if len(scenario_seeds) == 1 else {"5": 3, "0": 2, "3": 4}
         assert training_metadata["scenario_reset_counts"] == expected_counts

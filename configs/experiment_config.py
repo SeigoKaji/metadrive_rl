@@ -138,7 +138,11 @@ _EVALUATION_OPTIONAL_KEYS = frozenset(
         "deterministic",
     }
 )
-_ENVIRONMENT_KEYS = frozenset({"common", "train", "evaluation"})
+_ENVIRONMENT_KEYS = frozenset({"common", "train", "evaluation", "scene_groups"})
+SCENE_GROUP_SWITCH_KEYS: Final[frozenset[str]] = frozenset({
+    "map", "map_config", "traffic_density", "traffic_mode", "accident_prob",
+    "lead_vehicles", "horizon", "random_spawn_lane_index",
+})
 _MAX_RL_SEED = 2**32 - 1
 
 
@@ -373,6 +377,49 @@ def _validate_lookahead(value: object) -> Mapping[str, object] | None:
         raise ExperimentConfigError(str(error)) from error
 
 
+def _scene_group_environments(
+    environment: Mapping[str, object], common: Mapping[str, PlainData]
+) -> tuple[dict[str, object], dict[str, object]]:
+    stages = {stage: _plain_table(environment.get(stage, {}), f"environment.{stage}")
+              for stage in ("train", "evaluation")}
+    for stage, values in {"common": common, **stages}.items():
+        forbidden = set(values) & (SCENE_GROUP_SWITCH_KEYS | {"start_seed", "num_scenarios", "scenario_seeds"})
+        if forbidden:
+            raise _error(f"environment.{stage}",
+                         f"scene_groups使用時は {', '.join(sorted(forbidden))} を各グループへ移してください")
+        if _require_bool(values.get("random_traffic", False), f"environment.{stage}.random_traffic"):
+            raise _error(f"environment.{stage}.random_traffic", "scene_groupsではfalseにしてください")
+    entries = environment["scene_groups"]
+    if not isinstance(entries, list) or not entries:
+        raise _error("environment.scene_groups", "空でないグループ配列で指定してください")
+    groups, names, all_seeds = [], set(), []
+    for index, entry in enumerate(entries):
+        location = f"environment.scene_groups[{index}]"
+        group = _table(entry, location)
+        _reject_unknown_keys(group, allowed=frozenset({"name", "train_seeds", "evaluation_seeds", "common"}), location=location)
+        name = _safe_basename(group.get("name"), f"{location}.name")
+        if name in names:
+            raise _error(f"{location}.name", "グループ名を重複させないでください")
+        names.add(name)
+        train_seeds = validate_scenario_seeds(group.get("train_seeds"), f"{location}.train_seeds")
+        evaluation_seeds = validate_scenario_seeds(group.get("evaluation_seeds", train_seeds), f"{location}.evaluation_seeds")
+        scene = _plain_table(group.get("common"), f"{location}.common")
+        unknown = sorted(set(scene) - SCENE_GROUP_SWITCH_KEYS)
+        if unknown:
+            raise _error(f"{location}.common", f"{', '.join(unknown)} は切替対象外です。[environment.common]へ移してください")
+        if ("map" in scene) == ("map_config" in scene):
+            raise _error(f"{location}.common", "mapまたはmap_configをどちらか一方だけ指定してください")
+        groups.append((name, train_seeds, evaluation_seeds, scene))
+        all_seeds.extend([*train_seeds, *evaluation_seeds])
+    return tuple({
+        **_deep_merge(common, stages[stage]), "random_traffic": False,
+        "start_seed": min(all_seeds), "num_scenarios": max(all_seeds) - min(all_seeds) + 1,
+        "scene_groups": [{"name": name, "seeds": train if stage == "train" else evaluation,
+                          "env_config": _clone_plain(scene)}
+                         for name, train, evaluation, scene in groups],
+    } for stage in ("train", "evaluation"))
+
+
 def _validate_evaluation_action_compatibility(
     environment: Mapping[str, object],
     location: str,
@@ -604,20 +651,21 @@ def _profile_from_toml(raw: object) -> tuple[str, ExperimentProfile]:
         location="environment",
     )
     common = _plain_table(environment.get("common", {}), "environment.common")
-    train = _plain_table(
-        _required_table(environment, "train", "environment.train"),
-        "environment.train",
-    )
-    evaluation_environment = _plain_table(
-        _required_table(environment, "evaluation", "environment.evaluation"),
-        "environment.evaluation",
-    )
-    train_env_config = _validate_environment(
-        _deep_merge(common, train), "environment.train"
-    )
-    evaluation_env_config = _validate_environment(
-        _deep_merge(common, evaluation_environment), "environment.evaluation"
-    )
+    if "scene_groups" in environment:
+        train_env_config, evaluation_env_config = _scene_group_environments(environment, common)
+    else:
+        train = _plain_table(
+            _required_table(environment, "train", "environment.train"),
+            "environment.train",
+        )
+        evaluation_environment = _plain_table(
+            _required_table(environment, "evaluation", "environment.evaluation"),
+            "environment.evaluation",
+        )
+        train_env_config = _validate_environment(_deep_merge(common, train), "environment.train")
+        evaluation_env_config = _validate_environment(
+            _deep_merge(common, evaluation_environment), "environment.evaluation"
+        )
     _validate_evaluation_action_compatibility(train_env_config, "environment.train")
     _validate_evaluation_action_compatibility(
         evaluation_env_config,
