@@ -1,0 +1,445 @@
+diff --git a/README.md b/README.md
+index cfb187e..a80c56c 100644
+--- a/README.md
++++ b/README.md
+@@ -66,6 +66,8 @@ python3 -m venv .venv
+ 
+ 別のモデルを指定する場合は、`--model models/<model-name>.zip` を追加します。
+ 
++`[lookahead]` 付きで学習したモデルを同じ設定で評価すると、各エピソードの GIF・MP4・PNG に、検証済みの車線中心線を青緑の線、そのステップの行動を選ぶ際に観測した注視点を橙色の輪で表示します。カメラは固定経路全体が収まる画角です。車両は行動後の位置に描きます。注視点が無効なステップは凡例に `Decision lookahead (unavailable)` と表示し、輪を省きます。点の世界座標は `evaluation_steps.jsonl` の `lookahead_learning.pre_step.preview.q_xy`、有効フラグは同じ箇所の `preview_valid` です。
++
+ 学習・評価の成果物は、TOML の `name` を使った `outputs/<name>/training/` と `outputs/<name>/evaluation/` に保存します。同じ `name` で再実行すると同じ保存先を更新します。評価対象のモデルや `evaluation.output_prefix` を変えても、成果物ディレクトリは変わりません。この作業環境の既存成果物もこの構成へ移行済みです。同居していた `official_start_lane_return_penalty200` は別の実験フォルダに分けて保持しています。
+ 
+ ## configファイル
+diff --git a/evaluate.py b/evaluate.py
+index 42adf6c..1d9463f 100644
+--- a/evaluate.py
++++ b/evaluate.py
+@@ -522,6 +522,10 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
+                     episode_number=episode_number,
+                     scenario_seed=actual_scenario_seed,
+                     scene_group=scene_group,
++                    reference_path=(
++                        env.get_wrapper_attr("reference_path")
++                        if record_gif and lookahead_config is not None else None
++                    ),
+                     write_gif_trace=_write_gif_trace,
+                 )
+                 active_recorder.prepare()
+diff --git a/evaluation_results.py b/evaluation_results.py
+index 1f78c4d..3c788a5 100644
+--- a/evaluation_results.py
++++ b/evaluation_results.py
+@@ -9,7 +9,7 @@ import sys
+ import traceback
+ from collections.abc import Callable
+ from pathlib import Path
+-from typing import Any, Mapping, TextIO
++from typing import TYPE_CHECKING, Any, Mapping, TextIO
+ 
+ import numpy as np
+ from PIL import Image
+@@ -21,13 +21,18 @@ from evaluation_visualization import (
+     SimulationTiming,
+     compose_telemetry_panel,
+     decode_discrete_action,
++    overlay_lookahead_bev,
+     replace_latest_recorded_frame,
+ )
+ 
++if TYPE_CHECKING:
++    from lookahead_learning.geometry import ReferencePath
+ 
++
++_BEV_SCREEN_SIZE = (600, 600)
+ GIF_RENDER_API = (
+     'env.render(mode="topdown", screen_record=True, window=False, '
+-    "screen_size=(600, 600), camera_position=(50, 50))"
++    f"screen_size={_BEV_SCREEN_SIZE}, camera_position=(50, 50))"
+ )
+ GIF_GENERATE_API = (
+     "env.top_down_renderer.generate_gif("
+@@ -317,12 +322,16 @@ class _EpisodeVisualizationRecorder:
+         episode_number: int,
+         scenario_seed: int,
+         scene_group: str | None = None,
++        reference_path: ReferencePath | None = None,
+         write_gif_trace: Callable[[Path, str, list[str]], None] | None = None,
+     ) -> None:
+         self.requested = bool(requested)
+         self.episode_number = int(episode_number)
+         self.scenario_seed = int(scenario_seed)
+         self.scene_group = scene_group
++        self.reference_path = reference_path
++        self.route_xy: list[tuple[float, float]] = []
++        self.camera_options: dict[str, Any] = {"camera_position": (50, 50)}
+         self._write_gif_trace = write_gif_trace or _write_gif_trace
+         self.paths = _episode_visualization_paths(
+             run_dir,
+@@ -447,6 +456,29 @@ class _EpisodeVisualizationRecorder:
+         except Exception:
+             self.frame_dump_exception_trace = traceback.format_exc()
+ 
++    def _configure_route_view(self, path: ReferencePath) -> None:
++        """Sample the validated lane centers once and fit them in the episode view."""
++
++        for lane in path.lanes:
++            # Keep the actual lane ends and follow arcs at intervals of at most 1 m.
++            distances = np.linspace(0.0, lane.length, math.ceil(lane.length) + 1)
++            for distance in distances:
++                x, y = lane.position(distance, 0.0)
++                self.route_xy.append((float(x), float(y)))
++        if not self.route_xy:
++            return
++        low = np.min(self.route_xy, axis=0)
++        high = np.max(self.route_xy, axis=0)
++        center = tuple(float(coordinate) for coordinate in (low + high) / 2)
++        # Use the usual 5 px/m whenever the full route fits with a 24 px margin.
++        span_m = max(1.0, float(np.max(high - low)))
++        scaling = min(5.0, (min(_BEV_SCREEN_SIZE) - 48) / span_m)
++        self.camera_options = {"camera_position": center, "scaling": scaling}
++        self.gif_result["render_api"] = (
++            'env.render(mode="topdown", screen_record=True, window=False, '
++            f"screen_size={_BEV_SCREEN_SIZE}, camera_position={center}, scaling={scaling})"
++        )
++
+     def record_frame(
+         self,
+         *,
+@@ -460,19 +492,34 @@ class _EpisodeVisualizationRecorder:
+             return
+ 
+         try:
+-            if GIF_RENDER_API not in self.gif_attempted_apis:
+-                self.gif_attempted_apis.append(GIF_RENDER_API)
++            if self.frame_count == 0 and self.reference_path is not None:
++                self._configure_route_view(self.reference_path)
++            render_api = self.gif_result["render_api"]
++            if render_api not in self.gif_attempted_apis:
++                self.gif_attempted_apis.append(render_api)
+             rendered_frame = env.render(
+                 mode="topdown",
+                 screen_record=True,
+                 window=False,
+-                screen_size=(600, 600),
+-                camera_position=(50, 50),
++                screen_size=_BEV_SCREEN_SIZE,
++                **self.camera_options,
+             )
+             renderer = env.top_down_renderer
+             if renderer is None:
+                 raise RuntimeError("top_down_renderer was not created")
+             self.renderer = renderer
++            goal_valid = None
++            if self.reference_path is not None:
++                # The policy selected the displayed action using the pre-step
++                # observation. The returned post-step point is for the next action.
++                preview = telemetry["lookahead_learning"]["pre_step"]["preview"]
++                goal_valid = preview["preview_valid"]
++                rendered_frame = overlay_lookahead_bev(
++                    rendered_frame,
++                    renderer,
++                    route_xy=self.route_xy,
++                    preview_goal_xy=preview["q_xy"] if goal_valid else None,
++                )
+             action_history = [
+                 decode_discrete_action(action_id, env.config)
+                 for action_id in switch_tracker.history
+@@ -481,6 +528,7 @@ class _EpisodeVisualizationRecorder:
+                 rendered_frame,
+                 telemetry,
+                 action_history,
++                decision_lookahead_valid=goal_valid,
+             )
+             replace_latest_recorded_frame(renderer, panel_frame)
+         except Exception:
+diff --git a/evaluation_visualization.py b/evaluation_visualization.py
+index da210a2..a5fbeb0 100644
+--- a/evaluation_visualization.py
++++ b/evaluation_visualization.py
+@@ -19,6 +19,9 @@ from PIL import Image, ImageDraw, ImageFont
+ GIF_FRAME_DURATION_MS = 100
+ TELEMETRY_PANEL_WIDTH = 320
+ ACTION_HISTORY_SECONDS = 2.0
++_REFERENCE_ROUTE_COLOR = (0, 139, 153)
++_DECISION_LOOKAHEAD_COLOR = (255, 163, 35)
++_DECISION_LOOKAHEAD_OUTLINE = (54, 31, 12)
+ 
+ 
+ STEP_TELEMETRY_FIELDS: tuple[str, ...] = (
+@@ -505,12 +508,79 @@ def _history_colors(action: DecodedAction) -> tuple[tuple[int, int, int], tuple[
+     return steering_color, throttle_color
+ 
+ 
++def overlay_lookahead_bev(
++    frame: np.ndarray,
++    renderer: Any,
++    *,
++    route_xy: Sequence[tuple[float, float]] = (),
++    preview_goal_xy: Sequence[float] | None = None,
++) -> np.ndarray:
++    """Draw world-space geometry in the evaluator's fixed, north-up camera."""
++
++    if len(route_xy) < 2 and preview_goal_xy is None:
++        return frame
++    # Use the same WorldSurface and integer blit area as TopDownRenderer._draw.
++    # In particular, ``pos2pix`` includes the origin, Y inversion and scaling
++    # resolved by the renderer itself when it creates the map surface.
++    height, width = frame.shape[:2]
++    canvas = renderer._frame_canvas
++    center_x, center_y = canvas.pos2pix(*renderer.position)
++    left = int(center_x - width / 2)
++    top = int(center_y - height / 2)
++
++    def project(point: Sequence[float]) -> tuple[int, int]:
++        x, y = canvas.pos2pix(*point)
++        return x - left, y - top
++
++    output = frame.copy()
++    if len(route_xy) >= 2:
++        from pygame import surfarray
++
++        mask = Image.new("1", (width, height))
++        ImageDraw.Draw(mask).line([project(point) for point in route_xy], fill=1, width=3)
++        rows, cols = np.nonzero(np.asarray(mask))
++        map_x, map_y = cols + left, rows + top
++        backdrop = renderer._background_canvas
++        backdrop_width, backdrop_height = backdrop.get_size()
++        on_canvas = (map_x >= 0) & (map_x < backdrop_width) & (map_y >= 0) & (map_y < backdrop_height)
++        rows, cols = rows[on_canvas], cols[on_canvas]
++        # The base map is copied before MetaDrive draws traffic and history.
++        # Keep those foreground pixels above the reference route.
++        backdrop_pixels = surfarray.pixels3d(backdrop)
++        reference_pixels = backdrop_pixels[map_x[on_canvas], map_y[on_canvas]]
++        del backdrop_pixels
++        map_only = np.all(frame[rows, cols] == reference_pixels, axis=1)
++        output[rows[map_only], cols[map_only]] = _REFERENCE_ROUTE_COLOR
++
++    if preview_goal_xy is None:
++        return output
++    image = Image.fromarray(output)
++    x, y = project(preview_goal_xy)
++    _draw_decision_lookahead_marker(ImageDraw.Draw(image), x, y)
++    return np.asarray(image)
++
++
++def _draw_decision_lookahead_marker(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
++    radius = 7
++    draw.ellipse(
++        (x - radius, y - radius, x + radius, y + radius),
++        outline=_DECISION_LOOKAHEAD_OUTLINE,
++        width=3,
++    )
++    draw.ellipse(
++        (x - radius + 1, y - radius + 1, x + radius - 1, y + radius - 1),
++        outline=_DECISION_LOOKAHEAD_COLOR,
++        width=2,
++    )
++
++
+ def compose_telemetry_panel(
+     frame: np.ndarray,
+     telemetry: Mapping[str, Any],
+     action_history: Sequence[DecodedAction],
+     *,
+     panel_width: int = TELEMETRY_PANEL_WIDTH,
++    decision_lookahead_valid: bool | None = None,
+ ) -> np.ndarray:
+     """Append a high-contrast telemetry panel without obscuring the map frame."""
+ 
+@@ -645,6 +715,19 @@ def compose_telemetry_panel(
+             fill=muted,
+             font=small_font,
+         )
++        y += 43
++
++    if decision_lookahead_valid is not None:
++        divider()
++        draw.line((x, y + 7, x + 14, y + 7), fill=_REFERENCE_ROUTE_COLOR, width=3)
++        draw.text((x + 24, y), "Fixed reference route", fill=light, font=small_font)
++        y += 18
++        if decision_lookahead_valid:
++            _draw_decision_lookahead_marker(draw, x + 7, y + 7)
++            label = "Decision lookahead"
++        else:
++            label = "Decision lookahead (unavailable)"
++        draw.text((x + 24, y), label, fill=light, font=small_font)
+ 
+     return np.asarray(output)
+ 
+@@ -652,9 +735,8 @@ def compose_telemetry_panel(
+ def replace_latest_recorded_frame(renderer: Any, frame: np.ndarray) -> None:
+     """Replace MetaDrive 0.4.3's latest recorded frame with a local composite.
+ 
+-    MetaDrive exposes ``screen_frames`` as a deep-copy-only property. The
+-    version-pinned evaluator therefore contains this single private-API touch
+-    here instead of modifying the upstream renderer or spreading the dependency.
++    MetaDrive's public ``screen_frames`` property returns a deep copy, so GIF
++    export needs the composite written into the original frame buffer.
+     """
+ 
+     frames = getattr(renderer, "_screen_frames", None)
+diff --git a/lookahead_learning/adapter.py b/lookahead_learning/adapter.py
+index fd34940..2fb17a0 100644
+--- a/lookahead_learning/adapter.py
++++ b/lookahead_learning/adapter.py
+@@ -28,7 +28,7 @@ from .prediction import MotionState, PredictionReference, time_lookahead_distanc
+ 
+ if TYPE_CHECKING:
+     from .env import LookaheadEnv
+-    from .geometry import RouteCurvatureProfile
++    from .geometry import ReferencePath, RouteBuildResult, RouteCurvatureProfile
+ 
+ 
+ PREVIEW_FEATURE_DIM: Final[int] = 3
+@@ -1007,7 +1007,7 @@ def build_fixed_navigation_route(
+     endpoint_tolerance_m: float = 1.0e-3,
+     width_tolerance_m: float = 1.0e-3,
+     tangent_tolerance_rad: float = 1.0e-3,
+-) -> object:
++) -> RouteBuildResult:
+     """Build the fixed directed route from the post-reset Navigation state.
+ 
+     The returned object is :class:`lookahead_learning.geometry.RouteBuildResult`.  A
+@@ -1240,13 +1240,19 @@ class MetaDrivePreviewProvider:
+         self.include_lateral_accel = include_lateral_accel
+         self._radius_reader = radius_reader
+         self._curvature_profile: RouteCurvatureProfile | None = None
+-        self._route: object | None = None
++        self._route: RouteBuildResult | None = None
+         self._episode_key: object = None
+         self._target_ordinal: int | None = None
+         self._target_ordinal_persistent = False
+         self._reference_preview: Mapping[str, object] | None = None
+         self._reference_projection = None
+ 
++    @property
++    def reference_path(self) -> ReferencePath | None:
++        """Return the validated geometry used by this episode's previews."""
++
++        return None if self._route is None else self._route.path
++
+     def reset(self, env: object) -> None:
+         """Rebuild route state exactly once after the raw environment reset."""
+ 
+diff --git a/lookahead_learning/env.py b/lookahead_learning/env.py
+index 3c89824..14567d5 100644
+--- a/lookahead_learning/env.py
++++ b/lookahead_learning/env.py
+@@ -41,7 +41,7 @@ from .adapter import (
+     simulation_dt_seconds,
+ )
+ from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
+-from .geometry import NORMALIZATION_DISTANCE_M, pp_penalty_result
++from .geometry import NORMALIZATION_DISTANCE_M, ReferencePath, pp_penalty_result
+ from .prediction import MotionState, PredictionEpisodeMetrics, PredictionResult, prediction_penalty
+ from .lateral_acceleration import (
+     LateralEpisodeMetrics, LateralReference, lateral_accel_penalty, planar_speed_mps,
+@@ -815,6 +815,12 @@ class LookaheadEnv(gym.Wrapper):
+     def contract(self) -> ObservationContract:
+         return self._contract
+ 
++    @property
++    def reference_path(self) -> ReferencePath | None:
++        """Expose the current episode's path when the preview provider supplies it."""
++
++        return getattr(self._preview_provider, "reference_path", None)
++
+     @property
+     def last_snapshot(self) -> PreviewSnapshot | None:
+         """Return the immutable snapshot for the next action, if available."""
+diff --git a/lookahead_learning/test_env.py b/lookahead_learning/test_env.py
+index 1bfaffc..27b3afd 100644
+--- a/lookahead_learning/test_env.py
++++ b/lookahead_learning/test_env.py
+@@ -689,6 +689,24 @@ class ObservationWrapperTests(unittest.TestCase):
+ 
+ 
+ class ContractAndNavigationTests(unittest.TestCase):
++    def test_wrapper_exposes_the_episode_path_used_by_preview(self) -> None:
++        raw = FakeRawEnv()
++        lane = StraightLane((0.0, 0.0), (20.0, 0.0), lane_index=("A", "B", 0))
++        raw.vehicle.navigation = FakeNavigation(("A", "B"), {"A": {"B": [lane]}})
++        wrapped = gym.Wrapper(wrap_lookahead_env(raw))
++
++        self.assertIsNone(wrapped.get_wrapper_attr("reference_path"))
++        _, reset_info = wrapped.reset()
++        path = wrapped.get_wrapper_attr("reference_path")
++        preview = reset_info["lookahead_learning"]["post_step"]["preview"]
++        self.assertTrue(preview["preview_valid"])
++        self.assertEqual(path.position_at(preview["s_goal_m"]), tuple(preview["q_xy"]))
++
++        wrapped.step(4)
++        self.assertIs(path, wrapped.get_wrapper_attr("reference_path"))
++        wrapped.reset()
++        self.assertIsNot(path, wrapped.get_wrapper_attr("reference_path"))
++
+     def test_provider_passes_lookahead_distance_to_geometry(self) -> None:
+         lane = StraightLane((0.0, 0.0), (20.0, 0.0), lane_index=("A", "B", 0))
+         navigation = FakeNavigation(("A", "B"), {"A": {"B": [lane]}})
+diff --git a/tests/test_evaluation_visualization.py b/tests/test_evaluation_visualization.py
+index e4f4f5c..43aa428 100644
+--- a/tests/test_evaluation_visualization.py
++++ b/tests/test_evaluation_visualization.py
+@@ -441,6 +441,61 @@ def test_one_step_connects_to_metadrive_043_recorded_frame(
+         env.close()
+ 
+ 
++def test_lookahead_recording_uses_the_point_observed_for_each_action(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    import torch
++    from lookahead_learning.checkpoint import set_lookahead_model_metadata
++    from evaluation_visualization import _DECISION_LOOKAHEAD_COLOR, _REFERENCE_ROUTE_COLOR
++
++    config = tmp_path / "cross.toml"
++    config.write_text(
++        _OFFICIAL_SELECTION.source_path.read_text()
++        + '\nmap = "SXS"\nhorizon = 2\n\n[lookahead]\nlookahead_time_s = 5.0\n',
++        encoding="utf-8",
++    )
++    experiment = select_experiment(config_path=config)
++    profile = experiment.profile
++    env = make_evaluation_env(0, profile.evaluation_env_config, profile.lookahead_config)
++    model_path = tmp_path / "model.zip"
++    try:
++        model = evaluate_module.PPO("MlpPolicy", env, n_steps=2, batch_size=2, device="cpu")
++        # Drive forward from rest. The time-based point is invalid for the
++        # first decision, then becomes valid in its returned observation.
++        with torch.no_grad():
++            model.policy.action_net.weight.zero_()
++            model.policy.action_net.bias.zero_()
++            model.policy.action_net.bias[7] = 1
++        set_lookahead_model_metadata(model, profile.lookahead_config)
++        model.save(model_path)
++    finally:
++        env.close()
++
++    monkeypatch.setattr(evaluate_module, "OUTPUT_DIR", tmp_path / "outputs")
++    monkeypatch.setattr(evaluate_module, "LOG_DIR", tmp_path / "logs")
++    assert evaluate_module.main(["--config", str(config), "--model", str(model_path)]) == 0
++    run = evaluate_module._evaluation_output_directory(experiment.name)
++    rows = [
++        json.loads(line)["lookahead_learning"]
++        for line in (run / "evaluation_steps.jsonl").read_text().splitlines()
++    ]
++    assert rows[0]["pre_step"]["preview"]["q_xy"] is not None
++    assert rows[0]["pre_step"]["preview"]["preview_valid"] is False
++    assert rows[0]["post_step"]["preview"]["preview_valid"] is True
++    assert rows[1]["pre_step"]["preview"] == rows[0]["post_step"]["preview"]
++    artifacts = json.loads((run / "evaluation.json").read_text())
++    for kind in ("frames", "gif", "mp4"):
++        assert artifacts[kind]["status"] == "success"
++        assert artifacts[kind]["frame_count"] == 2
++    images = sorted(Path(artifacts["frames"]["output_path"]).glob("frame_*.png"))
++    for index, filename in enumerate(images):
++        with Image.open(filename) as image:
++            bev = np.asarray(image)[:, :600]
++            assert np.any(np.all(bev == _REFERENCE_ROUTE_COLOR, axis=2))
++            marker = np.all(bev == _DECISION_LOOKAHEAD_COLOR, axis=2)
++            assert bool(np.any(marker)) == (index == 1)
++
++
+ def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,

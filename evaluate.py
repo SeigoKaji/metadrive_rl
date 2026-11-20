@@ -522,6 +522,10 @@ def _evaluate(args: argparse.Namespace, log_path: Path) -> Path:
                     episode_number=episode_number,
                     scenario_seed=actual_scenario_seed,
                     scene_group=scene_group,
+                    reference_path=(
+                        env.get_wrapper_attr("reference_path")
+                        if record_gif and lookahead_config is not None else None
+                    ),
                     write_gif_trace=_write_gif_trace,
                 )
                 active_recorder.prepare()

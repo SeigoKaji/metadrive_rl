@@ -41,7 +41,7 @@ from .adapter import (
     simulation_dt_seconds,
 )
 from .checkpoint import LOOKAHEAD_DEFAULTS, resolve_lookahead_config
-from .geometry import NORMALIZATION_DISTANCE_M, pp_penalty_result
+from .geometry import NORMALIZATION_DISTANCE_M, ReferencePath, pp_penalty_result
 from .prediction import MotionState, PredictionEpisodeMetrics, PredictionResult, prediction_penalty
 from .lateral_acceleration import (
     LateralEpisodeMetrics, LateralReference, lateral_accel_penalty, planar_speed_mps,
@@ -814,6 +814,12 @@ class LookaheadEnv(gym.Wrapper):
     @property
     def contract(self) -> ObservationContract:
         return self._contract
+
+    @property
+    def reference_path(self) -> ReferencePath | None:
+        """Expose the current episode's path when the preview provider supplies it."""
+
+        return getattr(self._preview_provider, "reference_path", None)
 
     @property
     def last_snapshot(self) -> PreviewSnapshot | None:

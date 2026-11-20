@@ -441,6 +441,61 @@ def test_one_step_connects_to_metadrive_043_recorded_frame(
         env.close()
 
 
+def test_lookahead_recording_uses_the_point_observed_for_each_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+    from lookahead_learning.checkpoint import set_lookahead_model_metadata
+    from evaluation_visualization import _DECISION_LOOKAHEAD_COLOR, _REFERENCE_ROUTE_COLOR
+
+    config = tmp_path / "cross.toml"
+    config.write_text(
+        _OFFICIAL_SELECTION.source_path.read_text()
+        + '\nmap = "SXS"\nhorizon = 2\n\n[lookahead]\nlookahead_time_s = 5.0\n',
+        encoding="utf-8",
+    )
+    experiment = select_experiment(config_path=config)
+    profile = experiment.profile
+    env = make_evaluation_env(0, profile.evaluation_env_config, profile.lookahead_config)
+    model_path = tmp_path / "model.zip"
+    try:
+        model = evaluate_module.PPO("MlpPolicy", env, n_steps=2, batch_size=2, device="cpu")
+        # Drive forward from rest. The time-based point is invalid for the
+        # first decision, then becomes valid in its returned observation.
+        with torch.no_grad():
+            model.policy.action_net.weight.zero_()
+            model.policy.action_net.bias.zero_()
+            model.policy.action_net.bias[7] = 1
+        set_lookahead_model_metadata(model, profile.lookahead_config)
+        model.save(model_path)
+    finally:
+        env.close()
+
+    monkeypatch.setattr(evaluate_module, "OUTPUT_DIR", tmp_path / "outputs")
+    monkeypatch.setattr(evaluate_module, "LOG_DIR", tmp_path / "logs")
+    assert evaluate_module.main(["--config", str(config), "--model", str(model_path)]) == 0
+    run = evaluate_module._evaluation_output_directory(experiment.name)
+    rows = [
+        json.loads(line)["lookahead_learning"]
+        for line in (run / "evaluation_steps.jsonl").read_text().splitlines()
+    ]
+    assert rows[0]["pre_step"]["preview"]["q_xy"] is not None
+    assert rows[0]["pre_step"]["preview"]["preview_valid"] is False
+    assert rows[0]["post_step"]["preview"]["preview_valid"] is True
+    assert rows[1]["pre_step"]["preview"] == rows[0]["post_step"]["preview"]
+    artifacts = json.loads((run / "evaluation.json").read_text())
+    for kind in ("frames", "gif", "mp4"):
+        assert artifacts[kind]["status"] == "success"
+        assert artifacts[kind]["frame_count"] == 2
+    images = sorted(Path(artifacts["frames"]["output_path"]).glob("frame_*.png"))
+    for index, filename in enumerate(images):
+        with Image.open(filename) as image:
+            bev = np.asarray(image)[:, :600]
+            assert np.any(np.all(bev == _REFERENCE_ROUTE_COLOR, axis=2))
+            marker = np.all(bev == _DECISION_LOOKAHEAD_COLOR, axis=2)
+            assert bool(np.any(marker)) == (index == 1)
+
+
 def test_evaluate_keeps_all_steps_when_gif_and_trace_writes_fail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

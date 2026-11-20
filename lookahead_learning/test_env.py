@@ -689,6 +689,24 @@ class ObservationWrapperTests(unittest.TestCase):
 
 
 class ContractAndNavigationTests(unittest.TestCase):
+    def test_wrapper_exposes_the_episode_path_used_by_preview(self) -> None:
+        raw = FakeRawEnv()
+        lane = StraightLane((0.0, 0.0), (20.0, 0.0), lane_index=("A", "B", 0))
+        raw.vehicle.navigation = FakeNavigation(("A", "B"), {"A": {"B": [lane]}})
+        wrapped = gym.Wrapper(wrap_lookahead_env(raw))
+
+        self.assertIsNone(wrapped.get_wrapper_attr("reference_path"))
+        _, reset_info = wrapped.reset()
+        path = wrapped.get_wrapper_attr("reference_path")
+        preview = reset_info["lookahead_learning"]["post_step"]["preview"]
+        self.assertTrue(preview["preview_valid"])
+        self.assertEqual(path.position_at(preview["s_goal_m"]), tuple(preview["q_xy"]))
+
+        wrapped.step(4)
+        self.assertIs(path, wrapped.get_wrapper_attr("reference_path"))
+        wrapped.reset()
+        self.assertIsNot(path, wrapped.get_wrapper_attr("reference_path"))
+
     def test_provider_passes_lookahead_distance_to_geometry(self) -> None:
         lane = StraightLane((0.0, 0.0), (20.0, 0.0), lane_index=("A", "B", 0))
         navigation = FakeNavigation(("A", "B"), {"A": {"B": [lane]}})

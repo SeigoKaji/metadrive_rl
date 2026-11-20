@@ -9,7 +9,7 @@ import sys
 import traceback
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Mapping, TextIO
+from typing import TYPE_CHECKING, Any, Mapping, TextIO
 
 import numpy as np
 from PIL import Image
@@ -21,13 +21,18 @@ from evaluation_visualization import (
     SimulationTiming,
     compose_telemetry_panel,
     decode_discrete_action,
+    overlay_lookahead_bev,
     replace_latest_recorded_frame,
 )
 
+if TYPE_CHECKING:
+    from lookahead_learning.geometry import ReferencePath
 
+
+_BEV_SCREEN_SIZE = (600, 600)
 GIF_RENDER_API = (
     'env.render(mode="topdown", screen_record=True, window=False, '
-    "screen_size=(600, 600), camera_position=(50, 50))"
+    f"screen_size={_BEV_SCREEN_SIZE}, camera_position=(50, 50))"
 )
 GIF_GENERATE_API = (
     "env.top_down_renderer.generate_gif("
@@ -317,12 +322,16 @@ class _EpisodeVisualizationRecorder:
         episode_number: int,
         scenario_seed: int,
         scene_group: str | None = None,
+        reference_path: ReferencePath | None = None,
         write_gif_trace: Callable[[Path, str, list[str]], None] | None = None,
     ) -> None:
         self.requested = bool(requested)
         self.episode_number = int(episode_number)
         self.scenario_seed = int(scenario_seed)
         self.scene_group = scene_group
+        self.reference_path = reference_path
+        self.route_xy: list[tuple[float, float]] = []
+        self.camera_options: dict[str, Any] = {"camera_position": (50, 50)}
         self._write_gif_trace = write_gif_trace or _write_gif_trace
         self.paths = _episode_visualization_paths(
             run_dir,
@@ -447,6 +456,29 @@ class _EpisodeVisualizationRecorder:
         except Exception:
             self.frame_dump_exception_trace = traceback.format_exc()
 
+    def _configure_route_view(self, path: ReferencePath) -> None:
+        """Sample the validated lane centers once and fit them in the episode view."""
+
+        for lane in path.lanes:
+            # Keep the actual lane ends and follow arcs at intervals of at most 1 m.
+            distances = np.linspace(0.0, lane.length, math.ceil(lane.length) + 1)
+            for distance in distances:
+                x, y = lane.position(distance, 0.0)
+                self.route_xy.append((float(x), float(y)))
+        if not self.route_xy:
+            return
+        low = np.min(self.route_xy, axis=0)
+        high = np.max(self.route_xy, axis=0)
+        center = tuple(float(coordinate) for coordinate in (low + high) / 2)
+        # Use the usual 5 px/m whenever the full route fits with a 24 px margin.
+        span_m = max(1.0, float(np.max(high - low)))
+        scaling = min(5.0, (min(_BEV_SCREEN_SIZE) - 48) / span_m)
+        self.camera_options = {"camera_position": center, "scaling": scaling}
+        self.gif_result["render_api"] = (
+            'env.render(mode="topdown", screen_record=True, window=False, '
+            f"screen_size={_BEV_SCREEN_SIZE}, camera_position={center}, scaling={scaling})"
+        )
+
     def record_frame(
         self,
         *,
@@ -460,19 +492,34 @@ class _EpisodeVisualizationRecorder:
             return
 
         try:
-            if GIF_RENDER_API not in self.gif_attempted_apis:
-                self.gif_attempted_apis.append(GIF_RENDER_API)
+            if self.frame_count == 0 and self.reference_path is not None:
+                self._configure_route_view(self.reference_path)
+            render_api = self.gif_result["render_api"]
+            if render_api not in self.gif_attempted_apis:
+                self.gif_attempted_apis.append(render_api)
             rendered_frame = env.render(
                 mode="topdown",
                 screen_record=True,
                 window=False,
-                screen_size=(600, 600),
-                camera_position=(50, 50),
+                screen_size=_BEV_SCREEN_SIZE,
+                **self.camera_options,
             )
             renderer = env.top_down_renderer
             if renderer is None:
                 raise RuntimeError("top_down_renderer was not created")
             self.renderer = renderer
+            goal_valid = None
+            if self.reference_path is not None:
+                # The policy selected the displayed action using the pre-step
+                # observation. The returned post-step point is for the next action.
+                preview = telemetry["lookahead_learning"]["pre_step"]["preview"]
+                goal_valid = preview["preview_valid"]
+                rendered_frame = overlay_lookahead_bev(
+                    rendered_frame,
+                    renderer,
+                    route_xy=self.route_xy,
+                    preview_goal_xy=preview["q_xy"] if goal_valid else None,
+                )
             action_history = [
                 decode_discrete_action(action_id, env.config)
                 for action_id in switch_tracker.history
@@ -481,6 +528,7 @@ class _EpisodeVisualizationRecorder:
                 rendered_frame,
                 telemetry,
                 action_history,
+                decision_lookahead_valid=goal_valid,
             )
             replace_latest_recorded_frame(renderer, panel_frame)
         except Exception:

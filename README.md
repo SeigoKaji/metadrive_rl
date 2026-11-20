@@ -66,6 +66,8 @@ python3 -m venv .venv
 
 別のモデルを指定する場合は、`--model models/<model-name>.zip` を追加します。
 
+`[lookahead]` 付きで学習したモデルを同じ設定で評価すると、各エピソードの GIF・MP4・PNG に、検証済みの車線中心線を青緑の線、そのステップの行動を選ぶ際に観測した注視点を橙色の輪で表示します。カメラは固定経路全体が収まる画角です。車両は行動後の位置に描きます。注視点が無効なステップは凡例に `Decision lookahead (unavailable)` と表示し、輪を省きます。点の世界座標は `evaluation_steps.jsonl` の `lookahead_learning.pre_step.preview.q_xy`、有効フラグは同じ箇所の `preview_valid` です。
+
 学習・評価の成果物は、TOML の `name` を使った `outputs/<name>/training/` と `outputs/<name>/evaluation/` に保存します。同じ `name` で再実行すると同じ保存先を更新します。評価対象のモデルや `evaluation.output_prefix` を変えても、成果物ディレクトリは変わりません。この作業環境の既存成果物もこの構成へ移行済みです。同居していた `official_start_lane_return_penalty200` は別の実験フォルダに分けて保持しています。
 
 ## configファイル

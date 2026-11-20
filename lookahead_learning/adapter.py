@@ -28,7 +28,7 @@ from .prediction import MotionState, PredictionReference, time_lookahead_distanc
 
 if TYPE_CHECKING:
     from .env import LookaheadEnv
-    from .geometry import RouteCurvatureProfile
+    from .geometry import ReferencePath, RouteBuildResult, RouteCurvatureProfile
 
 
 PREVIEW_FEATURE_DIM: Final[int] = 3
@@ -1007,7 +1007,7 @@ def build_fixed_navigation_route(
     endpoint_tolerance_m: float = 1.0e-3,
     width_tolerance_m: float = 1.0e-3,
     tangent_tolerance_rad: float = 1.0e-3,
-) -> object:
+) -> RouteBuildResult:
     """Build the fixed directed route from the post-reset Navigation state.
 
     The returned object is :class:`lookahead_learning.geometry.RouteBuildResult`.  A
@@ -1240,12 +1240,18 @@ class MetaDrivePreviewProvider:
         self.include_lateral_accel = include_lateral_accel
         self._radius_reader = radius_reader
         self._curvature_profile: RouteCurvatureProfile | None = None
-        self._route: object | None = None
+        self._route: RouteBuildResult | None = None
         self._episode_key: object = None
         self._target_ordinal: int | None = None
         self._target_ordinal_persistent = False
         self._reference_preview: Mapping[str, object] | None = None
         self._reference_projection = None
+
+    @property
+    def reference_path(self) -> ReferencePath | None:
+        """Return the validated geometry used by this episode's previews."""
+
+        return None if self._route is None else self._route.path
 
     def reset(self, env: object) -> None:
         """Rebuild route state exactly once after the raw environment reset."""

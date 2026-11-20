@@ -19,6 +19,9 @@ from PIL import Image, ImageDraw, ImageFont
 GIF_FRAME_DURATION_MS = 100
 TELEMETRY_PANEL_WIDTH = 320
 ACTION_HISTORY_SECONDS = 2.0
+_REFERENCE_ROUTE_COLOR = (0, 139, 153)
+_DECISION_LOOKAHEAD_COLOR = (255, 163, 35)
+_DECISION_LOOKAHEAD_OUTLINE = (54, 31, 12)
 
 
 STEP_TELEMETRY_FIELDS: tuple[str, ...] = (
@@ -505,12 +508,79 @@ def _history_colors(action: DecodedAction) -> tuple[tuple[int, int, int], tuple[
     return steering_color, throttle_color
 
 
+def overlay_lookahead_bev(
+    frame: np.ndarray,
+    renderer: Any,
+    *,
+    route_xy: Sequence[tuple[float, float]] = (),
+    preview_goal_xy: Sequence[float] | None = None,
+) -> np.ndarray:
+    """Draw world-space geometry in the evaluator's fixed, north-up camera."""
+
+    if len(route_xy) < 2 and preview_goal_xy is None:
+        return frame
+    # Use the same WorldSurface and integer blit area as TopDownRenderer._draw.
+    # In particular, ``pos2pix`` includes the origin, Y inversion and scaling
+    # resolved by the renderer itself when it creates the map surface.
+    height, width = frame.shape[:2]
+    canvas = renderer._frame_canvas
+    center_x, center_y = canvas.pos2pix(*renderer.position)
+    left = int(center_x - width / 2)
+    top = int(center_y - height / 2)
+
+    def project(point: Sequence[float]) -> tuple[int, int]:
+        x, y = canvas.pos2pix(*point)
+        return x - left, y - top
+
+    output = frame.copy()
+    if len(route_xy) >= 2:
+        from pygame import surfarray
+
+        mask = Image.new("1", (width, height))
+        ImageDraw.Draw(mask).line([project(point) for point in route_xy], fill=1, width=3)
+        rows, cols = np.nonzero(np.asarray(mask))
+        map_x, map_y = cols + left, rows + top
+        backdrop = renderer._background_canvas
+        backdrop_width, backdrop_height = backdrop.get_size()
+        on_canvas = (map_x >= 0) & (map_x < backdrop_width) & (map_y >= 0) & (map_y < backdrop_height)
+        rows, cols = rows[on_canvas], cols[on_canvas]
+        # The base map is copied before MetaDrive draws traffic and history.
+        # Keep those foreground pixels above the reference route.
+        backdrop_pixels = surfarray.pixels3d(backdrop)
+        reference_pixels = backdrop_pixels[map_x[on_canvas], map_y[on_canvas]]
+        del backdrop_pixels
+        map_only = np.all(frame[rows, cols] == reference_pixels, axis=1)
+        output[rows[map_only], cols[map_only]] = _REFERENCE_ROUTE_COLOR
+
+    if preview_goal_xy is None:
+        return output
+    image = Image.fromarray(output)
+    x, y = project(preview_goal_xy)
+    _draw_decision_lookahead_marker(ImageDraw.Draw(image), x, y)
+    return np.asarray(image)
+
+
+def _draw_decision_lookahead_marker(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
+    radius = 7
+    draw.ellipse(
+        (x - radius, y - radius, x + radius, y + radius),
+        outline=_DECISION_LOOKAHEAD_OUTLINE,
+        width=3,
+    )
+    draw.ellipse(
+        (x - radius + 1, y - radius + 1, x + radius - 1, y + radius - 1),
+        outline=_DECISION_LOOKAHEAD_COLOR,
+        width=2,
+    )
+
+
 def compose_telemetry_panel(
     frame: np.ndarray,
     telemetry: Mapping[str, Any],
     action_history: Sequence[DecodedAction],
     *,
     panel_width: int = TELEMETRY_PANEL_WIDTH,
+    decision_lookahead_valid: bool | None = None,
 ) -> np.ndarray:
     """Append a high-contrast telemetry panel without obscuring the map frame."""
 
@@ -645,6 +715,19 @@ def compose_telemetry_panel(
             fill=muted,
             font=small_font,
         )
+        y += 43
+
+    if decision_lookahead_valid is not None:
+        divider()
+        draw.line((x, y + 7, x + 14, y + 7), fill=_REFERENCE_ROUTE_COLOR, width=3)
+        draw.text((x + 24, y), "Fixed reference route", fill=light, font=small_font)
+        y += 18
+        if decision_lookahead_valid:
+            _draw_decision_lookahead_marker(draw, x + 7, y + 7)
+            label = "Decision lookahead"
+        else:
+            label = "Decision lookahead (unavailable)"
+        draw.text((x + 24, y), label, fill=light, font=small_font)
 
     return np.asarray(output)
 
@@ -652,9 +735,8 @@ def compose_telemetry_panel(
 def replace_latest_recorded_frame(renderer: Any, frame: np.ndarray) -> None:
     """Replace MetaDrive 0.4.3's latest recorded frame with a local composite.
 
-    MetaDrive exposes ``screen_frames`` as a deep-copy-only property. The
-    version-pinned evaluator therefore contains this single private-API touch
-    here instead of modifying the upstream renderer or spreading the dependency.
+    MetaDrive's public ``screen_frames`` property returns a deep copy, so GIF
+    export needs the composite written into the original frame buffer.
     """
 
     frames = getattr(renderer, "_screen_frames", None)
